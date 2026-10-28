@@ -1,0 +1,14 @@
+{
+  "campaign_name": "Midwest Hiring Organizations - IT & Engineering",
+  "mode": "CORPORATE",
+  "sourcing_provider": "gemini_xray",
+  "target_geography": ["Ohio", "Indiana", "Michigan", "Kentucky"],
+  "decision_maker_titles": ["VP of Engineering", "CTO", "Director of IT"],
+  "industry_keywords": ["Software", "Healthcare IT", "Manufacturing"],
+  "signal_query": "actively hiring Senior Software Engineer OR Cloud Architect",
+  "blocked_email_prefixes": ["careers", "jobs", "hr", "recruiting", "info", "admin", "support", "contact", "sales", "office", "media", "help"],
+  "blocked_consumer_domains": ["gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com", "msn.com", "comcast.net"],
+  "outreach_persona": "Peer-to-peer technical recruiting and advisory partner",
+  "calendar_duration_minutes": 15,
+  "auto_send_booking_replies": false
+}

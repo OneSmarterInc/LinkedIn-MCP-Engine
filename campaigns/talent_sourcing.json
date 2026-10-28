@@ -1,0 +1,11 @@
+{
+  "campaign_name": "Senior Engineering & Healthcare IT Candidate Sourcing",
+  "mode": "CANDIDATE",
+  "sourcing_provider": "gemini_xray",
+  "target_geography": ["Ohio", "Remote"],
+  "decision_maker_titles": ["Senior Software Engineer", "Data Engineer", "HL7 Integration Specialist"],
+  "industry_keywords": ["Healthcare IT", "Python", "Cloud"],
+  "block_current_employer_domain": true,
+  "calendar_duration_minutes": 15,
+  "auto_send_booking_replies": false
+}

@@ -1,0 +1,17 @@
+{
+  "campaign_name": "Ohio & Midwest Self-Funded Employers & TPAs",
+  "mode": "CORPORATE",
+  "sourcing_provider": "gemini_xray",
+  "target_geography": ["Ohio", "Indiana", "Michigan", "Kentucky"],
+  "decision_maker_titles": ["VP of Human Resources", "CFO", "Director of Benefits"],
+  "industry_keywords": ["Third Party Administrator", "Healthcare", "Manufacturing"],
+  "blocked_email_prefixes": [
+    "info", "contact", "admin", "support", "sales", "office",
+    "billing", "volunteer", "hr", "careers", "jobs", "recruiting", "media"
+  ],
+  "blocked_consumer_domains": [
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"
+  ],
+  "calendar_duration_minutes": 15,
+  "auto_send_booking_replies": false
+}

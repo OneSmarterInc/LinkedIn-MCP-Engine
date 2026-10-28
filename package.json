@@ -9,7 +9,7 @@
   "scripts": {
     "test": "vitest run",
     "dev": "tsx src/main.ts",
-    "build": "tsc",
+    "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
