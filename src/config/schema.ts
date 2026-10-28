@@ -45,19 +45,27 @@ export const LeadRecord = z.object({
 export type LeadRecord = z.infer<typeof LeadRecord>;
 
 export const FailureReason = z.enum([
+  // Gate 1
   "MISSING_EMAIL",
+  // Gate 2
   "SHARED_OR_DUPLICATE_EMAIL",
   "ALREADY_CONTACTED",
   "OPTED_OUT",
+  // Gate 3
   "CONSUMER_DOMAIN",
   "ROLE_ACCOUNT",
   "DOMAIN_MISMATCH",
   "CURRENT_EMPLOYER_DOMAIN",
+  // Gate 4
   "ENTITY_MISMATCH",
+  // Gate 5
   "NO_MX_RECORD",
   "MAILBOX_INVALID",
   "MAILBOX_CATCH_ALL",
   "MAILBOX_UNKNOWN",
+  "MAILBOX_DO_NOT_MAIL",
+  // Any gate: an external check failed. The lead is held back, never passed.
+  "GATE_ERROR",
 ]);
 export type FailureReason = z.infer<typeof FailureReason>;
 

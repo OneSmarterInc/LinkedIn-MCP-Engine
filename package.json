@@ -14,7 +14,8 @@
     "test:watch": "vitest",
     "coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
-    "mcp": "tsx src/mcp/server.ts"
+    "mcp": "tsx src/mcp/server.ts",
+    "test:contract": "vitest run --config vitest.contract.config.ts"
   },
   "keywords": [],
   "author": "",
