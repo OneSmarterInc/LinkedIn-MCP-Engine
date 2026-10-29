@@ -47,6 +47,25 @@ export function emailMatchesName(local: string, first: string, last: string): bo
   return false;
 }
 
+const EDU_DOMAIN = /\.(edu|edu\.[a-z]{2}|ac\.[a-z]{2})$/;
+const GOV_DOMAIN = /\.(gov|mil|gov\.[a-z]{2})$/;
+const SCHOOL_WORDS = /\b(university|college|school|institute|academy|education|seminary|polytechnic|district)\b/i;
+const GOV_WORDS = /\b(government|county|city of|state of|department|agency|authority|commission|federal|army|navy|air force|military)\b/i;
+
+/**
+ * Code rules that run before the model, so obvious mismatches never depend on model quality.
+ * Returns a reason when the email domain is a school or government domain but the company is not one.
+ */
+export function institutionalMismatch(companyName: string, emailDomain: string): string | null {
+  if (EDU_DOMAIN.test(emailDomain) && !SCHOOL_WORDS.test(companyName)) {
+    return `education domain ${emailDomain} for non-school company "${companyName}"`;
+  }
+  if (GOV_DOMAIN.test(emailDomain) && !GOV_WORDS.test(companyName)) {
+    return `government domain ${emailDomain} for non-government company "${companyName}"`;
+  }
+  return null;
+}
+
 export interface EntityCheckOptions {
   minConfidence?: number;
 }
@@ -64,6 +83,12 @@ export function makeEntityCheck(llm: LLMProvider, cfg: CampaignConfig, opts: Ent
     // CANDIDATE on a personal inbox: the domain says nothing about the company, so check the name instead.
     if (cfg.mode === "CANDIDATE" && cfg.blocked_consumer_domains.includes(domain)) {
       return emailMatchesName(local, lead.first_name, lead.last_name) ? null : "ENTITY_MISMATCH";
+    }
+
+    const rule = institutionalMismatch(lead.company_name, domain);
+    if (rule) {
+      logger.debug({ lead_id: lead.lead_id, gate: 4, rule }, "entity rule mismatch");
+      return "ENTITY_MISMATCH";
     }
 
     try {

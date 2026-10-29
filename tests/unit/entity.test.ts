@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { emailMatchesName, makeEntityCheck } from "../../src/core/gates/entity.js";
+import { emailMatchesName, institutionalMismatch, makeEntityCheck } from "../../src/core/gates/entity.js";
 import { candidateCfg, corporateCfg, fakeLLM, makeLead } from "../helpers.js";
 
 const match = { same_organization: true, location_consistent: true, confidence: 0.9, reason: "match" };
@@ -69,5 +69,28 @@ describe("emailMatchesName", () => {
     ["xyz123", false],
   ])("%s -> %s", (local, expected) => {
     expect(emailMatchesName(local, "Jane", "Miller")).toBe(expected);
+  });
+});
+
+describe("gate 4: code rules before the model", () => {
+  it("rejects a .edu email for a hospital, even when the model says yes", async () => {
+    const { llm, prompts } = fakeLLM(match);
+    const r = await makeEntityCheck(llm, corporateCfg)(makeLead({
+      company_name: "Kettering Health", company_domain: "kettering.edu", email: "kevin.price@kettering.edu",
+    }));
+    expect(r).toBe("ENTITY_MISMATCH");
+    expect(prompts).toHaveLength(0);
+  });
+
+  it.each([
+    ["Kettering Health", "kettering.edu", true],
+    ["Wright State University", "wright.edu", false],
+    ["Sinclair Community College", "sinclair.edu", false],
+    ["Acme Manufacturing", "ox.ac.uk", true],
+    ["Reynolds and Reynolds", "ohio.gov", true],
+    ["Montgomery County", "mcohio.gov", false],
+    ["Acme Manufacturing", "acme.com", false],
+  ])("%s @ %s -> mismatch %s", (company, domain, expected) => {
+    expect(institutionalMismatch(company, domain) !== null).toBe(expected);
   });
 });

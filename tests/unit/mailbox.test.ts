@@ -11,9 +11,30 @@ function dnsError(code: string) {
 }
 
 describe("gate 5: MX check", () => {
+  // Fails for every domain except the gmail.com DNS canary, like a real "domain does not exist".
+  const onlyGmail = (code: string): MxResolver => async (d) => {
+    if (d === "gmail.com") return [{ exchange: "gmail-smtp-in.l.google.com", priority: 5 }];
+    throw dnsError(code);
+  };
+
   it("rejects a domain with no MX record", async () => {
-    const check = makeMailboxCheck({ verifier: validVerifier, resolveMx: async () => { throw dnsError("ENOTFOUND"); } });
+    const check = makeMailboxCheck({ verifier: validVerifier, resolveMx: onlyGmail("ENOTFOUND") });
     expect(await check(makeLead())).toBe("NO_MX_RECORD");
+  });
+
+  it("treats ENODATA as no MX record", async () => {
+    const check = makeMailboxCheck({ verifier: validVerifier, resolveMx: onlyGmail("ENODATA") });
+    expect(await check(makeLead())).toBe("NO_MX_RECORD");
+  });
+
+  it("holds leads back (GATE_ERROR) when DNS itself is down", async () => {
+    const check = makeMailboxCheck({ verifier: validVerifier, resolveMx: async () => { throw dnsError("ENOTFOUND"); } });
+    expect(await check(makeLead())).toBe("GATE_ERROR");
+  });
+
+  it("treats a resolver failure (ESERVFAIL) as GATE_ERROR, not a missing domain", async () => {
+    const check = makeMailboxCheck({ verifier: validVerifier, resolveMx: onlyGmail("ESERVFAIL") });
+    expect(await check(makeLead())).toBe("GATE_ERROR");
   });
 
   it("rejects a null MX (RFC 7505)", async () => {

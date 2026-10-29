@@ -1,0 +1,9 @@
+[
+  { "full_name": "Jordan Reyes", "title": "VP of Human Resources", "company_name": "CareSource", "company_domain": "caresource.com", "location": "Dayton, OH", "linkedin_url": "https://www.linkedin.com/in/jordan-reyes-sample", "email": "jordan.reyes@caresource.com" },
+  { "full_name": "Priya Nair", "title": "VP of Human Resources", "company_name": "Premier Health", "company_domain": "premierhealth.com", "location": "Dayton, OH", "linkedin_url": "https://linkedin.com/in/priya-nair-sample/", "email": "priya.nair@premierhealth.com" },
+  { "full_name": "Sam Ortiz", "title": "VP of Human Resources", "company_name": "Reynolds and Reynolds", "company_domain": "reyrey.com", "location": "Dayton, OH", "linkedin_url": "https://www.linkedin.com/company/reynolds", "email": "sam.ortiz@reyrey.com" },
+  { "full_name": "Dr. Helen Brooks", "title": "CFO", "company_name": "Kettering Health", "company_domain": "ketteringhealth.org", "location": "Dayton, OH", "linkedin_url": "https://www.linkedin.com/in/helen-brooks-sample", "email": "helen.brooks@ketteringhealth.org" },
+  { "full_name": "Chris Young", "title": "CFO", "company_name": "The Kroger Co.", "company_domain": "kroger.com", "location": "Cincinnati, OH", "linkedin_url": "https://www.linkedin.com/in/chris-young-sample", "email": null },
+  { "full_name": "Jordan Reyes", "title": "Director of Benefits", "company_name": "CareSource", "company_domain": "caresource.com", "location": "Dayton, OH", "linkedin_url": "https://www.linkedin.com/in/jordan-reyes-sample", "email": "jordan.reyes@caresource.com" },
+  { "full_name": "Dana White", "title": "Director of Benefits", "company_name": "Dayton Children's Hospital", "company_domain": "childrensdayton.org", "location": "Dayton, OH", "linkedin_url": "https://www.linkedin.com/in/dana-white-sample", "email": "dana.white@childrensdayton.org" }
+]

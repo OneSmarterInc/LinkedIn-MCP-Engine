@@ -52,7 +52,11 @@ export const devSkipVerifier: MailboxVerifier = {
   },
 };
 
-const NOT_FOUND_CODES = new Set(["ENOTFOUND", "ENODATA", "ENOTIMP", "ESERVFAIL"]);
+/** DNS answers that mean "this domain has no mail server". ESERVFAIL is a resolver failure, not an answer. */
+const NOT_FOUND_CODES = new Set(["ENOTFOUND", "ENODATA"]);
+
+/** A domain that always has MX records. If it fails too, DNS itself is down. */
+const DNS_CANARY = "gmail.com";
 
 export interface MailboxCheckDeps {
   verifier: MailboxVerifier;
@@ -66,6 +70,13 @@ export interface MailboxCheckDeps {
 export function makeMailboxCheck(deps: MailboxCheckDeps) {
   const resolveMx = deps.resolveMx ?? dns.resolveMx;
   const mxCache = new Map<string, Promise<boolean>>();
+  let dnsCheck: Promise<boolean> | undefined;
+
+  /** Run once per process: confirms DNS works before trusting any "no MX" answer. */
+  const dnsWorks = (): Promise<boolean> => {
+    dnsCheck ??= resolveMx(DNS_CANARY).then((r) => r.length > 0, () => false);
+    return dnsCheck;
+  };
 
   const hasMx = (domain: string): Promise<boolean> => {
     let p = mxCache.get(domain);
@@ -73,8 +84,11 @@ export function makeMailboxCheck(deps: MailboxCheckDeps) {
       p = resolveMx(domain).then(
         // RFC 7505 "null MX" (exchange "" or ".") means the domain accepts no mail.
         (records) => records.some((r) => r.exchange !== "" && r.exchange !== "."),
-        (err: NodeJS.ErrnoException) => {
-          if (err.code && NOT_FOUND_CODES.has(err.code)) return false;
+        async (err: NodeJS.ErrnoException) => {
+          if (err.code && NOT_FOUND_CODES.has(err.code)) {
+            if (await dnsWorks()) return false;
+            throw new Error(`DNS lookups are failing (even ${DNS_CANARY}). Check the network; leads are held back, not rejected.`);
+          }
           throw err;
         },
       );

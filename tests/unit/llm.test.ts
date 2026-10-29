@@ -51,6 +51,19 @@ describe("OllamaProvider", () => {
     expect("think" in JSON.parse((off as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![1].body)).toBe(false);
   });
 
+  it("shows Ollama's own message and does not retry when memory is short", async () => {
+    const fetchFn = vi.fn(async () => new Response(JSON.stringify({ error: "failed to allocate buffer of size 3121348608" }), { status: 500 })) as unknown as typeof fetch;
+    const p = new OllamaProvider({ url: "http://x", model: "big:7b", fetchFn });
+    await expect(p.generateJSON("hi", Schema)).rejects.toThrow(/not enough memory to load "big:7b"/);
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("says which model is missing", async () => {
+    const fetchFn = vi.fn(async () => new Response("{}", { status: 404 })) as unknown as typeof fetch;
+    const p = new OllamaProvider({ url: "http://x", model: "nope:1b", fetchFn });
+    await expect(p.generateText("hi")).rejects.toThrow(/ollama pull nope:1b/);
+  });
+
   it("refuses grounded calls", async () => {
     const p = new OllamaProvider({ url: "http://x", model: "m", fetchFn: reply("{}") });
     await expect(p.generateText("hi", { grounded: true })).rejects.toBeInstanceOf(GroundingUnsupportedError);

@@ -16,6 +16,8 @@ export const CampaignConfig = z.object({
   campaign_name: z.string().min(1),
   mode: Mode,
   sourcing_provider: SourcingProvider,
+  /** Default file for csv_import. The CLI --csv flag overrides it. */
+  csv_path: z.string().optional(),
   target_geography: z.array(z.string()).min(1),
   decision_maker_titles: z.array(z.string()).min(1),
   industry_keywords: z.array(z.string()).default([]),
