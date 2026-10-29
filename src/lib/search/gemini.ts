@@ -22,7 +22,10 @@ export class GeminiSearchProvider implements SearchProvider {
 
   constructor(private readonly llm: LLMProvider) {
     if (!llm.supportsGrounding) {
-      throw new Error(`GeminiSearchProvider needs a provider with web search; "${llm.name}" has none.`);
+      throw new Error(
+        `Live LinkedIn search needs web search, and "${llm.name}" has it switched off or does not offer it. ` +
+        `For Gemini: turn on billing and set GEMINI_GROUNDING=true. Or use --csv / SEARCH_PROVIDER=fixture.`,
+      );
     }
   }
 

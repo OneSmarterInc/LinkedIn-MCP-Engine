@@ -95,6 +95,7 @@ export function makeEntityCheck(llm: LLMProvider, cfg: CampaignConfig, opts: Ent
       const verdict = await llm.generateJSON(buildPrompt(lead, domain), EntityVerdict, {
         system: SYSTEM,
         grounded: llm.supportsGrounding,
+        thinking: "low", // a yes/no check needs little thinking; keeps Gate 4 cheap
       });
       const ok = verdict.same_organization && verdict.location_consistent && verdict.confidence >= minConfidence;
       logger.debug({ lead_id: lead.lead_id, gate: 4, ok, confidence: verdict.confidence, reason: verdict.reason }, "entity check");

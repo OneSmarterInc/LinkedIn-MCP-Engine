@@ -33,9 +33,10 @@ export function buildAsyncGates(
   cfg: CampaignConfig,
   env: NodeJS.ProcessEnv = process.env,
   llm: LLMProvider = getLLM(env),
-): AsyncGates {
+): AsyncGates & { llm: LLMProvider } {
   const minConfidence = Number(env.ENTITY_MIN_CONFIDENCE ?? 0.7);
   return {
+    llm,
     entityCheck: makeEntityCheck(llm, cfg, { minConfidence }),
     mailboxCheck: makeMailboxCheck({ verifier: getMailboxVerifier(env) }),
   };

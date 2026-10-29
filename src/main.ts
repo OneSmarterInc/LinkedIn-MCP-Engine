@@ -4,6 +4,7 @@ import { loadCampaign } from "./config/load.js";
 import { openLedger } from "./core/db.js";
 import { buildAsyncGates } from "./core/gates/index.js";
 import { formatSummary, runVerify, writeReport } from "./core/pipeline.js";
+import { getSearch } from "./lib/search/index.js";
 
 const program = new Command()
   .name("linkedin-mcp-engine")
@@ -33,10 +34,11 @@ program
     const ledger = openLedger();
     try {
       console.log(`Running... (LLM: ${process.env.LLM_PROVIDER ?? "ollama"}, mailbox: ${process.env.MAILBOX_VERIFIER ?? "zerobounce"})`);
+      const gates = buildAsyncGates(cfg);
       const report = await runVerify(
         cfg,
         { limit: Number(o.limit), csvPath: o.csv },
-        { ledger, gates: buildAsyncGates(cfg) },
+        { ledger, gates, ...(o.csv ? {} : { search: getSearch(process.env, gates.llm) }) },
       );
       const path = await writeReport(report, o.out);
       console.log("");

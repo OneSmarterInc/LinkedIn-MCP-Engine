@@ -1,11 +1,16 @@
 import type { z } from "zod";
 
+export type ThinkingLevel = "low" | "medium" | "high";
+
 export interface GenerateOptions {
   /** Ask the provider to search the web before answering. */
   grounded?: boolean;
   temperature?: number;
   system?: string;
+  /** How much the model may think before answering. Thinking is billed as output, so small checks use "low". */
+  thinking?: ThinkingLevel;
 }
+
 
 /**
  * The single contract every LLM backend implements.

@@ -1,8 +1,24 @@
 import { GeminiProvider } from "./gemini.js";
 import { OllamaProvider } from "./ollama.js";
-import type { LLMProvider } from "./provider.js";
+import type { LLMProvider, ThinkingLevel } from "./provider.js";
 
-export type { LLMProvider, GenerateOptions } from "./provider.js";
+export type { LLMProvider, GenerateOptions, ThinkingLevel } from "./provider.js";
+
+export const DEFAULT_GEMINI_MODEL = "gemini-3.8-flash";
+
+/** Reads GEMINI_* settings from the environment. Shared by the LLM and the search provider. */
+export function geminiOptions(env: NodeJS.ProcessEnv, apiKey: string) {
+  const level = (env.GEMINI_THINKING ?? "").toLowerCase();
+  if (level && !["low", "medium", "high"].includes(level)) {
+    throw new Error(`GEMINI_THINKING must be low, medium, high, or empty (got "${level}")`);
+  }
+  return {
+    apiKey,
+    model: env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+    ...(level ? { thinking: level as ThinkingLevel } : {}),
+    grounding: (env.GEMINI_GROUNDING ?? "true").toLowerCase() !== "false",
+  };
+}
 export { GroundingUnsupportedError, extractJson } from "./provider.js";
 
 /** Picks the LLM backend from LLM_PROVIDER. This is the only place that knows which one is live. */
@@ -20,7 +36,7 @@ export function getLLM(env: NodeJS.ProcessEnv = process.env): LLMProvider {
       });
     case "gemini": {
       if (!env.GEMINI_API_KEY) throw new Error("LLM_PROVIDER=gemini but GEMINI_API_KEY is empty");
-      return new GeminiProvider({ apiKey: env.GEMINI_API_KEY, model: env.GEMINI_MODEL ?? "gemini-2.5-flash" });
+      return new GeminiProvider(geminiOptions(env, env.GEMINI_API_KEY));
     }
     default:
       throw new Error(`Unknown LLM_PROVIDER "${provider}". Use "ollama" or "gemini".`);
