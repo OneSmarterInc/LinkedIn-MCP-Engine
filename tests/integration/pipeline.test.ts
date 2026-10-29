@@ -4,7 +4,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadCampaign } from "../../src/config/load.js";
 import { openLedger } from "../../src/core/db.js";
-import { runVerify, writeReport, formatSummary } from "../../src/core/pipeline.js";
+import { runAll, runVerify, writeReport, formatSummary } from "../../src/core/pipeline.js";
+import { existsSync } from "node:fs";
+import { fakeLLM } from "../helpers.js";
 import type { AsyncGates } from "../../src/core/verifier.js";
 
 // Gate 4 and 5 stand-ins with known answers, so the test is offline and exact.
@@ -50,5 +52,38 @@ describe("pipeline: dirty CSV through all 5 gates", async () => {
     const saved = JSON.parse(readFileSync(path, "utf8"));
     expect(saved.counts.passed).toBe(5);
     expect(formatSummary(report)).toContain("PASSED");
+  });
+});
+
+describe("pipeline: run (verify + draft)", async () => {
+  const cfg = await loadCampaign("campaigns/b2b_healthcare.json");
+  // One fake draft that names the company, so every passed lead gets a READY draft.
+  const llm = {
+    ...fakeLLM({}).llm,
+    async generateJSON(prompt: string, schema: { parse: (x: unknown) => unknown }) {
+      const company = /Company: ([^(\n]+)/.exec(prompt)![1]!.trim().replace(/^The /, "");
+      return schema.parse({
+        research_summary: [],
+        email_subject: "Claims review question",
+        email_body: `Teams at ${company} review a lot of claims files. Errors are easy to miss. I would like to hear how you check them. Open to a 15-minute call?`,
+      });
+    },
+  } as never;
+  const report = await runAll(cfg, { limit: 100, csvPath: "tests/fixtures/dirty_leads.csv" },
+    { ledger: openLedger(":memory:"), gates, llm });
+
+  it("drafts only the 5 leads that passed all gates", () => {
+    expect(report.drafts).toHaveLength(5);
+    expect(report.drafts_by_status).toEqual({ READY: 5 });
+    expect(report.drafts!.map((d) => d.lead_id).sort()).toEqual(report.passed.map((l) => l.lead_id).sort());
+  });
+
+  it("writes a readable drafts file next to the JSON report", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "out-"));
+    const path = await writeReport(report, dir);
+    const md = path.replace(/run-(.+)\.json$/, "drafts-$1.md");
+    expect(existsSync(md)).toBe(true);
+    expect(readFileSync(md, "utf8")).toContain("Subject: Claims review question");
+    expect(formatSummary(report)).toContain("DRAFTED");
   });
 });

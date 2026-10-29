@@ -2,16 +2,47 @@
   "campaign_name": "Ohio & Midwest Self-Funded Employers & TPAs",
   "mode": "CORPORATE",
   "sourcing_provider": "gemini_xray",
-  "target_geography": ["Ohio", "Indiana", "Michigan", "Kentucky"],
-  "decision_maker_titles": ["VP of Human Resources", "CFO", "Director of Benefits"],
-  "industry_keywords": ["Third Party Administrator", "Healthcare", "Manufacturing"],
+  "target_geography": [
+    "Ohio",
+    "Indiana",
+    "Michigan",
+    "Kentucky"
+  ],
+  "decision_maker_titles": [
+    "VP of Human Resources",
+    "CFO",
+    "Director of Benefits"
+  ],
+  "industry_keywords": [
+    "Third Party Administrator",
+    "Healthcare",
+    "Manufacturing"
+  ],
   "blocked_email_prefixes": [
-    "info", "contact", "admin", "support", "sales", "office",
-    "billing", "volunteer", "hr", "careers", "jobs", "recruiting", "media"
+    "info",
+    "contact",
+    "admin",
+    "support",
+    "sales",
+    "office",
+    "billing",
+    "volunteer",
+    "hr",
+    "careers",
+    "jobs",
+    "recruiting",
+    "media"
   ],
   "blocked_consumer_domains": [
-    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com", "icloud.com"
+    "gmail.com",
+    "yahoo.com",
+    "hotmail.com",
+    "outlook.com",
+    "aol.com",
+    "icloud.com"
   ],
   "calendar_duration_minutes": 15,
-  "auto_send_booking_replies": false
+  "auto_send_booking_replies": false,
+  "sender_company": "One Smarter",
+  "offer": "a 15-minute call to compare how their team reviews medical claims and payment files before money goes out"
 }

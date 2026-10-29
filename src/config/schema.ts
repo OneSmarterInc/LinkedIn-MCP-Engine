@@ -23,6 +23,10 @@ export const CampaignConfig = z.object({
   industry_keywords: z.array(z.string()).default([]),
   signal_query: z.string().optional(),
   outreach_persona: z.string().optional(),
+  /** Who the email is from (company name). The writer uses only this, never a guess. */
+  sender_company: z.string().optional(),
+  /** What we are asking for, in one plain sentence. The writer may not invent any other offer or claim. */
+  offer: z.string().optional(),
   blocked_email_prefixes: z.array(z.string()).default(DEFAULT_ROLE_PREFIXES),
   blocked_consumer_domains: z.array(z.string()).default(DEFAULT_CONSUMER_DOMAINS),
   block_current_employer_domain: z.boolean().default(false),

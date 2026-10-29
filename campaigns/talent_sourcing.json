@@ -2,10 +2,23 @@
   "campaign_name": "Senior Engineering & Healthcare IT Candidate Sourcing",
   "mode": "CANDIDATE",
   "sourcing_provider": "gemini_xray",
-  "target_geography": ["Ohio", "Remote"],
-  "decision_maker_titles": ["Senior Software Engineer", "Data Engineer", "HL7 Integration Specialist"],
-  "industry_keywords": ["Healthcare IT", "Python", "Cloud"],
+  "target_geography": [
+    "Ohio",
+    "Remote"
+  ],
+  "decision_maker_titles": [
+    "Senior Software Engineer",
+    "Data Engineer",
+    "HL7 Integration Specialist"
+  ],
+  "industry_keywords": [
+    "Healthcare IT",
+    "Python",
+    "Cloud"
+  ],
   "block_current_employer_domain": true,
   "calendar_duration_minutes": 15,
-  "auto_send_booking_replies": false
+  "auto_send_booking_replies": false,
+  "sender_company": "One Smarter",
+  "offer": "a 15-minute call about a senior engineering role with an Ohio healthcare IT team"
 }

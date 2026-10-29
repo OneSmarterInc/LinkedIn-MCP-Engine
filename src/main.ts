@@ -3,7 +3,7 @@ import { Command } from "commander";
 import { loadCampaign } from "./config/load.js";
 import { openLedger } from "./core/db.js";
 import { buildAsyncGates } from "./core/gates/index.js";
-import { formatSummary, runVerify, writeReport } from "./core/pipeline.js";
+import { formatSummary, runAll, runVerify, writeReport } from "./core/pipeline.js";
 import { getSearch } from "./lib/search/index.js";
 
 const program = new Command()
@@ -45,6 +45,46 @@ program
       console.log(formatSummary(report));
       console.log("");
       console.log(`Report saved: ${path}`);
+    } finally {
+      ledger.close();
+    }
+  });
+
+program
+  .command("run")
+  .description("Source leads, run all 5 gates, and draft an email for every lead that passes")
+  .requiredOption("-c, --campaign <path>", "path to campaign JSON")
+  .option("--csv <path>", "CSV or XLSX lead file (overrides the campaign's sourcing_provider)")
+  .option("-l, --limit <n>", "max leads to source", "50")
+  .option("-o, --out <dir>", "folder for the reports", "out")
+  .option("--show <n>", "drafts to print on screen", "3")
+  .action(async (o: { campaign: string; csv?: string; limit: string; out: string; show: string }) => {
+    const cfg = await loadCampaign(o.campaign);
+    const ledger = openLedger();
+    try {
+      console.log(`Running... (LLM: ${process.env.LLM_PROVIDER ?? "ollama"}, mailbox: ${process.env.MAILBOX_VERIFIER ?? "zerobounce"})`);
+      const gates = buildAsyncGates(cfg);
+      const report = await runAll(
+        cfg,
+        { limit: Number(o.limit), csvPath: o.csv },
+        {
+          ledger, gates, llm: gates.llm,
+          writer: { concurrency: Number(process.env.DRAFT_CONCURRENCY ?? 3) },
+          ...(o.csv ? {} : { search: getSearch(process.env, gates.llm) }),
+        },
+      );
+      const path = await writeReport(report, o.out);
+      console.log("");
+      console.log(formatSummary(report));
+      for (const d of (report.drafts ?? []).slice(0, Number(o.show))) {
+        console.log(`\n--- ${d.first_name} ${d.last_name} <${d.email}>  [${d.draft_status}]`);
+        console.log(`Subject: ${d.email_subject}\n`);
+        console.log(d.email_body);
+        if (d.draft_issues.length) console.log(`Issues: ${d.draft_issues.join("; ")}`);
+      }
+      console.log("");
+      console.log(`Report saved: ${path}`);
+      console.log(`Drafts saved: ${path.replace(/run-([^/\\]+)\.json$/, "drafts-$1.md")}`);
     } finally {
       ledger.close();
     }
