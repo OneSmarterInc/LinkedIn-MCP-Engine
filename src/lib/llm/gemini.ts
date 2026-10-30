@@ -13,6 +13,8 @@ export interface GeminiOptions {
    * so set false while on the free tier.
    */
   grounding?: boolean;
+  /** Max time for one request. Default 60 s. */
+  timeoutMs?: number;
 }
 
 /** The part of the SDK client we use; tests pass a fake. */
@@ -37,7 +39,12 @@ export class GeminiProvider implements LLMProvider {
   private readonly ai: GenAIClient;
 
   constructor(private readonly opts: GeminiOptions, client?: GenAIClient) {
-    this.ai = client ?? new GoogleGenAI({ apiKey: opts.apiKey });
+    // The SDK retries 429/5xx silently (5 tries, up to 60 s apart). Turn that off:
+    // our withRetry does the retrying and logs every attempt, so a slow key is visible.
+    this.ai = client ?? new GoogleGenAI({
+      apiKey: opts.apiKey,
+      httpOptions: { timeout: opts.timeoutMs ?? 60_000, retryOptions: { attempts: 1 } },
+    });
     this.supportsGrounding = opts.grounding ?? true;
   }
 
@@ -59,6 +66,7 @@ export class GeminiProvider implements LLMProvider {
           ...(opts.grounded ? { tools: [{ googleSearch: {} }] } : {}),
           ...(useJsonMode ? { responseMimeType: "application/json", responseJsonSchema: jsonSchema } : {}),
           ...(thinking ? { thinkingConfig: thinking } : {}),
+          httpOptions: { timeout: this.opts.timeoutMs ?? 60_000, retryOptions: { attempts: 1 } },
         },
       });
       const text = res.text;
@@ -68,6 +76,17 @@ export class GeminiProvider implements LLMProvider {
       // 4xx (bad key, unknown model, bad request) will not fix itself: stop instead of retrying.
       if (err instanceof ApiError && err.status >= 400 && err.status < 500 && err.status !== 429) {
         throw new AbortError(`gemini: HTTP ${err.status}: ${summarize(err.message)}`);
+      }
+      if (err instanceof ApiError && err.status === 429) {
+        const msg = summarize(err.message);
+        // A per-day or zero quota will not recover in seconds: stop and say so.
+        if (/per ?day|limit: ?0|billing/i.test(msg)) {
+          throw new AbortError(`gemini: quota exhausted (429). ${msg}`);
+        }
+        throw new Error(`gemini: rate limited (429), will retry. ${msg}`);
+      }
+      if ((err as Error).name === "AbortError" || /timed? ?out|timeout/i.test((err as Error).message)) {
+        throw new Error(`gemini: no answer within ${(this.opts.timeoutMs ?? 60_000) / 1000} s`);
       }
       throw err;
     }

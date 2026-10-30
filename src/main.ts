@@ -5,6 +5,7 @@ import { openLedger } from "./core/db.js";
 import { buildAsyncGates } from "./core/gates/index.js";
 import { formatSummary, runAll, runVerify, writeReport } from "./core/pipeline.js";
 import { getSearch } from "./lib/search/index.js";
+import { getLLM } from "./lib/llm/index.js";
 
 const program = new Command()
   .name("linkedin-mcp-engine")
@@ -20,6 +21,23 @@ program
     console.log(`Mode: ${c.mode} | Provider: ${c.sourcing_provider}`);
     console.log(`Titles: ${c.decision_maker_titles.join(", ")}`);
     console.log(`Geography: ${c.target_geography.join(", ")}`);
+  });
+
+program
+  .command("ping")
+  .description("Send one tiny request to the configured LLM and report how long it took")
+  .action(async () => {
+    const llm = getLLM();
+    const model = llm.name === "gemini" ? process.env.GEMINI_MODEL || "gemini-3.8-flash" : process.env.OLLAMA_MODEL;
+    console.log(`Pinging ${llm.name} (${model})...`);
+    const t = Date.now();
+    try {
+      const reply = await llm.generateText("Reply with the single word: ok", { thinking: "low" });
+      console.log(`OK in ${((Date.now() - t) / 1000).toFixed(1)} s. Reply: ${reply.trim().slice(0, 40)}`);
+    } catch (err) {
+      console.log(`FAILED after ${((Date.now() - t) / 1000).toFixed(1)} s: ${(err as Error).message}`);
+      process.exitCode = 1;
+    }
   });
 
 program

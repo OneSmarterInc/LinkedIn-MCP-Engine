@@ -17,6 +17,7 @@ export function geminiOptions(env: NodeJS.ProcessEnv, apiKey: string) {
     model: env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
     ...(level ? { thinking: level as ThinkingLevel } : {}),
     grounding: (env.GEMINI_GROUNDING ?? "true").toLowerCase() !== "false",
+    timeoutMs: Number(env.LLM_TIMEOUT_MS || 60_000),
   };
 }
 export { GroundingUnsupportedError, extractJson } from "./provider.js";

@@ -55,6 +55,34 @@ describe("GeminiProvider", () => {
     expect(generateContent).toHaveBeenCalledTimes(1);
   });
 
+  it("retries a per-minute 429, then succeeds", async () => {
+    let n = 0;
+    const generateContent = vi.fn(async () => {
+      n += 1;
+      if (n === 1) throw new ApiError({ message: JSON.stringify({ error: { message: "Resource exhausted. Please try again later." } }), status: 429 });
+      return { text: "ok" };
+    });
+    const p = new GeminiProvider({ apiKey: "k", model: "m" }, { models: { generateContent } } as never);
+    expect(await p.generateText("hi")).toBe("ok");
+    expect(generateContent).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops at once on a daily or zero quota", async () => {
+    const body = JSON.stringify({ error: { message: "Quota exceeded for metric generate_content_free_tier_requests, limit: 0" } });
+    const generateContent = vi.fn(async () => { throw new ApiError({ message: body, status: 429 }); });
+    const p = new GeminiProvider({ apiKey: "k", model: "m" }, { models: { generateContent } } as never);
+    await expect(p.generateText("hi")).rejects.toThrow(/quota exhausted/);
+    expect(generateContent).toHaveBeenCalledTimes(1);
+  });
+
+  it("sends a request timeout and turns off the SDK's hidden retries", async () => {
+    const { client, generateContent } = fakeClient("ok");
+    const p = new GeminiProvider({ apiKey: "k", model: "m", timeoutMs: 15_000 }, client);
+    await p.generateText("hi");
+    const http = (generateContent.mock.calls[0]![0] as Req).config.httpOptions as { timeout: number; retryOptions: { attempts: number } };
+    expect(http).toEqual({ timeout: 15_000, retryOptions: { attempts: 1 } });
+  });
+
   it("retries a 503", async () => {
     let n = 0;
     const generateContent = vi.fn(async () => {
