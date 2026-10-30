@@ -1,0 +1,48 @@
+import Database from "better-sqlite3";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+
+export interface Ledger {
+  isContacted(email: string): boolean;
+  isSuppressed(email: string): boolean;
+  recordContact(c: { email: string; lead_id: string; full_name: string; campaign: string; status: string }): void;
+  suppress(email: string, reason: string): void;
+  close(): void;
+}
+
+export function openLedger(path = process.env.LEDGER_PATH ?? "data/ledger.db"): Ledger {
+  console.log("[DB 1] openLedger started");
+  console.log("[DB 2] Database path:", path);
+
+  if (path !== ":memory:") {
+    mkdirSync(dirname(path), { recursive: true });
+  }
+
+  console.log("[DB 3] Directory ready");
+
+  const db = new Database(path);
+
+  console.log("[DB 4] Database connection opened");
+
+  db.pragma("journal_mode = WAL");
+
+  console.log("[DB 5] WAL enabled");
+
+  const contacted = db.prepare("SELECT 1 FROM global_contacts_ledger WHERE email = ?");
+  const suppressed = db.prepare("SELECT 1 FROM suppression_list WHERE email = ?");
+  const insertContact = db.prepare(`
+    INSERT OR IGNORE INTO global_contacts_ledger (email, lead_id, full_name, campaign, status, first_seen_at)
+    VALUES (@email, @lead_id, @full_name, @campaign, @status, @first_seen_at)`);
+  const insertSuppress = db.prepare(
+    "INSERT OR REPLACE INTO suppression_list (email, reason, added_at) VALUES (?, ?, ?)");
+
+  return {
+    isContacted: (email) => contacted.get(email.toLowerCase()) !== undefined,
+    isSuppressed: (email) => suppressed.get(email.toLowerCase()) !== undefined,
+    recordContact: (c) =>
+      void insertContact.run({ ...c, email: c.email.toLowerCase(), first_seen_at: new Date().toISOString() }),
+    suppress: (email, reason) =>
+      void insertSuppress.run(email.toLowerCase(), reason, new Date().toISOString()),
+    close: () => db.close(),
+  };
+}
