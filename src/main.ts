@@ -118,26 +118,17 @@ program
   .option("-l, --limit <n>", "max leads to source", "50")
   .option("-o, --out <dir>", "folder for the reports", "out")
   .option("--show <n>", "drafts to print on screen", "3")
-<<<<<<< Updated upstream
   .addOption(
     new Option("--export <target>", "also send the result to the Google Sheet (sheet), an Excel file (xlsx), or both")
       .choices(["none", "sheet", "xlsx", "both"])
       .default("none"),
   )
   .action(async (o: { campaign: string; csv?: string; limit: string; out: string; show: string; export: ExportTarget }) => {
-=======
-  .action(async (o: { campaign: string; csv?: string; limit: string; out: string; show: string }) => {
-    console.log("[DEBUG 1] Run action started");
-
->>>>>>> Stashed changes
     const cfg = await loadCampaign(o.campaign);
-    console.log("[DEBUG 2] Campaign loaded");
 
     const ledger = openLedger();
-    console.log("[DEBUG 3] Ledger opened");
 
     try {
-        console.log("[DEBUG 4] Entered try block");
       console.log(`Running... (LLM: ${process.env.LLM_PROVIDER ?? "ollama"}, mailbox: ${process.env.MAILBOX_VERIFIER ?? "zerobounce"})`);
       const gates = buildAsyncGates(cfg);
       const report = await runAll(
