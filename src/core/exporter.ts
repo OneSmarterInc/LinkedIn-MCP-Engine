@@ -34,6 +34,10 @@ export const STATUS = {
   replied: "Replied",
   meetingBooked: "Meeting Booked",
   optedOut: "Opted Out",
+  // Written by apps_script/AutoBooker.gs. Listed here so the dropdown accepts them.
+  sending: "Sending",
+  sendError: "Send Error",
+  bounced: "Bounced",
 } as const;
 export const STATUS_OPTIONS: string[] = Object.values(STATUS);
 

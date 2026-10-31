@@ -1,0 +1,26 @@
+{
+  "campaign_name": "Enterprise Local AI & Off-Premises Hosting",
+  "mode": "CORPORATE",
+  "sourcing_provider": "gemini_xray",
+  "target_geography": [
+    "United States",
+    "India"
+  ],
+  "decision_maker_titles": [
+    "Chief Technology Officer",
+    "VP of Engineering",
+    "Director of IT Infrastructure",
+    "Chief Information Security Officer"
+  ],
+  "industry_keywords": [
+    "Healthcare",
+    "Financial Services",
+    "Enterprise Software",
+    "Manufacturing"
+  ],
+  "sender_company": "Your Company Name",
+  "offer": "a 15-minute call to discuss hosting custom LLMs securely on your own off-premises infrastructure or our private cloud",
+  "calendar_duration_minutes": 15,
+  "auto_send_booking_replies": false,
+  "daily_send_cap": 15
+}

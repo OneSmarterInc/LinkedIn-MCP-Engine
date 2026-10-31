@@ -43,7 +43,8 @@ export class GeminiProvider implements LLMProvider {
     // our withRetry does the retrying and logs every attempt, so a slow key is visible.
     this.ai = client ?? new GoogleGenAI({
       apiKey: opts.apiKey,
-      httpOptions: { timeout: opts.timeoutMs ?? 60_000, retryOptions: { attempts: 1 } },
+      // Inside constructor and call method config:
+      httpOptions: { timeout: opts.timeoutMs ?? 180_000, retryOptions: { attempts: 1 } }
     });
     this.supportsGrounding = opts.grounding ?? true;
   }
@@ -66,7 +67,7 @@ export class GeminiProvider implements LLMProvider {
           ...(opts.grounded ? { tools: [{ googleSearch: {} }] } : {}),
           ...(useJsonMode ? { responseMimeType: "application/json", responseJsonSchema: jsonSchema } : {}),
           ...(thinking ? { thinkingConfig: thinking } : {}),
-          httpOptions: { timeout: this.opts.timeoutMs ?? 60_000, retryOptions: { attempts: 1 } },
+          httpOptions: { timeout: this.opts.timeoutMs ?? 180_000, retryOptions: { attempts: 1 } },
         },
       });
       const text = res.text;
@@ -86,7 +87,7 @@ export class GeminiProvider implements LLMProvider {
         throw new Error(`gemini: rate limited (429), will retry. ${msg}`);
       }
       if ((err as Error).name === "AbortError" || /timed? ?out|timeout/i.test((err as Error).message)) {
-        throw new Error(`gemini: no answer within ${(this.opts.timeoutMs ?? 60_000) / 1000} s`);
+        throw new Error(`gemini: no answer within ${(this.opts.timeoutMs ?? 180_000) / 1000} s`);
       }
       throw err;
     }
