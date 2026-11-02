@@ -70,6 +70,8 @@ On Windows PowerShell, call `npx tsx src/main.ts` directly. `npm run dev --` dro
 
 `source_leads` now accepts a campaign Name as well as a path.
 
+`export_run` sends a drafted run to the Sheet: drafts to the Pipeline tab as "Ready for Review", failures to Quarantined, emails recorded in the ledger. The full chat chain is `source_leads` → `verify_leads` → `draft_emails` → `export_run`.
+
 ## The morning run
 
 One schedule, one command: `run-active`. It reads active rows, runs each one through source → 5 gates → draft → export to the Pipeline tab, honoring each row's DailyCap. A failure in one campaign is logged and the next one still runs.

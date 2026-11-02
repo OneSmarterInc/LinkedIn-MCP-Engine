@@ -263,9 +263,13 @@ export function sheetCampaignStore(gw: SheetsGateway): CampaignStore {
         await gw.writeValues(`${CAMPAIGNS_TAB}!A${existing.rowNumber}:${LAST}${existing.rowNumber}`, [row], "raw");
         return { name: cfg.campaign_name, active, mode: cfg.mode, status: "OK", rowNumber: existing.rowNumber };
       }
-      await gw.appendValues(`${CAMPAIGNS_TAB}!A1:${LAST}`, [row]);
-      const added = await findRow(cfg.campaign_name);
-      return { name: cfg.campaign_name, active, mode: cfg.mode, status: "OK", rowNumber: added?.rowNumber ?? -1 };
+      // Checkbox cells hold FALSE, so Google's append would land below them (row 1001). Write into the first row with no Name instead.
+      const { rows } = await readAll();
+      const nameIdx = colIndex("Name");
+      const target = rows.findIndex((r) => !(r[nameIdx] ?? "").trim());
+      const rowNumber = target === -1 ? rows.length + 2 : target + 2;
+      await gw.writeValues(`${CAMPAIGNS_TAB}!A${rowNumber}:${LAST}${rowNumber}`, [row], "raw");
+      return { name: cfg.campaign_name, active, mode: cfg.mode, status: "OK", rowNumber };
     },
 
     async setActive(name, active) {

@@ -147,6 +147,15 @@ describe("sheetCampaignStore", () => {
     expect(tabs.get(CAMPAIGNS_TAB)!.rows[1]![H.indexOf("Offer")]).toBe("a new offer line");
   });
 
+  it("writes a new campaign into the first empty Name row, not below 1000 checkbox rows", async () => {
+    const blank = H.map((h) => (h === "Active" || h === "BlockEmployerDomain" ? "FALSE" : ""));
+    const { gw, tabs } = fakeSheets({ [CAMPAIGNS_TAB]: [H, goodRow(), blank, blank, blank] });
+    const s = await sheetCampaignStore(gw).save({ ...corporateCfg, campaign_name: "New One", offer: "a 15-minute call", sender_company: "One Smarter" });
+    expect(s.rowNumber).toBe(3);
+    expect(tabs.get(CAMPAIGNS_TAB)!.rows[2]![H.indexOf("Name")]).toBe("New One");
+    expect(tabs.get(CAMPAIGNS_TAB)!.rows).toHaveLength(5);
+  });
+
   it("activates valid rows and refuses to activate a broken one", async () => {
     const { gw, tabs } = fakeSheets({ [CAMPAIGNS_TAB]: [H, goodRow({ Active: "FALSE" }), goodRow({ Name: "Broken", Titles: "" })] });
     const store = sheetCampaignStore(gw);

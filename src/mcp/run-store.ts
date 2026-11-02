@@ -8,7 +8,7 @@ import type { SourceResult } from "../core/sources/types.js";
 import type { VerifyOutput } from "../core/verifier.js";
 import type { DraftedLead } from "../core/enricher.js";
 
-export type McpRunStatus = "SOURCED" | "VERIFIED" | "DRAFTED";
+export type McpRunStatus = "SOURCED" | "VERIFIED" | "DRAFTED" | "EXPORTED";
 
 export interface McpRunState {
   run_id: string;
@@ -18,6 +18,7 @@ export interface McpRunState {
   source: SourceResult;
   verification?: VerifyOutput;
   drafts?: DraftedLead[];
+  exported_at?: string;
   created_at: string;
   updated_at: string;
 }
@@ -79,7 +80,7 @@ export async function loadRunState(
 
   if (
     state.run_id !== runId ||
-    !["SOURCED", "VERIFIED", "DRAFTED"].includes(state.status) ||
+    !["SOURCED", "VERIFIED", "DRAFTED", "EXPORTED"].includes(state.status) ||
     !state.source ||
     !Array.isArray(state.source.leads)
   ) {

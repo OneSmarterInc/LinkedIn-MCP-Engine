@@ -16,7 +16,8 @@ import { getLLM } from "../lib/llm/index.js";
 import { getSearch } from "../lib/search/index.js";
 import { createSheetsGateway } from "../lib/google/sheets.js";
 import { createCalendarGateway } from "../lib/google/calendar.js";
-import { TAB, PIPELINE_HEADERS, STATUS } from "../core/exporter.js";
+import { TAB, PIPELINE_HEADERS, STATUS, exportToSheet, recordExported } from "../core/exporter.js";
+import type { RunReport } from "../core/pipeline.js";
 
 import {
   createRunId,
@@ -199,6 +200,77 @@ server.registerTool(
         needs_rewrite: drafts.filter(d => d.draft_status === "NEEDS_REWRITE").length,
         errors: drafts.filter(d => d.draft_status === "DRAFT_ERROR").length,
         drafts
+      });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL 3b: EXPORT RUN TO THE SHEET
+server.registerTool(
+  "export_run",
+  {
+    description:
+      "Send a drafted run to the Google Sheet: drafts go to the Pipeline tab as 'Ready for Review', failed leads to the Quarantined tab. " +
+      "Exported emails are recorded in the ledger so a later run will not contact them again. Call after draft_emails.",
+    inputSchema: {
+      run_id: z.string().min(1)
+    }
+  },
+  async ({ run_id }) => {
+    try {
+      const state = await loadRunState(run_id);
+
+      if (state.status === "EXPORTED") {
+        return success({ run_id, status: state.status, message: `Run was already exported at ${state.exported_at}. Nothing added.` });
+      }
+      if (state.status !== "DRAFTED" || !state.drafts || !state.verification) {
+        throw new Error("Run must be drafted before export. Call draft_emails first.");
+      }
+
+      const tally = <T,>(items: T[], key: (t: T) => string) =>
+        items.reduce<Record<string, number>>((acc, i) => { acc[key(i)] = (acc[key(i)] ?? 0) + 1; return acc; }, {});
+
+      const report: RunReport = {
+        run_id,
+        campaign: state.config.campaign_name,
+        mode: state.config.mode,
+        provider: state.source.provider,
+        started_at: state.created_at,
+        finished_at: new Date().toISOString(),
+        counts: {
+          rows_read: state.source.leads.length + state.source.skipped.length,
+          skipped: state.source.skipped.length,
+          sourced: state.source.leads.length,
+          passed: state.verification.passed.length,
+          quarantined: state.verification.quarantined.length
+        },
+        quarantined_by_reason: tally(state.verification.quarantined, (q) => q.result.failure_reason ?? "UNKNOWN"),
+        skipped_by_reason: tally(state.source.skipped, (r) => r.reason),
+        passed: state.verification.passed,
+        quarantined: state.verification.quarantined,
+        skipped: state.source.skipped,
+        drafts: state.drafts,
+        drafts_by_status: tally(state.drafts, (d) => d.draft_status)
+      };
+
+      const res = await exportToSheet(report, createSheetsGateway());
+      const recorded = recordExported(report, res.exported, ledger);
+
+      state.status = "EXPORTED";
+      state.exported_at = new Date().toISOString();
+      state.updated_at = state.exported_at;
+      await saveRunState(state);
+
+      return success({
+        run_id,
+        status: state.status,
+        pipeline_added: res.pipeline_added,
+        pipeline_already_present: res.pipeline_already_present,
+        quarantined_added: res.quarantined_added,
+        ledger_recorded: recorded,
+        message: `${res.pipeline_added} draft(s) are in the Pipeline tab as "${STATUS.ready}". ${res.quarantined_added} lead(s) in Quarantined.`
       });
     } catch (error) {
       return failure(error);
