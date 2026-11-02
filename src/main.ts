@@ -20,6 +20,7 @@ import {
 import type { Ledger } from "./core/db.js";
 import { getSearch } from "./lib/search/index.js";
 import { getLLM } from "./lib/llm/index.js";
+import { formatOptOutSync, syncOptOuts } from "./core/optout-sync.js";
 
 type ExportTarget = "none" | "sheet" | "xlsx" | "both";
 
@@ -81,6 +82,28 @@ async function exportRun(
   }
 }
 
+/**
+ * Pulls opt-outs from the Google Sheet into the ledger before any leads are checked.
+ * Runs only when a Sheet is configured. If the Sheet cannot be read, it throws,
+ * so the run stops instead of possibly emailing someone who said stop.
+ */
+async function syncOptOutsIfConfigured(ledger: Ledger, skip: boolean): Promise<void> {
+  if (skip) {
+    console.log("Opt-out sync SKIPPED (--skip-optout-sync).");
+    return;
+  }
+  if (!process.env.GOOGLE_SHEET_ID) return;
+  const { createSheetsGateway } = await import("./lib/google/sheets.js");
+  try {
+    console.log(formatOptOutSync(await syncOptOuts(createSheetsGateway(), ledger)));
+  } catch (err) {
+    throw new Error(
+      `Could not read opt-outs from the Google Sheet, so the run was stopped: ${(err as Error).message}\n` +
+      "Fix the Sheet connection, or rerun with --skip-optout-sync if you are sure no one has opted out.",
+    );
+  }
+}
+
 const program = new Command()
   .name("linkedin-mcp-engine")
   .description(
@@ -137,6 +160,22 @@ program
   });
 
 program
+  .command("sync-optouts")
+  .description("Copy Opted Out / Bounced rows from the Google Sheet into the ledger's do-not-contact list")
+  .action(async () => {
+    if (!process.env.GOOGLE_SHEET_ID) throw new Error("GOOGLE_SHEET_ID is empty, so there is no Sheet to read.");
+    const ledger = openLedger();
+    try {
+      const { createSheetsGateway } = await import("./lib/google/sheets.js");
+      const r = await syncOptOuts(createSheetsGateway(), ledger);
+      console.log(formatOptOutSync(r));
+      for (const e of r.addedEmails) console.log(`  + ${e}`);
+    } finally {
+      ledger.close();
+    }
+  });
+
+program
   .command("verify")
   .description("Source leads (CSV or search) and run them through all 5 gates")
   .requiredOption("-c, --campaign <path>", "path to campaign JSON")
@@ -146,17 +185,20 @@ program
   )
   .option("-l, --limit <n>", "max leads to source", "50")
   .option("-o, --out <dir>", "folder for the JSON report", "out")
+  .option("--skip-optout-sync", "do not read opt-outs from the Google Sheet first", false)
   .action(
     async (o: {
       campaign: string;
       csv?: string;
       limit: string;
       out: string;
+      skipOptoutSync: boolean;
     }) => {
       const cfg = await loadCampaign(o.campaign);
       const ledger = openLedger();
 
       try {
+        await syncOptOutsIfConfigured(ledger, o.skipOptoutSync);
         console.log(
           `Running... (LLM: ${process.env.LLM_PROVIDER ?? "ollama"}, mailbox: ${process.env.MAILBOX_VERIFIER ?? "zerobounce"})`,
         );
@@ -206,6 +248,7 @@ program
       .choices(["none", "sheet", "xlsx", "both"])
       .default("none"),
   )
+  .option("--skip-optout-sync", "do not read opt-outs from the Google Sheet first", false)
   .action(
     async (o: {
       campaign: string;
@@ -214,11 +257,13 @@ program
       out: string;
       show: string;
       export: ExportTarget;
+      skipOptoutSync: boolean;
     }) => {
       const cfg = await loadCampaign(o.campaign);
       const ledger = openLedger();
 
       try {
+        await syncOptOutsIfConfigured(ledger, o.skipOptoutSync);
         console.log(
           `Running... (LLM: ${process.env.LLM_PROVIDER ?? "ollama"}, mailbox: ${process.env.MAILBOX_VERIFIER ?? "zerobounce"})`,
         );

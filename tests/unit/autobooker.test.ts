@@ -1,419 +1,416 @@
+/**
+ * Tests for apps_script/AutoBooker.gs.
+ * The script runs inside a Node vm with fakes for the Google services it uses
+ * (SpreadsheetApp, GmailApp, CalendarApp, LockService, Utilities, Session, ScriptApp).
+ * The clock is frozen at Monday 2 Nov 2026, 09:00 Eastern.
+ */
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
+import { PIPELINE_HEADERS } from "../../src/core/exporter.js";
+import { DO_NOT_CONTACT_STATUSES } from "../../src/core/optout-sync.js";
 
-/**
- * Runs apps_script/AutoBooker.gs against a fake Google (fake Sheet, Gmail, Calendar, Gemini),
- * so the sender's safety rules are tested without sending anything real.
- */
+const NOW = Date.UTC(2026, 10, 2, 14, 0); // Mon 2 Nov 2026 09:00 America/New_York
+const SCRIPT = readFileSync(join(process.cwd(), "apps_script/AutoBooker.gs"), "utf8");
 
-const HEADERS = ["Company", "Domain", "Name", "Title", "Email", "Research", "Status", "Subject", "DraftBody", "ThreadID"];
-const STATUS_COL = 6;
-const THREAD_COL = 9;
-
-interface FakeMsg { getFrom(): string; getSubject(): string; getPlainBody(): string; getId(): string }
-interface FakeThread { getId(): string; getMessages(): FakeMsg[]; reply(t: string): void; replies: string[]; msgs: FakeMsg[] }
-
-interface Api {
-  CONFIG: Record<string, unknown>;
-  processApprovedEmails(): void;
-  checkRepliesAndBook(): void;
-  stripQuoted_(text: string): string;
-  isOptOut_(text: string): boolean;
-}
-
-function row(o: Partial<Record<string, string>> = {}): string[] {
-  const base: Record<string, string> = {
-    Company: "Acme", Domain: "acme.com", Name: "Jane Miller", Title: "CFO", Email: "jane@acme.com",
-    Research: "", Status: "Approved", Subject: "A note for Acme", DraftBody: "Hi Jane,\n\nOne. Two. Three. Four?", ThreadID: "",
-  };
-  return HEADERS.map((h) => o[h] ?? base[h]!);
-}
-
-function futureSlot(hourUtc = 15, kind: "weekday" | "saturday" = "weekday"): string {
-  const d = new Date();
-  d.setUTCDate(d.getUTCDate() + 7);
-  d.setUTCHours(hourUtc, 0, 0, 0);
-  while (kind === "weekday" ? [0, 6].includes(d.getUTCDay()) : d.getUTCDay() !== 6) d.setUTCDate(d.getUTCDate() + 1);
-  return d.toISOString();
-}
-
-function setup(rows: string[][]) {
-  const data: string[][] = [HEADERS, ...rows];
-  const notes = new Map<string, string>();
-  const sent: { to: string; subject: string; body: string; opts: { name?: string } }[] = [];
-  const threads = new Map<string, FakeThread>();
-  const events: unknown[][] = [];
-  const props = new Map<string, string>([["GEMINI_API_KEY", "test-key"]]);
-  const fetches: unknown[][] = [];
-  const state = { busy: false, gemini: { code: 200, body: "" as string }, sendThrows: false, n: 0 };
-
-  const addMsg = (t: FakeThread, from: string, subject: string, body: string) => {
-    state.n += 1;
-    const id = `M${state.n}`;
-    t.msgs.push({ getFrom: () => from, getSubject: () => subject, getPlainBody: () => body, getId: () => id });
-  };
-  const addThread = (id: string): FakeThread => {
-    const t: FakeThread = { getId: () => id, getMessages: () => t.msgs, reply: (x) => void t.replies.push(x), replies: [], msgs: [] };
-    addMsg(t, "Me <me@one.com>", "A note for Acme", "our email");
-    threads.set(id, t);
-    return t;
-  };
-  const gemini = (o: unknown) => {
-    state.gemini = { code: 200, body: JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(o) }] } }] }) };
-  };
-
-  const sheet = {
-    getDataRange: () => ({ getValues: () => data.map((r) => [...r]) }),
-    getRange: (r: number, c: number) => ({
-      setValue: (v: string) => { data[r - 1]![c - 1] = v; },
-      setNote: (n: string) => { notes.set(`${r}:${c}`, n); },
-    }),
-  };
-
+// ---------------------------------------------------------------- Utilities.formatDate
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+function formatDate(d: Date, tz: string, pattern: string): string {
+  const p = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, year: "numeric", month: "numeric", day: "numeric",
+      hour: "numeric", minute: "numeric", hourCycle: "h23", weekday: "long",
+    }).formatToParts(d).map((x) => [x.type, x.value]),
+  ) as Record<string, string>;
+  const y = +p.year!, M = +p.month!, D = +p.day!, H = +p.hour!, m = +p.minute!;
+  const h12 = H % 12 === 0 ? 12 : H % 12;
   const pad = (n: number) => String(n).padStart(2, "0");
+  return pattern.replace(/'[^']*'|yyyy|EEEE|MMM|MM|M|dd|d|HH|H|hh|h|mm|m|a/g, (t) => {
+    switch (t) {
+      case "yyyy": return String(y);
+      case "EEEE": return p.weekday!;
+      case "MMM": return MONTHS[M - 1]!;
+      case "MM": return pad(M);
+      case "M": return String(M);
+      case "dd": return pad(D);
+      case "d": return String(D);
+      case "HH": return pad(H);
+      case "H": return String(H);
+      case "hh": return pad(h12);
+      case "h": return String(h12);
+      case "mm": return pad(m);
+      case "m": return String(m);
+      case "a": return H < 12 ? "AM" : "PM";
+      default: return t.slice(1, -1); // quoted literal
+    }
+  });
+}
+
+// ---------------------------------------------------------------- fake Sheets
+class FakeSheet {
+  cells: unknown[][] = [];
+  appended: unknown[][] = [];
+  constructor(public name: string) {}
+  get(r: number, c: number) { return this.cells[r]?.[c] ?? ""; }
+  set(r: number, c: number, v: unknown) { (this.cells[r] ??= [])[c] = v; }
+  getLastRow() { let n = 0; this.cells.forEach((row, i) => { if (row && row.some((v) => v !== "" && v !== undefined)) n = i; }); return n; }
+  getMaxColumns() { return 26; }
+  getMaxRows() { return 1000; }
+  insertColumnsAfter() {}
+  setColumnWidth() {} setColumnWidths() {} setFrozenRows() {}
+  getRange(r: number, c: number, nr = 1, nc = 1) {
+    const self = this;
+    const range = {
+      getValues: () => Array.from({ length: nr }, (_, i) => Array.from({ length: nc }, (_, j) => self.get(r + i, c + j))),
+      setValue: (v: unknown) => { self.set(r, c, v); return range; },
+      setValues: (vals: unknown[][]) => { vals.forEach((row, i) => row.forEach((v, j) => self.set(r + i, c + j, v))); return range; },
+      setFontWeight: () => range, setBackground: () => range, setNumberFormat: () => range,
+    };
+    return range;
+  }
+  getDataRange() {
+    const last = this.getLastRow();
+    let cols = 0; this.cells.forEach((row) => { if (row) cols = Math.max(cols, row.length - 1); });
+    return this.getRange(1, 1, last, cols);
+  }
+  appendRow(row: unknown[]) { this.appended.push(row); this.set(this.getLastRow() + 1, 1, row[0]); row.forEach((v, j) => this.set(this.getLastRow(), j + 1, v)); }
+}
+
+type Row = Partial<Record<"company" | "name" | "email" | "status" | "subject" | "body" | "threadId" | "messageId" | "sentAt" | "lastReplyAt" | "sendState" | "notes", unknown>>;
+const COLS = { company: 1, domain: 2, name: 3, title: 4, email: 5, research: 6, status: 7, subject: 8, body: 9, threadId: 10, messageId: 11, sentAt: 12, lastReplyAt: 13, sendState: 14, notes: 15 } as const;
+
+const LIVE_CONFIG: Record<string, string> = {
+  DryRun: "FALSE", SenderName: "Vikram Sethi", SenderTitle: "Founder", Street: "1 Main St", CityStateZip: "Dayton, OH 45402",
+};
+
+// ---------------------------------------------------------------- fake Gmail / Calendar
+interface FakeMsg { from: string; date: Date; body: string }
+class FakeThread {
+  replies: string[] = [];
+  constructor(public id: string, public msgs: FakeMsg[]) {}
+  getId() { return this.id; }
+  getMessages() { return this.msgs.map((m) => ({ getFrom: () => m.from, getDate: () => m.date, getPlainBody: () => m.body })); }
+  reply(text: string) { this.replies.push(text); }
+}
+
+function setup(opts: { rows?: Row[]; config?: Record<string, string>; busy?: { s: Date; e: Date }[]; threads?: FakeThread[]; lockFree?: boolean; sendThrows?: boolean } = {}) {
+  const sheets = new Map<string, FakeSheet>();
+  const pipeline = new FakeSheet("Pipeline");
+  sheets.set("Pipeline", pipeline);
+  PIPELINE_HEADERS.forEach((h, i) => pipeline.set(1, i + 1, h));
+  (opts.rows ?? []).forEach((row, i) => {
+    for (const [k, v] of Object.entries(row)) pipeline.set(i + 2, COLS[k as keyof typeof COLS], v);
+  });
+
+  const config = new FakeSheet("Config");
+  sheets.set("Config", config);
+  config.set(1, 1, "Key"); config.set(1, 2, "Value");
+  Object.entries(opts.config ?? {}).forEach(([k, v], i) => { config.set(i + 2, 1, k); config.set(i + 2, 2, v); });
+
+  const sent: { to: string; subject: string; body: string }[] = [];
+  const events: { title: string; start: Date; end: Date; opts: Record<string, unknown> }[] = [];
+  const threads = new Map((opts.threads ?? []).map((t) => [t.id, t]));
+  let n = 0;
+
+  const RealDate = Date;
+  function FakeDate(this: unknown, ...a: unknown[]) {
+    return a.length ? new (RealDate as unknown as new (...x: unknown[]) => Date)(...a) : new RealDate(NOW);
+  }
+  FakeDate.prototype = RealDate.prototype;
+  Object.assign(FakeDate, { now: () => NOW, UTC: RealDate.UTC, parse: RealDate.parse });
+
   const globals = {
-    Logger: { log: () => undefined },
-    LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => undefined }) },
-    PropertiesService: { getScriptProperties: () => ({ getProperty: (k: string) => props.get(k) ?? null, setProperty: (k: string, v: string) => void props.set(k, v) }) },
-    Session: { getScriptTimeZone: () => "UTC", getEffectiveUser: () => ({ getEmail: () => "me@one.com" }) },
-    Utilities: {
-      sleep: () => undefined,
-      formatDate: (d: Date, _tz: string, f: string) => {
-        const day = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"][d.getUTCDay()]!;
-        const date = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
-        if (f === "yyyy-MM-dd") return date;
-        if (f === "H") return String(d.getUTCHours());
-        if (f === "m") return String(d.getUTCMinutes());
-        if (f === "u") return String(d.getUTCDay() === 0 ? 7 : d.getUTCDay());
-        if (f === "XXX") return "Z";
-        return `${day}, ${date} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
-      },
+    Date: FakeDate,
+    console: { log: () => {} },
+    SpreadsheetApp: {
+      flush: () => {},
+      getActiveSpreadsheet: () => ({
+        getSheetByName: (name: string) => sheets.get(name) ?? null,
+        insertSheet: (name: string) => { const s = new FakeSheet(name); sheets.set(name, s); return s; },
+      }),
     },
-    SpreadsheetApp: { getActiveSpreadsheet: () => ({ getSheetByName: (n: string) => (n === "Pipeline" ? sheet : null) }), flush: () => undefined },
     GmailApp: {
-      createDraft: (to: string, subject: string, body: string, opts: { name?: string }) => ({
+      createDraft: (to: string, subject: string, body: string) => ({
         send: () => {
-          if (state.sendThrows) throw new Error("Gmail is down");
-          sent.push({ to, subject, body, opts });
-          const t = addThread(`T${sent.length}`);
-          return { getThread: () => t };
+          if (opts.sendThrows) throw new Error("Gmail quota");
+          n += 1;
+          sent.push({ to, subject, body });
+          const t = new FakeThread(`thread-${n}`, []);
+          threads.set(t.id, t);
+          return { getId: () => `msg-${n}`, getThread: () => t };
         },
       }),
       getThreadById: (id: string) => threads.get(id) ?? null,
     },
     CalendarApp: {
       getDefaultCalendar: () => ({
-        getEvents: () => (state.busy ? [{}] : []),
-        createEvent: (...args: unknown[]) => void events.push(args),
+        getEvents: (s: Date, e: Date) => (opts.busy ?? [])
+          .filter((b) => s.getTime() < b.e.getTime() && e.getTime() > b.s.getTime())
+          .map((b) => ({ getStartTime: () => b.s, getEndTime: () => b.e })),
+        createEvent: (title: string, start: Date, end: Date, o: Record<string, unknown>) => { events.push({ title, start, end, opts: o }); },
       }),
     },
-    UrlFetchApp: {
-      fetch: (...args: unknown[]) => {
-        fetches.push(args);
-        return { getResponseCode: () => state.gemini.code, getContentText: () => state.gemini.body };
-      },
-    },
+    LockService: { getScriptLock: () => ({ tryLock: () => opts.lockFree !== false, releaseLock: () => {} }) },
+    Utilities: { formatDate },
+    Session: { getScriptTimeZone: () => "America/New_York" },
+    ScriptApp: { getProjectTriggers: () => [], deleteTrigger: () => {}, newTrigger: () => ({ timeBased: () => ({ everyMinutes: () => ({ create: () => {} }) }) }) },
   };
 
-  const ctx = vm.createContext({ ...globals });
-  vm.runInContext(
-    readFileSync(join(process.cwd(), "apps_script/AutoBooker.gs"), "utf8") +
-      "\n;globalThis.__api = { CONFIG, processApprovedEmails, checkRepliesAndBook, stripQuoted_, isOptOut_, buildEmailBody_, setupTriggers };",
-    ctx,
-  );
-  const api = (ctx as unknown as { __api: Api }).__api;
-  const configure = () => Object.assign(api.CONFIG, {
-    SENDER_NAME: "Alex Rivera", SENDER_TITLE: "Founder", COMPANY_NAME: "One Smarter Inc.",
-    POSTAL_ADDRESS: "1 Main Street, Dayton, OH 45402", SEND_GAP_MS: 0,
-  });
-
-  return {
-    api, configure, data, notes, sent, threads, events, props, fetches, state, addThread, addMsg, gemini,
-    status: (i: number) => data[i]![STATUS_COL]!,
-    note: (i: number) => notes.get(`${i + 1}:${STATUS_COL + 1}`),
-  };
+  const ctx = vm.createContext(globals) as Record<string, (...a: unknown[]) => unknown>;
+  vm.runInContext(SCRIPT, ctx);
+  const cell = (row: number, col: keyof typeof COLS) => pipeline.get(row, COLS[col]);
+  return { ctx, pipeline, cell, sent, events, threads };
 }
 
-const STOP_FOOTER = 'If you would rather not hear from me again, just reply "STOP" and I will not contact you again.';
-const quoted = `\n\nOn Mon, Nov 2, 2026 at 9:00 AM Me <me@one.com> wrote:\n> Hi Jane,\n> One. Two.\n> ${STOP_FOOTER}\n`;
+const et = (y: number, mo: number, d: number, h: number, mi = 0) =>
+  new Date(Date.UTC(y, mo - 1, d, h + 5, mi)); // Eastern Standard Time (after 1 Nov 2026)
 
-describe("sending", () => {
-  it("refuses to send while the name and postal address are still placeholders", () => {
-    const e = setup([row()]);
-    expect(() => e.api.processApprovedEmails()).toThrow(/CONFIG\./);
-    expect(e.sent).toHaveLength(0);
-    expect(e.status(1)).toBe("Approved");
-  });
+// =====================================================================================
+describe("reply reading (pure functions)", () => {
+  const { ctx } = setup();
+  const strip = (t: string) => ctx.stripQuotedText_!(t) as string;
+  const classify = (t: string) => (ctx.classifyReply_!(t, { notes: "" }, { TimeZone: "America/New_York" }) as { kind: string }).kind;
 
-  it("sends only Approved rows, with signature, postal address and opt-out line", () => {
-    const e = setup([row(), row({ Email: "bob@acme.com", Status: "Ready for Review" })]);
-    e.configure();
-    e.api.processApprovedEmails();
-    expect(e.sent).toHaveLength(1);
-    const m = e.sent[0]!;
-    expect(m.to).toBe("jane@acme.com");
-    expect(m.body).toContain("Alex Rivera");
-    expect(m.body).toContain("1 Main Street, Dayton, OH 45402");
-    expect(m.body).toContain('reply "STOP"');
-    expect(m.body).not.toContain("Automated Outreach Engine");
-    expect(m.opts.name).toBe("Alex Rivera");
-    expect(e.status(1)).toBe("Sent");
-    expect(e.data[1]![THREAD_COL]).toBe("T1");
-    expect(e.status(2)).toBe("Ready for Review");
-  });
+  const quoted = "Sure, Tuesday at 2pm works.\n\nOn Mon, Nov 2, 2026 at 9:00 AM Vikram <v@onesmarter.com> wrote:\n> reply with the word unsubscribe and I will remove you.";
 
-  it("never emails the same person twice, even if two rows are Approved", () => {
-    const e = setup([row(), row({ Name: "Jane M." })]);
-    e.configure();
-    e.api.processApprovedEmails();
-    expect(e.sent).toHaveLength(1);
-    expect(e.status(2)).toBe("Rejected");
-  });
+  it("cuts Gmail quoted text", () => expect(strip(quoted)).toBe("Sure, Tuesday at 2pm works."));
+  it("cuts Outlook quoted text", () => expect(strip("No thanks.\n________________________________\nFrom: Vikram\nSent: Monday")).toBe("No thanks."));
+  it("cuts lines quoted with > even without an 'On ... wrote:' header", () =>
+    expect(strip("Thursday works.\n> If you would rather not hear from me again, reply with the word unsubscribe")).toBe("Thursday works."));
+  it("cuts phone signatures", () => expect(strip("Yes please.\nSent from my iPhone")).toBe("Yes please."));
 
-  it("skips people already Sent, Opted Out or stuck in Sending", () => {
-    const e = setup([
-      row({ Email: "a@x.com", Status: "Sent" }), row({ Email: "a@x.com" }),
-      row({ Email: "b@x.com", Status: "Opted Out" }), row({ Email: "b@x.com" }),
-      row({ Email: "c@x.com", Status: "Sending" }), row({ Email: "c@x.com" }),
-    ]);
-    e.configure();
-    e.api.processApprovedEmails();
-    expect(e.sent).toHaveLength(0);
-    expect([2, 4, 6].map((i) => e.status(i))).toEqual(["Rejected", "Rejected", "Rejected"]);
-  });
-
-  it("flags bad addresses and empty drafts instead of sending", () => {
-    const e = setup([row({ Email: "not-an-email" }), row({ Email: "ok@x.com", DraftBody: "" })]);
-    e.configure();
-    e.api.processApprovedEmails();
-    expect(e.sent).toHaveLength(0);
-    expect([e.status(1), e.status(2)]).toEqual(["Send Error", "Send Error"]);
-  });
-
-  it("stops at the daily limit, and the limit survives into the next run", () => {
-    const rows = ["a", "b", "c", "d"].map((n) => row({ Email: `${n}@x.com` }));
-    const e = setup(rows);
-    e.configure();
-    e.api.CONFIG.MAX_SENDS_PER_DAY = 2;
-    e.api.processApprovedEmails();
-    e.api.processApprovedEmails();
-    expect(e.sent).toHaveLength(2);
-    expect([1, 2, 3, 4].map((i) => e.status(i))).toEqual(["Sent", "Sent", "Approved", "Approved"]);
-  });
-
-  it("respects the per-run limit", () => {
-    const e = setup(["a", "b", "c"].map((n) => row({ Email: `${n}@x.com` })));
-    e.configure();
-    e.api.CONFIG.MAX_SENDS_PER_RUN = 1;
-    e.api.processApprovedEmails();
-    expect(e.sent).toHaveLength(1);
-  });
-
-  it("marks Send Error (and no thread id) when Gmail fails", () => {
-    const e = setup([row()]);
-    e.configure();
-    e.state.sendThrows = true;
-    e.api.processApprovedEmails();
-    expect(e.status(1)).toBe("Send Error");
-    expect(e.data[1]![THREAD_COL]).toBe("");
-  });
+  it("a friendly reply that quotes our opt-out line is NOT an opt-out", () => expect(classify(strip(quoted))).toBe("TIME_PROPOSED"));
+  it.each(["Please remove me from your list.", "unsubscribe", "Stop emailing me", "Not interested, thanks.", "Do not contact me again"])(
+    "opt-out: %s", (t) => expect(classify(t)).toBe("OPT_OUT"));
+  it.each(["What times do you have open this week?", "Send me a few options", "What's your availability?"])(
+    "times requested: %s", (t) => expect(classify(t)).toBe("TIMES_REQUESTED"));
+  it.each(["Can you tell me more about pricing?", "Thursday could work.", "", "We sat down and discussed it."])(
+    "needs a person: %j", (t) => expect(classify(t)).toBe("NEEDS_HUMAN"));
 });
 
-describe("reading replies", () => {
-  const sentRow = (o: Partial<Record<string, string>> = {}) => row({ Status: "Sent", ThreadID: "T1", ...o });
-  const reply = (e: ReturnType<typeof setup>, body: string, from = "Jane <jane@acme.com>", subject = "Re: A note for Acme") =>
-    e.addMsg(e.threads.get("T1")!, from, subject, body);
-
-  it("does NOT treat a reply that quotes our STOP footer as an opt-out", () => {
-    const e = setup([sentRow()]);
-    e.configure();
-    e.addThread("T1");
-    e.gemini({ isInterested: true, wantsNoContact: false, dateTimeISO: futureSlot() });
-    reply(e, "Thursday at 3pm works for me." + quoted);
-    e.api.checkRepliesAndBook();
-    expect(e.status(1)).toBe("Replied");
-    expect(e.fetches).toHaveLength(1);
-  });
-
-  it.each(["STOP", "stop.", "Please stop emailing me.", "Unsubscribe", "Remove me from your list", "Don't contact me again"])(
-    "marks %s as Opted Out",
-    (text) => {
-      const e = setup([sentRow()]);
-      e.addThread("T1");
-      reply(e, text + quoted);
-      e.api.checkRepliesAndBook();
-      expect(e.status(1)).toBe("Opted Out");
-      expect(e.fetches).toHaveLength(0);
-    },
-  );
-
-  it("does not treat 'stop by' as an opt-out", () => {
-    const e = setup([sentRow()]);
-    e.addThread("T1");
-    e.gemini({ isInterested: false, wantsNoContact: false, dateTimeISO: null });
-    reply(e, "Feel free to stop by our office next week.");
-    e.api.checkRepliesAndBook();
-    expect(e.status(1)).toBe("Replied");
-  });
-
-  it("still honours an opt-out after the row already says Replied or Meeting Booked", () => {
-    const e = setup([sentRow({ Status: "Replied" }), sentRow({ Status: "Meeting Booked", Email: "b@x.com", ThreadID: "T2" })]);
-    e.addThread("T1");
-    e.addThread("T2");
-    reply(e, "STOP");
-    e.addMsg(e.threads.get("T2")!, "Bob <b@x.com>", "Re: hi", "unsubscribe me please");
-    e.api.checkRepliesAndBook();
-    expect([e.status(1), e.status(2)]).toEqual(["Opted Out", "Opted Out"]);
-  });
-
-  it("marks bounces as Bounced, and ignores out-of-office auto-replies", () => {
-    const e = setup([sentRow(), sentRow({ Email: "b@x.com", ThreadID: "T2" })]);
-    e.addThread("T1");
-    e.addThread("T2");
-    reply(e, "Address not found", "Mail Delivery Subsystem <mailer-daemon@googlemail.com>", "Delivery Status Notification (Failure)");
-    e.addMsg(e.threads.get("T2")!, "Bob <b@x.com>", "Automatic reply: A note", "I am away until Monday");
-    e.api.checkRepliesAndBook();
-    expect([e.status(1), e.status(2)]).toEqual(["Bounced", "Sent"]);
-  });
-
-  it("reads each reply only once", () => {
-    const e = setup([sentRow()]);
-    e.addThread("T1");
-    e.gemini({ isInterested: false, wantsNoContact: false, dateTimeISO: null });
-    reply(e, "Not now, thanks.");
-    e.api.checkRepliesAndBook();
-    e.api.checkRepliesAndBook();
-    expect(e.fetches).toHaveLength(1);
-  });
-
-  it("leaves it for a human when there is no Gemini key", () => {
-    const e = setup([sentRow()]);
-    e.props.delete("GEMINI_API_KEY");
-    e.addThread("T1");
-    reply(e, "Sure, let's talk Tuesday 10am.");
-    e.api.checkRepliesAndBook();
-    expect(e.status(1)).toBe("Replied");
-    expect(e.fetches).toHaveLength(0);
-    expect(e.events).toHaveLength(0);
-  });
-
-  it("leaves it for a human when Gemini fails", () => {
-    const e = setup([sentRow()]);
-    e.addThread("T1");
-    e.state.gemini = { code: 500, body: "" };
-    reply(e, "Sure, let's talk Tuesday 10am.");
-    e.api.checkRepliesAndBook();
-    expect(e.status(1)).toBe("Replied");
-    expect(e.note(1)).toContain("Read it in Gmail");
-    expect(e.events).toHaveLength(0);
-  });
-});
-
-describe("booking", () => {
-  const start = () => {
-    const e = setup([row({ Status: "Sent", ThreadID: "T1" })]);
-    e.configure();
-    e.addThread("T1");
-    return e;
-  };
-  const interested = (e: ReturnType<typeof setup>, iso: string | null) => {
-    e.gemini({ isInterested: true, wantsNoContact: false, dateTimeISO: iso });
-    e.addMsg(e.threads.get("T1")!, "Jane <jane@acme.com>", "Re: A note", "Yes, happy to talk.");
+describe("time parsing", () => {
+  const { ctx } = setup();
+  const now = new Date(NOW);
+  const parse = (t: string, tz = "America/New_York") => {
+    const d = ctx.parseProposedTime_!(t, now, tz) as Date | null;
+    return d ? d.toISOString() : null;
   };
 
-  it("by default only flags the proposed time: no event, no email", () => {
-    const e = start();
-    interested(e, futureSlot());
-    e.api.checkRepliesAndBook();
-    expect(e.status(1)).toBe("Replied");
-    expect(e.note(1)).toContain("AUTO_BOOK");
-    expect(e.events).toHaveLength(0);
-    expect(e.threads.get("T1")!.replies).toHaveLength(0);
-  });
-
-  it("with AUTO_BOOK on, creates the event and really invites the prospect", () => {
-    const e = start();
-    e.api.CONFIG.AUTO_BOOK = true;
-    interested(e, futureSlot());
-    e.api.checkRepliesAndBook();
-    expect(e.status(1)).toBe("Meeting Booked");
-    expect(e.events).toHaveLength(1);
-    const [title, , , opts] = e.events[0] as [string, Date, Date, { guests: string; sendInvites: boolean }];
-    expect(title).toContain("Jane Miller");
-    expect(opts.guests).toBe("jane@acme.com");
-    expect(opts.sendInvites).toBe(true);
-    expect(e.threads.get("T1")!.replies).toHaveLength(0);
-  });
-
-  it("only sends the confirmation email when AUTO_REPLY is also on", () => {
-    const e = start();
-    e.api.CONFIG.AUTO_BOOK = true;
-    e.api.CONFIG.AUTO_REPLY = true;
-    interested(e, futureSlot());
-    e.api.checkRepliesAndBook();
-    expect(e.threads.get("T1")!.replies).toHaveLength(1);
-  });
-
-  it.each([
-    ["in the past", "2020-01-06T15:00:00Z", /past/],
-    ["on a weekend", futureSlot(15, "saturday"), /weekend/],
-    ["outside business hours", futureSlot(23), /business hours/],
-  ])("will not book a time that is %s", (_n, iso, why) => {
-    const e = start();
-    e.api.CONFIG.AUTO_BOOK = true;
-    interested(e, iso);
-    e.api.checkRepliesAndBook();
-    expect(e.events).toHaveLength(0);
-    expect(e.status(1)).toBe("Replied");
-    expect(e.note(1)).toMatch(why);
-  });
-
-  it("will not double-book a busy calendar", () => {
-    const e = start();
-    e.api.CONFIG.AUTO_BOOK = true;
-    e.state.busy = true;
-    interested(e, futureSlot());
-    e.api.checkRepliesAndBook();
-    expect(e.events).toHaveLength(0);
-    expect(e.note(1)).toContain("busy");
-  });
-
-  it("flags interest with no specific time instead of guessing one", () => {
-    const e = start();
-    e.api.CONFIG.AUTO_BOOK = true;
-    interested(e, null);
-    e.api.checkRepliesAndBook();
-    expect(e.events).toHaveLength(0);
-    expect(e.note(1)).toContain("no specific time");
-  });
+  it("Tuesday at 2pm Eastern (after the DST change)", () => expect(parse("tuesday at 2pm")).toBe("2026-11-03T19:00:00.000Z"));
+  it("Nov 5 at 10:30 am Central", () => expect(parse("Nov 5 at 10:30 am", "America/Chicago")).toBe("2026-11-05T16:30:00.000Z"));
+  it("tomorrow at noon", () => expect(parse("tomorrow at noon")).toBe("2026-11-03T17:00:00.000Z"));
+  it("11/6 at 14:30", () => expect(parse("11/6 at 14:30")).toBe("2026-11-06T19:30:00.000Z"));
+  it("Thurs. 3 pm", () => expect(parse("thurs 3 pm")).toBe("2026-11-05T20:00:00.000Z"));
+  it("'monday' on a Monday means next week", () => expect(parse("monday at 10am")).toBe("2026-11-09T15:00:00.000Z"));
+  it("rejects a time already past", () => expect(parse("today at 8am")).toBeNull());
+  it("rejects a time more than 60 days out", () => expect(parse("feb 20 at 10am")).toBeNull());
+  it("needs both a day and a time", () => { expect(parse("tuesday")).toBeNull(); expect(parse("at 2pm")).toBeNull(); });
 });
 
-describe("helpers", () => {
-  const { api } = setup([]);
-  it("strips the quoted copy of our email", () => {
-    expect(api.stripQuoted_("Sounds good.\n\nOn Mon, Nov 2, 2026 at 9:00 AM A <a@b.com> wrote:\n> old\n")).toBe("Sounds good.");
-    expect(api.stripQuoted_("Yes\n\n-----Original Message-----\nFrom: x")).toBe("Yes");
-    expect(api.stripQuoted_("> only quoted\nreal line")).toBe("real line");
+// =====================================================================================
+describe("sendApproved", () => {
+  const approved = (email: string, extra: Row = {}): Row => ({
+    company: "Acme", name: "Jane Miller", email, status: "Approved", subject: "Claims review", body: "Hi Jane,\n\nFour sentences.", ...extra,
   });
-  it("detects opt-outs conservatively", () => {
-    expect(api.isOptOut_("no more emails please")).toBe(true);
-    expect(api.isOptOut_("Thursday works")).toBe(false);
-  });
-  it("creates exactly one 10-minute trigger per job, with no duplicates on re-run", () => {
-    const created: string[] = [];
-    const deleted: string[] = [];
-    const existing = [{ getHandlerFunction: () => "processApprovedEmails" }];
-    const ctx = vm.createContext({
-      ScriptApp: {
-        getProjectTriggers: () => existing,
-        deleteTrigger: (t: { getHandlerFunction(): string }) => void deleted.push(t.getHandlerFunction()),
-        newTrigger: (fn: string) => ({ timeBased: () => ({ everyMinutes: (n: number) => ({ create: () => void created.push(`${fn}:${n}`) }) }) }),
-      },
+
+  it("sends only Approved rows, once, and records the thread", () => {
+    const t = setup({
+      config: LIVE_CONFIG,
+      rows: [approved("a@acme.com"), { ...approved("b@acme.com"), status: "Ready for Review" }, { ...approved("c@acme.com"), status: "Needs Rewrite" }],
     });
-    vm.runInContext(readFileSync(join(process.cwd(), "apps_script/AutoBooker.gs"), "utf8") + "\n;setupTriggers();", ctx);
-    expect(created).toEqual(["processApprovedEmails:10", "checkRepliesAndBook:10"]);
-    expect(deleted).toEqual(["processApprovedEmails"]);
+    t.ctx.sendApproved!();
+    expect(t.sent.map((s) => s.to)).toEqual(["a@acme.com"]);
+    expect(t.cell(2, "status")).toBe("Sent");
+    expect(t.cell(2, "threadId")).toBe("thread-1");
+    expect(t.cell(2, "messageId")).toBe("msg-1");
+    expect(t.cell(2, "sendState")).toBe("SENT");
+    expect(t.cell(2, "sentAt")).toBeInstanceOf(Date);
+  });
+
+  it("never sends the same row twice, even if the trigger runs again", () => {
+    const t = setup({ config: LIVE_CONFIG, rows: [approved("a@acme.com")] });
+    t.ctx.sendApproved!();
+    t.pipeline.set(2, COLS.status, "Approved"); // someone flips it back by hand
+    t.ctx.sendApproved!();
+    expect(t.sent).toHaveLength(1);
+  });
+
+  it("skips a row left mid-send (SENDING) by a crashed run", () => {
+    const t = setup({ config: LIVE_CONFIG, rows: [approved("a@acme.com", { sendState: "SENDING" })] });
+    t.ctx.sendApproved!();
+    expect(t.sent).toHaveLength(0);
+  });
+
+  it("adds the signature with postal address and the opt-out line", () => {
+    const t = setup({ config: LIVE_CONFIG, rows: [approved("a@acme.com")] });
+    t.ctx.sendApproved!();
+    const body = t.sent[0]!.body;
+    expect(body).toContain("Vikram Sethi");
+    expect(body).toContain("1 Main St");
+    expect(body).toContain("Dayton, OH 45402");
+    expect(body).toMatch(/unsubscribe/);
+  });
+
+  it("stops at the daily cap, counting what was already sent today", () => {
+    const t = setup({
+      config: { ...LIVE_CONFIG, DailySendCap: "2" },
+      rows: [
+        { ...approved("old@acme.com"), status: "Sent", sentAt: new Date(NOW - 3600_000), messageId: "m0", sendState: "SENT" },
+        approved("a@acme.com"), approved("b@acme.com"),
+      ],
+    });
+    t.ctx.sendApproved!();
+    expect(t.sent.map((s) => s.to)).toEqual(["a@acme.com"]);
+    expect(t.cell(4, "status")).toBe("Approved");
+  });
+
+  it("dry run sends nothing and leaves a note", () => {
+    const t = setup({ rows: [approved("a@acme.com")] }); // DryRun defaults to TRUE
+    t.ctx.sendApproved!();
+    expect(t.sent).toHaveLength(0);
+    expect(String(t.cell(2, "notes"))).toContain("[DRY RUN]");
+    expect(t.cell(2, "status")).toBe("Approved");
+  });
+
+  it("refuses to go live without a full signature", () => {
+    const t = setup({ config: { DryRun: "FALSE", SenderName: "Vikram" }, rows: [approved("a@acme.com")] });
+    expect(() => t.ctx.sendApproved!()).toThrow(/Street|CityStateZip/);
+    expect(t.sent).toHaveLength(0);
+  });
+
+  it("marks a failed send and does not retry it automatically", () => {
+    const t = setup({ config: LIVE_CONFIG, rows: [approved("a@acme.com")], sendThrows: true });
+    t.ctx.sendApproved!();
+    expect(t.cell(2, "sendState")).toBe("SEND_FAILED");
+    expect(t.cell(2, "status")).toBe("Approved");
+  });
+
+  it("does nothing when another run holds the lock", () => {
+    const t = setup({ config: LIVE_CONFIG, rows: [approved("a@acme.com")], lockFree: false });
+    t.ctx.sendApproved!();
+    expect(t.sent).toHaveLength(0);
+  });
+});
+
+// =====================================================================================
+describe("processReplies", () => {
+  const ours = { from: "Vikram Sethi <v@onesmarter.com>", date: new Date(NOW - 86_400_000), body: "Hi Jane, ..." };
+  const fromLead = (body: string, minutesAgo = 30) => ({ from: "Jane Miller <jane@acme.com>", date: new Date(NOW - minutesAgo * 60_000), body });
+  const sentRow = (threadId: string, extra: Row = {}): Row => ({
+    company: "Acme", name: "Jane Miller", email: "jane@acme.com", status: "Sent", threadId, messageId: "m1", sendState: "SENT", ...extra,
+  });
+  const run = (reply: string, opts: { config?: Record<string, string>; busy?: { s: Date; e: Date }[]; row?: Row } = {}) => {
+    const thread = new FakeThread("t1", [ours, fromLead(reply)]);
+    const t = setup({ config: opts.config ?? LIVE_CONFIG, rows: [sentRow("t1", opts.row)], threads: [thread], busy: opts.busy });
+    t.ctx.processReplies!();
+    return { ...t, thread };
+  };
+
+  it("books a proposed time: invite goes to the lead, confirmation is sent", () => {
+    const t = run("Tuesday at 2pm works.\n\nOn Mon, Nov 2, 2026 at 9:00 AM Vikram wrote:\n> reply with the word unsubscribe");
+    expect(t.events).toHaveLength(1);
+    const e = t.events[0]!;
+    expect(e.start.toISOString()).toBe("2026-11-03T19:00:00.000Z");
+    expect(e.end.getTime() - e.start.getTime()).toBe(15 * 60_000);
+    expect(e.opts).toMatchObject({ guests: "jane@acme.com", sendInvites: true });
+    expect(t.thread.replies[0]).toContain("Booked for Tuesday, Nov 3 at 2:00 PM Eastern");
+    expect(t.cell(2, "status")).toBe("Meeting Booked");
+    expect(t.cell(2, "sendState")).toBe("BOOKED");
+  });
+
+  it("an opt-out is recorded with the exact status the ledger sync looks for", () => {
+    const t = run("Please remove me from your list.");
+    expect(t.cell(2, "status")).toBe("Opted Out");
+    expect(DO_NOT_CONTACT_STATUSES[String(t.cell(2, "status")).toLowerCase()]).toBe("OPTED_OUT");
+    expect(t.thread.replies).toHaveLength(0);
+    expect(t.events).toHaveLength(0);
+  });
+
+  it("offers 3 free slots on different working days when asked for times", () => {
+    const t = run("What times do you have this week?");
+    expect(t.cell(2, "status")).toBe("Replied");
+    expect(t.cell(2, "sendState")).toBe("TIMES_OFFERED");
+    const reply = t.thread.replies[0]!;
+    expect(reply).toContain("Eastern");
+    const days = reply.match(/(Monday|Tuesday|Wednesday|Thursday|Friday), Nov \d+/g) ?? [];
+    expect(new Set(days).size).toBe(3);
+    expect(reply).not.toMatch(/Saturday|Sunday/);
+  });
+
+  it("offers other times when the proposed one is busy", () => {
+    const t = run("Tuesday at 2pm?", { busy: [{ s: et(2026, 11, 3, 13, 30), e: et(2026, 11, 3, 14, 30) }] });
+    expect(t.events).toHaveLength(0);
+    expect(t.thread.replies[0]).toContain("I already have something at that time.");
+    expect(t.cell(2, "sendState")).toBe("TIMES_OFFERED");
+  });
+
+  it("does not offer a slot that clashes with the calendar", () => {
+    const busyAll10s = [3, 4, 5, 6].map((d) => ({ s: et(2026, 11, d, 10), e: et(2026, 11, d, 11) }));
+    const t = run("What times work for you?", { busy: busyAll10s });
+    expect(t.thread.replies[0]).not.toMatch(/at 10:00 AM/);
+  });
+
+  it("refuses a time outside working hours", () => {
+    const t = run("Tuesday at 7pm works");
+    expect(t.events).toHaveLength(0);
+    expect(t.thread.replies[0]).toContain("outside my working hours");
+  });
+
+  it("refuses a weekend time", () => {
+    const t = run("Saturday at 10am is good");
+    expect(t.events).toHaveLength(0);
+    expect(t.thread.replies[0]).toContain("not in the office that day");
+  });
+
+  it("hands anything unclear to a person without replying", () => {
+    const t = run("Can you tell me more about pricing?");
+    expect(t.cell(2, "status")).toBe("Replied");
+    expect(t.cell(2, "sendState")).toBe("NEEDS_HUMAN");
+    expect(t.thread.replies).toHaveLength(0);
+  });
+
+  it("does not handle the same reply twice", () => {
+    const t = run("What times do you have?");
+    t.ctx.processReplies!();
+    expect(t.thread.replies).toHaveLength(1);
+  });
+
+  it("leaves NEEDS_HUMAN rows alone", () => {
+    const t = run("What times do you have?", { row: { sendState: "NEEDS_HUMAN", status: "Replied" } });
+    expect(t.thread.replies).toHaveLength(0);
+  });
+
+  it("ignores messages that are not from the lead", () => {
+    const thread = new FakeThread("t1", [ours, { from: "someone@else.com", date: new Date(NOW - 60_000), body: "unsubscribe" }]);
+    const t = setup({ config: LIVE_CONFIG, rows: [sentRow("t1")], threads: [thread] });
+    t.ctx.processReplies!();
+    expect(t.cell(2, "status")).toBe("Sent");
+  });
+
+  it("dry run classifies but does not reply, book, or change Status", () => {
+    const t = run("Tuesday at 2pm works.", { config: {} });
+    expect(t.events).toHaveLength(0);
+    expect(t.thread.replies).toHaveLength(0);
+    expect(t.cell(2, "status")).toBe("Sent");
+    expect(String(t.cell(2, "notes"))).toContain("[DRY RUN] reply classified TIME_PROPOSED");
+  });
+});
+
+describe("compatibility with the exporter", () => {
+  it("uses the same 8 Status values as the exporter's dropdown", () => {
+    const { ctx } = setup();
+    const statuses = vm.runInContext("STATUS", ctx as vm.Context) as Record<string, string>;
+    expect(Object.values(statuses).sort()).toEqual(
+      ["Approved", "Meeting Booked", "Needs Rewrite", "Opted Out", "Ready for Review", "Rejected", "Replied", "Sent"],
+    );
+  });
+
+  it("reads columns A–J in the exporter's order", () => {
+    const { ctx } = setup();
+    const col = vm.runInContext("COL", ctx as vm.Context) as Record<string, number>;
+    const order = ["company", "domain", "name", "title", "email", "research", "status", "subject", "body", "threadId"];
+    order.forEach((k, i) => expect(col[k]).toBe(i + 1));
+    expect(PIPELINE_HEADERS).toHaveLength(10);
   });
 });
