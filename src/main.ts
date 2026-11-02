@@ -1,7 +1,8 @@
 ﻿
 import "dotenv/config";
 import { Command, Option } from "commander";
-import { loadCampaign } from "./config/load.js";
+import { defaultSheetsGateway, loadCampaign } from "./config/load.js";
+import { fileCampaignStore, sheetCampaignStore, type CampaignSummary } from "./config/store.js";
 import { openLedger } from "./core/db.js";
 import { buildAsyncGates } from "./core/gates/index.js";
 import {
@@ -113,7 +114,7 @@ const program = new Command()
 program
   .command("info")
   .description("Load a campaign file and print its settings")
-  .requiredOption("-c, --campaign <path>", "path to campaign JSON")
+  .requiredOption("-c, --campaign <ref>", "campaign JSON path, or the Name of a row in the Sheet's Campaigns tab")
   .action(async (o: { campaign: string }) => {
     const c = await loadCampaign(o.campaign);
 
@@ -178,7 +179,7 @@ program
 program
   .command("verify")
   .description("Source leads (CSV or search) and run them through all 5 gates")
-  .requiredOption("-c, --campaign <path>", "path to campaign JSON")
+  .requiredOption("-c, --campaign <ref>", "campaign JSON path, or the Name of a row in the Sheet's Campaigns tab")
   .option(
     "--csv <path>",
     "CSV or XLSX lead file (overrides the campaign's sourcing_provider)",
@@ -232,7 +233,7 @@ program
   .description(
     "Source leads, run all 5 gates, and draft an email for every lead that passes",
   )
-  .requiredOption("-c, --campaign <path>", "path to campaign JSON")
+  .requiredOption("-c, --campaign <ref>", "campaign JSON path, or the Name of a row in the Sheet's Campaigns tab")
   .option(
     "--csv <path>",
     "CSV or XLSX lead file (overrides the campaign's sourcing_provider)",
@@ -313,6 +314,94 @@ program
       }
     },
   );
+
+// ---------------------------------------------------------------------------
+// campaign: manage the Campaigns tab in the Google Sheet (production home of campaigns)
+// ---------------------------------------------------------------------------
+
+function printCampaigns(rows: CampaignSummary[]): void {
+  if (!rows.length) { console.log("No campaigns in the Campaigns tab yet. Use `campaign import` or add a row."); return; }
+  const w = Math.max(4, ...rows.map((r) => r.name.length));
+  console.log(`${"Name".padEnd(w)}  Active  Mode       Status`);
+  for (const r of rows) {
+    console.log(`${r.name.padEnd(w)}  ${(r.active ? "yes" : "no").padEnd(6)}  ${r.mode.padEnd(9)}  ${r.status}`);
+  }
+}
+
+const campaign = program.command("campaign").description("List, check, import, activate or pause campaigns in the Sheet");
+
+campaign.command("list").description("Show every row in the Campaigns tab").action(async () => {
+  printCampaigns(await sheetCampaignStore(await defaultSheetsGateway()).list());
+});
+
+campaign.command("validate").description("Re-check every row and write OK or the problem into its Status cell").action(async () => {
+  const rows = await sheetCampaignStore(await defaultSheetsGateway()).validateAll();
+  printCampaigns(rows);
+  const bad = rows.filter((r) => r.status !== "OK").length;
+  console.log(bad ? `\n${bad} row(s) need fixing. The Status cell says what.` : "\nAll rows are valid.");
+});
+
+campaign.command("show").description("Print one campaign as the engine sees it").argument("<ref>", "Name in the Sheet, or a JSON path")
+  .action(async (ref: string) => { console.log(JSON.stringify(await loadCampaign(ref), null, 2)); });
+
+campaign.command("import").description("Copy JSON campaign files into the Campaigns tab (paused)").argument("<files...>")
+  .option("--active", "import as active", false)
+  .action(async (files: string[], o: { active: boolean }) => {
+    const store = sheetCampaignStore(await defaultSheetsGateway());
+    for (const f of files) {
+      const cfg = await fileCampaignStore().get(f);
+      const s = await store.save(cfg, { active: o.active });
+      console.log(`${f} -> row ${s.rowNumber} "${s.name}" (${s.active ? "active" : "paused"})`);
+    }
+  });
+
+campaign.command("activate").description("Turn a campaign on. It runs on the next `run-active`").argument("<name>")
+  .action(async (name: string) => { await sheetCampaignStore(await defaultSheetsGateway()).setActive(name, true); console.log(`"${name}" is active.`); });
+
+campaign.command("pause").description("Turn a campaign off").argument("<name>")
+  .action(async (name: string) => { await sheetCampaignStore(await defaultSheetsGateway()).setActive(name, false); console.log(`"${name}" is paused.`); });
+
+program
+  .command("run-active")
+  .description("Run every active campaign in the Sheet (source, 5 gates, draft, export to Sheet). For the morning schedule.")
+  .option("-l, --limit <n>", "max leads to source per campaign", "50")
+  .option("-o, --out <dir>", "folder for the reports", "out")
+  .addOption(new Option("--export <target>", "where results go").choices(["none", "sheet", "xlsx", "both"]).default("sheet"))
+  .action(async (o: { limit: string; out: string; export: ExportTarget }) => {
+    const gw = await defaultSheetsGateway();
+    const store = sheetCampaignStore(gw);
+    const active = (await store.list()).filter((c) => c.active);
+    if (!active.length) { console.log("No active campaigns. Nothing to do."); return; }
+    console.log(`${active.length} active campaign(s): ${active.map((c) => c.name).join(", ")}`);
+
+    const ledger = openLedger();
+    let failures = 0;
+    try {
+      await syncOptOutsIfConfigured(ledger, false);
+      for (const c of active) {
+        console.log(`\n=== ${c.name} ===`);
+        try {
+          const cfg = await store.get(c.name);
+          const gates = buildAsyncGates(cfg);
+          const report = await runAll(cfg, { limit: Number(o.limit) }, {
+            ledger, gates, llm: gates.llm,
+            writer: { concurrency: Number(process.env.DRAFT_CONCURRENCY ?? 3) },
+            search: getSearch(process.env, gates.llm),
+          });
+          const path = await writeReport(report, o.out);
+          console.log(formatSummary(report));
+          console.log(`Report saved: ${path}`);
+          await exportRun(o.export, report, ledger, o.out);
+        } catch (err) {
+          failures += 1;
+          console.error(`"${c.name}" failed: ${(err as Error).message}. Moving to the next campaign.`);
+        }
+      }
+    } finally {
+      ledger.close();
+    }
+    if (failures) process.exitCode = 1;
+  });
 
 program.parseAsync().catch((err: Error) => {
   console.error(`Error: ${err.message}`);

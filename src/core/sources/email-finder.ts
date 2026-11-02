@@ -1,6 +1,7 @@
 import type { LeadRecord } from "../../config/schema.js";
 import { logger } from "../../lib/logger.js";
 import { apolloMatch, guessEmail } from "./apollo-finder.js";
+import { seamlessMatch, type SeamlessOptions } from "./seamless-finder.js";
 
 /**
  * Turns a person + company domain into an email address.
@@ -48,11 +49,42 @@ export function apolloEmailFinder(opts: ApolloFinderOptions): EmailFinder {
   };
 }
 
+export interface SeamlessFinderOptions {
+  apiKey: string;
+  /** Also guess first.last@domain when Seamless has nothing. Guesses must pass ZeroBounce at Gate 5. */
+  guessPattern: boolean;
+  fetchFn?: typeof fetch;
+  poll?: SeamlessOptions;
+}
+
+export function seamlessEmailFinder(opts: SeamlessFinderOptions): EmailFinder {
+  return {
+    name: opts.guessPattern ? "seamless+pattern" : "seamless",
+    async find(lead) {
+      if (lead.email) return { email: lead.email, email_source: lead.email_source ?? "search" };
+
+      const found = await seamlessMatch(lead, opts.apiKey, opts.fetchFn, opts.poll);
+      if (found) return { email: found, email_source: "seamless" };
+
+      if (opts.guessPattern) {
+        const guess = guessEmail(lead);
+        if (guess) {
+          logger.debug({ lead_id: lead.lead_id }, "email guessed from pattern");
+          return { email: guess, email_source: "pattern" };
+        }
+      }
+      return {};
+    },
+  };
+}
+
 /**
  * EMAIL_FINDER:
  *  - none            keep the search's email (default)
  *  - apollo          Apollo people/match only
  *  - apollo_pattern  Apollo, then a first.last@domain guess (needs MAILBOX_VERIFIER=zerobounce to pass)
+ *  - seamless        Seamless.AI Contact Research only
+ *  - seamless_pattern Seamless, then the same first.last@domain guess
  */
 export function getEmailFinder(env: NodeJS.ProcessEnv = process.env): EmailFinder {
   const choice = (env.EMAIL_FINDER ?? "none").trim().toLowerCase();
@@ -62,5 +94,10 @@ export function getEmailFinder(env: NodeJS.ProcessEnv = process.env): EmailFinde
     if (!apiKey) throw new Error(`EMAIL_FINDER=${choice} but APOLLO_API_KEY is empty`);
     return apolloEmailFinder({ apiKey, guessPattern: choice === "apollo_pattern" });
   }
-  throw new Error(`Unknown EMAIL_FINDER "${choice}". Use none, apollo, or apollo_pattern.`);
+  if (choice === "seamless" || choice === "seamless_pattern") {
+    const apiKey = env.SEAMLESS_API_KEY?.trim();
+    if (!apiKey) throw new Error(`EMAIL_FINDER=${choice} but SEAMLESS_API_KEY is empty`);
+    return seamlessEmailFinder({ apiKey, guessPattern: choice === "seamless_pattern" });
+  }
+  throw new Error(`Unknown EMAIL_FINDER "${choice}". Use none, apollo, apollo_pattern, seamless, or seamless_pattern.`);
 }

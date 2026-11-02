@@ -5,6 +5,8 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { loadCampaign } from "../config/load.js";
+import { CampaignConfig, Mode, SourcingProvider } from "../config/schema.js";
+import { sheetCampaignStore } from "../config/store.js";
 import { openLedger } from "../core/db.js";
 import { buildAsyncGates } from "../core/gates/index.js";
 import { draftAll } from "../core/enricher.js";
@@ -52,7 +54,7 @@ function failure(error: unknown) {
 server.registerTool(
   "source_leads",
   {
-    description: "Source leads using an existing campaign configuration and create a persistent run.",
+    description: "Source leads for a campaign and create a persistent run. campaign_path is a JSON path, or the Name of a row in the Campaigns tab.",
     inputSchema: {
       campaign_path: z.string().min(1),
       csv_path: z.string().min(1).optional(),
@@ -591,6 +593,134 @@ server.registerTool(
         email_sent: false,
         meeting
       });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// ---------------------------------------------------------------------------
+// CAMPAIGN TOOLS: the Campaigns tab in the Sheet is where production campaigns live.
+// A person (or Claude on their behalf) adds a row; no file, no deploy.
+// ---------------------------------------------------------------------------
+
+const campaignStore = () => sheetCampaignStore(createSheetsGateway());
+
+// TOOL 8: LIST CAMPAIGNS
+server.registerTool(
+  "list_campaigns",
+  {
+    description: "List every campaign in the Sheet's Campaigns tab with its mode, whether it is active, and whether it is valid.",
+    inputSchema: {}
+  },
+  async () => {
+    try {
+      return success({ campaigns: await campaignStore().list() });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL 9: GET CAMPAIGN
+server.registerTool(
+  "get_campaign",
+  {
+    description: "Show one campaign exactly as the engine will use it. Pass the Name from the Campaigns tab.",
+    inputSchema: { name: z.string().min(1) }
+  },
+  async ({ name }) => {
+    try {
+      return success(await campaignStore().get(name));
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL 10: CREATE OR UPDATE CAMPAIGN
+server.registerTool(
+  "create_campaign",
+  {
+    description:
+      "Create a campaign as a new row in the Campaigns tab, or replace the row with the same name. " +
+      "Ask the user for anything missing before calling: who (titles), where (states), what kind of company (keywords), " +
+      "the one-sentence offer, and the sender company. New campaigns start paused unless active=true. " +
+      "Mode CORPORATE writes to people at companies; CANDIDATE writes to job seekers at their personal email.",
+    inputSchema: {
+      name: z.string().min(1),
+      mode: Mode,
+      titles: z.array(z.string().min(1)).min(1),
+      states: z.array(z.string().min(1)).min(1),
+      keywords: z.array(z.string()).default([]),
+      offer: z.string().min(10).describe("One plain sentence. The only thing the email may offer."),
+      sender_company: z.string().min(1),
+      persona: z.string().optional(),
+      signal_query: z.string().optional(),
+      provider: SourcingProvider.default("gemini_xray"),
+      meeting_minutes: z.number().int().positive().default(15),
+      daily_cap: z.number().int().positive().default(20),
+      active: z.boolean().default(false)
+    }
+  },
+  async (a) => {
+    try {
+      const cfg = CampaignConfig.parse({
+        campaign_name: a.name,
+        mode: a.mode,
+        sourcing_provider: a.provider,
+        target_geography: a.states,
+        decision_maker_titles: a.titles,
+        industry_keywords: a.keywords,
+        offer: a.offer,
+        sender_company: a.sender_company,
+        ...(a.persona ? { outreach_persona: a.persona } : {}),
+        ...(a.signal_query ? { signal_query: a.signal_query } : {}),
+        calendar_duration_minutes: a.meeting_minutes,
+        daily_send_cap: a.daily_cap,
+        block_current_employer_domain: a.mode === "CANDIDATE"
+      });
+      const saved = await campaignStore().save(cfg, { active: a.active });
+      return success({
+        ...saved,
+        message: saved.active
+          ? `"${saved.name}" is saved and active. It runs on the next run-active.`
+          : `"${saved.name}" is saved and paused. Call set_campaign_active to turn it on.`
+      });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL 11: ACTIVATE / PAUSE
+server.registerTool(
+  "set_campaign_active",
+  {
+    description: "Turn a campaign on or off. An invalid campaign cannot be turned on; the error says what to fix.",
+    inputSchema: { name: z.string().min(1), active: z.boolean() }
+  },
+  async ({ name, active }) => {
+    try {
+      await campaignStore().setActive(name, active);
+      return success({ name, active, message: `"${name}" is now ${active ? "active" : "paused"}.` });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL 12: VALIDATE ALL
+server.registerTool(
+  "validate_campaigns",
+  {
+    description: "Re-check every row in the Campaigns tab and write OK or the problem into its Status cell. Use after someone edits the tab by hand.",
+    inputSchema: {}
+  },
+  async () => {
+    try {
+      const rows = await campaignStore().validateAll();
+      return success({ checked: rows.length, problems: rows.filter((r) => r.status !== "OK"), all: rows });
     } catch (error) {
       return failure(error);
     }
