@@ -46,6 +46,11 @@ export const LeadRecord = z.object({
   location: z.string(),
   linkedin_url: z.string().url().optional(),
   email: z.string().email().optional(),
+  /**
+   * Where the email came from. "pattern" means it was guessed (first.last@domain) and is
+   * unproven: Gate 5 rejects it unless a real mailbox check (ZeroBounce) confirms it.
+   */
+  email_source: z.enum(["csv", "search", "apollo", "pattern"]).optional(),
   source: SourcingProvider,
 });
 export type LeadRecord = z.infer<typeof LeadRecord>;
@@ -70,6 +75,7 @@ export const FailureReason = z.enum([
   "MAILBOX_CATCH_ALL",
   "MAILBOX_UNKNOWN",
   "MAILBOX_DO_NOT_MAIL",
+  "UNVERIFIED_GUESS",
   // Any gate: an external check failed. The lead is held back, never passed.
   "GATE_ERROR",
 ]);

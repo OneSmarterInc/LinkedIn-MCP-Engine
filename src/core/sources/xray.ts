@@ -61,7 +61,7 @@ export async function sourceFromSearch(
         email: h.email ?? undefined,
         source: "gemini_xray",
       };
-      lead.email = await emailFinder.find(lead);
+      Object.assign(lead, await emailFinder.find(lead));
       leads.push(lead);
     }
   }

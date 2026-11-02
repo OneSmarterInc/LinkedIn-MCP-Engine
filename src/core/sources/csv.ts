@@ -109,6 +109,7 @@ export async function readLeadFile(path: string, limit?: number): Promise<Source
       location,
       linkedin_url: linkedin,
       email,
+      ...(email ? { email_source: "csv" as const } : {}),
       source: "csv_import",
     });
   });

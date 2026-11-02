@@ -40,10 +40,16 @@ describe("gemini_xray sourcing (fixture search)", () => {
   });
 
   it("asks the email finder for every lead", async () => {
-    const finder: EmailFinder = { name: "t", find: vi.fn(async () => "found@acme.com") };
+    const finder: EmailFinder = { name: "t", find: vi.fn(async () => ({ email: "found@acme.com", email_source: "apollo" as const })) };
     const r = await sourceFromSearch(cfg, 50, fixture, finder);
     expect(finder.find).toHaveBeenCalledTimes(r.leads.length);
-    expect(r.leads.every((l) => l.email === "found@acme.com")).toBe(true);
+    expect(r.leads.every((l) => l.email === "found@acme.com" && l.email_source === "apollo")).toBe(true);
+  });
+
+  it("keeps the search's own email with EMAIL_FINDER=none, labelled as search", async () => {
+    const r = await sourceFromSearch(cfg, 50, fixture, noEmailFinder);
+    const jordan = r.leads.find((l) => l.first_name === "Jordan")!;
+    expect(jordan).toMatchObject({ email: "jordan.reyes@caresource.com", email_source: "search" });
   });
 
   it("leaves email empty when search had none (Gate 1 will catch it)", async () => {
