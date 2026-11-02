@@ -98,6 +98,8 @@ export function makeMailboxCheck(deps: MailboxCheckDeps) {
   };
 
   return async (lead: LeadRecord): Promise<FailureReason | null> => {
+    // A guessed address is only trusted after a real mailbox check. dev_skip is not one.
+    if (lead.email_source === "pattern" && deps.verifier.name === "dev_skip") return "UNVERIFIED_GUESS";
     const email = lead.email!;
     const { domain } = emailParts(email);
     try {

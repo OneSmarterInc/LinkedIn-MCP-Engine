@@ -215,14 +215,10 @@ program
       show: string;
       export: ExportTarget;
     }) => {
-      console.log("[DEBUG 1] Run action started");
-
       const cfg = await loadCampaign(o.campaign);
       const ledger = openLedger();
 
       try {
-        console.log("[DEBUG 4] Entered try block");
-
         console.log(
           `Running... (LLM: ${process.env.LLM_PROVIDER ?? "ollama"}, mailbox: ${process.env.MAILBOX_VERIFIER ?? "zerobounce"})`,
         );
