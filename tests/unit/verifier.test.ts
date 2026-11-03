@@ -88,6 +88,21 @@ describe("gate 3: CORPORATE mode", () => {
   it("does not treat 'helena@' as the role 'help@'", () => {
     expect(gate3Domain(lead({ email: "helena@acme.com" }), corporate)).toBeNull();
   });
+  it("lets a found email through on a different corporate domain (Cleveland Clinic mails from ccf.org)", () => {
+    const l = (email_source: "seamless" | "apollo" | "search") =>
+      lead({ email: "shatchett@ccf.org", company_domain: "clevelandclinic.org", email_source });
+    expect(gate3Domain(l("seamless"), corporate)).toBeNull();
+    expect(gate3Domain(l("apollo"), corporate)).toBeNull();
+    expect(gate3Domain(l("search"), corporate)).toBeNull();
+  });
+  it("still rejects a mismatched domain when the email is a guess or has no source", () => {
+    expect(gate3Domain(lead({ email: "jane@otherco.com", email_source: "pattern" }), corporate)).toBe("DOMAIN_MISMATCH");
+    expect(gate3Domain(lead({ email: "jane@otherco.com", email_source: "csv" }), corporate)).toBe("DOMAIN_MISMATCH");
+    expect(gate3Domain(lead({ email: "jane@otherco.com" }), corporate)).toBe("DOMAIN_MISMATCH");
+  });
+  it("a found email on a consumer domain is still blocked", () => {
+    expect(gate3Domain(lead({ email: "jane@gmail.com", email_source: "seamless" }), corporate)).toBe("CONSUMER_DOMAIN");
+  });
 });
 
 describe("gate 3: CANDIDATE mode", () => {

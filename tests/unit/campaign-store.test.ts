@@ -156,6 +156,14 @@ describe("sheetCampaignStore", () => {
     expect(tabs.get(CAMPAIGNS_TAB)!.rows).toHaveLength(5);
   });
 
+  it("appends when the grid has no spare row (after a person deleted the blank rows)", async () => {
+    const { gw, tabs } = fakeSheets({ [CAMPAIGNS_TAB]: [H, goodRow()] });
+    const s = await sheetCampaignStore(gw).save({ ...corporateCfg, campaign_name: "Sixth", offer: "a 15-minute call", sender_company: "MeshKor" });
+    expect(s.rowNumber).toBe(3);
+    expect(tabs.get(CAMPAIGNS_TAB)!.rows).toHaveLength(3);
+    expect(tabs.get(CAMPAIGNS_TAB)!.rows[2]![H.indexOf("Name")]).toBe("Sixth");
+  });
+
   it("activates valid rows and refuses to activate a broken one", async () => {
     const { gw, tabs } = fakeSheets({ [CAMPAIGNS_TAB]: [H, goodRow({ Active: "FALSE" }), goodRow({ Name: "Broken", Titles: "" })] });
     const store = sheetCampaignStore(gw);

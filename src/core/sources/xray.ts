@@ -1,3 +1,4 @@
+import pLimit from "p-limit";
 import type { CampaignConfig, LeadRecord } from "../../config/schema.js";
 import { logger } from "../../lib/logger.js";
 import type { PeopleQuery, SearchProvider } from "../../lib/search/provider.js";
@@ -30,12 +31,20 @@ export async function sourceFromSearch(
   const seen = new Set<string>();
   let hitNo = 0;
 
-  for (const q of buildQueries(cfg)) {
-    if (leads.length >= limit) break;
-    const want = Math.min(10, limit - leads.length);
+  // A campaign with 6 titles and 5 states is 30 searches. Cap how many run, and run them side by side,
+  // so sourcing finishes in about a minute instead of five. Title order is kept: the first titles get searched first.
+  const maxQueries = Number(process.env.XRAY_MAX_QUERIES ?? 8);
+  const queries = buildQueries(cfg).slice(0, maxQueries);
+  const want = Math.min(10, limit);
+  const limitSearches = pLimit(Number(process.env.XRAY_SEARCH_CONCURRENCY ?? 3));
+  const results = await Promise.all(queries.map((q) => limitSearches(async () => {
     const hits = await search.findPeople(q, want);
     logger.info({ provider: search.name, title: q.title, location: q.location, hits: hits.length }, "search");
+    return hits;
+  })));
 
+  for (const hits of results) {
+    if (leads.length >= limit) break;
     for (const h of hits) {
       hitNo += 1;
       if (leads.length >= limit) break;
@@ -61,9 +70,14 @@ export async function sourceFromSearch(
         email: h.email ?? undefined,
         source: "gemini_xray",
       };
-      Object.assign(lead, await emailFinder.find(lead));
       leads.push(lead);
     }
   }
+
+  // Email lookups are the slow part (Seamless polls per person). Run them side by side, not one after another,
+  // so 10 leads take about as long as 2. Order of `leads` is preserved.
+  const limitFinders = pLimit(Number(process.env.EMAIL_FINDER_CONCURRENCY ?? 5));
+  await Promise.all(leads.map((lead) => limitFinders(async () => { Object.assign(lead, await emailFinder.find(lead)); })));
+
   return { provider: `gemini_xray/${search.name}`, leads, skipped };
 }

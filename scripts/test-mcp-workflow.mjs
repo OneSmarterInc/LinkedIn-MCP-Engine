@@ -41,6 +41,14 @@ try {
     "source_leads"
   );
 
+  // Sourcing runs in the background. Poll get_run until it is done.
+  for (let i = 0; i < 60; i++) {
+    const run = parseResult(await client.callTool({ name: "get_run", arguments: { run_id: source.run_id } }), "get_run");
+    if (run.status === "SOURCED") { console.log(`   sourced ${run.leads_found} lead(s), ${run.with_email} with email`); break; }
+    if (run.status === "FAILED") throw new Error(`sourcing failed: ${run.error}`);
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
   console.log(source);
 
   console.log("\n2. TESTING VERIFY_LEADS");

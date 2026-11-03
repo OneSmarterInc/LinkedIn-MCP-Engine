@@ -82,7 +82,14 @@ export function gate3Domain(lead: LeadRecord, cfg: CampaignConfig): FailureReaso
 
   if (cfg.mode === "CORPORATE") {
     if (cfg.blocked_consumer_domains.includes(domain)) return "CONSUMER_DOMAIN";
-    if (!lead.company_domain || !domainMatches(domain, lead.company_domain)) return "DOMAIN_MISMATCH";
+    if (!lead.company_domain || !domainMatches(domain, lead.company_domain)) {
+      // A found email (Seamless, or returned by the search) may legitimately sit on a different corporate domain:
+      // Cleveland Clinic mails from ccf.org, not clevelandclinic.org. Gate 4 still confirms the person and company,
+      // Gate 5 still confirms the mailbox. Only a guessed email (pattern) or one with no provenance must match exactly,
+      // because for a guess the domain IS the guess.
+      if (lead.email_source === "seamless" || lead.email_source === "apollo" || lead.email_source === "search") return null;
+      return "DOMAIN_MISMATCH";
+    }
     return null;
   }
 

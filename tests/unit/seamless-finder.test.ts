@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { seamlessEmailFinder, getEmailFinder } from "../../src/core/sources/email-finder.js";
-import { firstRequestId, pickEmail, seamlessMatch } from "../../src/core/sources/seamless-finder.js";
+import { firstRequestId, pickEmail, pollRows, seamlessMatch } from "../../src/core/sources/seamless-finder.js";
 import { makeLead } from "../helpers.js";
 
 const noEmailLead = (o = {}) =>
@@ -16,8 +16,8 @@ function seamlessReplies(steps: Array<{ body: unknown; status?: number }>) {
 }
 
 const fast = { pollMs: 0, maxWaitMs: 2_000 };
-const submitted = [{ requestId: "req-1" }];
-const done = (contact: unknown) => [{ requestId: "req-1", status: "done", contact }];
+const submitted = { success: true, requestIds: ["req-1"] };
+const done = (contact: unknown) => ({ success: true, data: [{ requestId: "req-1", status: "done", contact }] });
 
 describe("getEmailFinder with seamless", () => {
   it("builds seamless and seamless_pattern", () => {
@@ -32,7 +32,21 @@ describe("firstRequestId", () => {
   it("reads a list", () => expect(firstRequestId([{ requestId: "a" }])).toBe("a"));
   it("reads a single object", () => expect(firstRequestId({ requestId: "b" })).toBe("b"));
   it("reads a wrapped list", () => expect(firstRequestId({ data: [{ requestId: "c" }] })).toBe("c"));
+  it("reads the live shape: { success, requestIds: [...] }", () =>
+    expect(firstRequestId({ success: true, requestIds: ["awKWWvryWyXxPpICuIUA6"] })).toBe("awKWWvryWyXxPpICuIUA6"));
+  it("reads a bare list of id strings", () => expect(firstRequestId(["x1", "x2"])).toBe("x1"));
   it("returns nothing for junk", () => expect(firstRequestId({ ok: true })).toBeUndefined());
+});
+
+describe("pollRows", () => {
+  it("unwraps the live shape { success, data: [...] }", () => {
+    expect(pollRows({ success: true, data: [{ requestId: "a", status: "done" }] })).toEqual([{ requestId: "a", status: "done" }]);
+  });
+  it("accepts a bare list and a single row", () => {
+    expect(pollRows([{ requestId: "a" }])).toEqual([{ requestId: "a" }]);
+    expect(pollRows({ requestId: "a", status: "queued" })).toEqual([{ requestId: "a", status: "queued" }]);
+  });
+  it("returns nothing for junk", () => expect(pollRows(null)).toEqual([]));
 });
 
 describe("pickEmail", () => {
@@ -54,6 +68,19 @@ describe("seamlessMatch", () => {
     ]);
     expect(await seamlessMatch(noEmailLead(), "k", f, fast)).toBe("jane.miller@acme.com");
     expect(f).toHaveBeenCalledTimes(4);
+  });
+
+  it("returns the email from the exact live Seamless payload", async () => {
+    const live = {
+      success: true,
+      data: [{
+        requestId: "req-1", searchResultId: "03abf809", status: "done",
+        contact: { contactId: "6073289942", firstName: "Benjamin", lastName: "Kister", email: "ben.kister@ohiohealth.com", personalEmail: "", company: "OhioHealth" },
+      }],
+    };
+    const f = seamlessReplies([{ body: { success: true, requestIds: ["req-1"] } }, { body: live }]);
+    expect(await seamlessMatch(noEmailLead(), "k", f, fast)).toBe("ben.kister@ohiohealth.com");
+    expect(f).toHaveBeenCalledTimes(2);
   });
 
   it("sends the key in the Token header, never in the URL", async () => {

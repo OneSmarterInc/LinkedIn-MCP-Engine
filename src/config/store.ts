@@ -263,13 +263,19 @@ export function sheetCampaignStore(gw: SheetsGateway): CampaignStore {
         await gw.writeValues(`${CAMPAIGNS_TAB}!A${existing.rowNumber}:${LAST}${existing.rowNumber}`, [row], "raw");
         return { name: cfg.campaign_name, active, mode: cfg.mode, status: "OK", rowNumber: existing.rowNumber };
       }
-      // Checkbox cells hold FALSE, so Google's append would land below them (row 1001). Write into the first row with no Name instead.
+      // Two cases. If blank rows exist (checkbox cells hold FALSE, so Google's append would skip past them to row 1001),
+      // write into the first row with no Name. If the grid has no spare row at all, append: a direct write to a row
+      // beyond the grid fails with "exceeds grid limits", while append grows the sheet.
       const { rows } = await readAll();
       const nameIdx = colIndex("Name");
       const target = rows.findIndex((r) => !(r[nameIdx] ?? "").trim());
-      const rowNumber = target === -1 ? rows.length + 2 : target + 2;
-      await gw.writeValues(`${CAMPAIGNS_TAB}!A${rowNumber}:${LAST}${rowNumber}`, [row], "raw");
-      return { name: cfg.campaign_name, active, mode: cfg.mode, status: "OK", rowNumber };
+      if (target !== -1) {
+        const rowNumber = target + 2;
+        await gw.writeValues(`${CAMPAIGNS_TAB}!A${rowNumber}:${LAST}${rowNumber}`, [row], "raw");
+        return { name: cfg.campaign_name, active, mode: cfg.mode, status: "OK", rowNumber };
+      }
+      await gw.appendValues(`${CAMPAIGNS_TAB}!A1:${LAST}`, [row]);
+      return { name: cfg.campaign_name, active, mode: cfg.mode, status: "OK", rowNumber: rows.length + 2 };
     },
 
     async setActive(name, active) {

@@ -36,17 +36,40 @@ type ResearchRow = {
 
 const PENDING = new Set(["queued", "researching", "pending", "processing"]);
 
-/** The submit response may be one row or a list of rows. Either way we want the first requestId. */
+/**
+ * The submit response, as seen live: { "success": true, "requestIds": ["awKW..."] }.
+ * Older or alternate shapes ({ requestId }, [{ requestId }], { data: [...] }) are still accepted.
+ */
 export function firstRequestId(body: unknown): string | undefined {
-  const rows = Array.isArray(body) ? body : body && typeof body === "object" ? [body as ResearchRow] : [];
-  for (const r of rows) {
-    const id = (r as ResearchRow)?.requestId;
-    if (typeof id === "string" && id.trim()) return id.trim();
+  const clean = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : undefined);
+  if (Array.isArray(body)) {
+    for (const r of body) {
+      const id = clean((r as ResearchRow)?.requestId) ?? clean(r);
+      if (id) return id;
+    }
+    return undefined;
   }
-  // Some responses wrap rows: { data: [...] } or { results: [...] }
-  const o = body as { data?: unknown; results?: unknown } | null;
-  if (o && (o.data || o.results)) return firstRequestId(o.data ?? o.results);
+  if (!body || typeof body !== "object") return undefined;
+  const o = body as { requestId?: unknown; requestIds?: unknown; data?: unknown; results?: unknown };
+  const direct = clean(o.requestId);
+  if (direct) return direct;
+  if (Array.isArray(o.requestIds)) return firstRequestId(o.requestIds);
+  if (o.data || o.results) return firstRequestId(o.data ?? o.results);
   return undefined;
+}
+
+/**
+ * The poll response, as seen live: { "success": true, "data": [ { requestId, status, contact } ] }.
+ * A bare list or a single row are also accepted.
+ */
+export function pollRows(body: unknown): ResearchRow[] {
+  if (Array.isArray(body)) return body as ResearchRow[];
+  if (!body || typeof body !== "object") return [];
+  const o = body as { data?: unknown; results?: unknown };
+  if (Array.isArray(o.data)) return o.data as ResearchRow[];
+  if (o.data && typeof o.data === "object") return [o.data as ResearchRow];
+  if (Array.isArray(o.results)) return o.results as ResearchRow[];
+  return [body as ResearchRow];
 }
 
 /**
@@ -76,8 +99,8 @@ export async function seamlessMatch(
   fetchFn: typeof fetch = fetch,
   opts: SeamlessOptions = {},
 ): Promise<string | undefined> {
-  const pollMs = opts.pollMs ?? 3_000;
-  const maxWaitMs = opts.maxWaitMs ?? 45_000;
+  const pollMs = opts.pollMs ?? 2_000;
+  const maxWaitMs = opts.maxWaitMs ?? 30_000;
   const headers = { "Content-Type": "application/json", Token: apiKey };
 
   const contact: Record<string, string> = { contactName: `${lead.first_name} ${lead.last_name}`.trim() };
@@ -114,8 +137,7 @@ export async function seamlessMatch(
         logger.warn({ lead_id: lead.lead_id, status: res.status }, "seamless poll failed");
         return undefined;
       }
-      const body = (await res.json()) as unknown;
-      const rows = Array.isArray(body) ? (body as ResearchRow[]) : [body as ResearchRow];
+      const rows = pollRows(await res.json());
       const row = rows.find((r) => r?.requestId === requestId) ?? rows[0];
       const status = (row?.status ?? "").toLowerCase();
 
