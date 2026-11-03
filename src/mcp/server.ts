@@ -25,6 +25,9 @@ import {
   saveRunState
 } from "./run-store.js";
 import { listRunIds, viewRun } from "./run-view.js";
+import { JOB_SEARCH_DEFAULTS, saveJobSearch, searchJobs } from "../core/jobs/job-search.js";
+import { GeminiProvider } from "../lib/llm/gemini.js";
+import { geminiOptions } from "../lib/llm/index.js";
 
 const server = new McpServer({
   name: "linkedin-mcp-engine",
@@ -191,6 +194,35 @@ server.registerTool(
         return success({ runs });
       }
       return success(viewRun(await loadRunState(run_id), { includeBodies: include_email_bodies ?? false }));
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL: RECENT JOB POSTS
+server.registerTool(
+  "search_jobs",
+  {
+    description:
+      `Find recent job posts on LinkedIn (any role, any company, posted in the last ${JOB_SEARCH_DEFAULTS.daysBack} days). ` +
+      "Returns title, company, location, an unconfirmed posted date, a short description, the link, and a contact email. " +
+      "Emails come only from Seamless: the poster, or a recruiter/HR person at the company " +
+      `(at most ${JOB_SEARCH_DEFAULTS.maxSeamlessLookups} lookups, 1 to 2 credits each). Takes no input.`,
+    inputSchema: {}
+  },
+  async () => {
+    try {
+      const key = process.env.GEMINI_API_KEY?.trim();
+      if (!key) throw new Error("search_jobs needs GEMINI_API_KEY in .env.");
+      const llm = new GeminiProvider(geminiOptions(process.env, key));
+      if (!llm.supportsGrounding) {
+        throw new Error("search_jobs needs Google Search in Gemini: turn on billing and set GEMINI_GROUNDING=true.");
+      }
+      const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
+      const result = await searchJobs({ llm, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
+      const saved_to = await saveJobSearch(result);
+      return success({ ...result, saved_to });
     } catch (error) {
       return failure(error);
     }

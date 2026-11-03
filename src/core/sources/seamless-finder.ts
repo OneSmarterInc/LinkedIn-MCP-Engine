@@ -98,35 +98,44 @@ export function pickEmail(contact: ResearchRow["contact"]): string | undefined {
   return undefined;
 }
 
-export async function seamlessMatch(
-  lead: LeadRecord,
+/** The contact fields we read from a finished research row. */
+export type ResearchContact = NonNullable<ResearchRow["contact"]> & {
+  name?: string | null;
+  firstName?: string | null;
+  lastName?: string | null;
+  title?: string | null;
+};
+
+/**
+ * Sends one research request (1 credit) and polls until it is done.
+ * Returns the researched contact, or undefined when Seamless has nothing, the person is Do Not Email,
+ * or anything fails. Never throws.
+ */
+export async function researchAndPoll(
+  body: Record<string, unknown>,
   apiKey: string,
   fetchFn: typeof fetch = fetch,
   opts: SeamlessOptions = {},
-): Promise<string | undefined> {
+  ctx: Record<string, unknown> = {},
+): Promise<ResearchContact | undefined> {
   const pollMs = opts.pollMs ?? 3_000;
   const maxWaitMs = opts.maxWaitMs ?? 60_000;
   const headers = { "Content-Type": "application/json", Token: apiKey };
-
-  const contact: Record<string, string> = { contactName: `${lead.first_name} ${lead.last_name}`.trim() };
-  if (lead.company_domain) contact.domain = lead.company_domain;
-  else contact.companyName = lead.company_name;
-  if (lead.linkedin_url) contact.liProfileUrl = lead.linkedin_url;
 
   try {
     const submit = await fetchFn(`${SEAMLESS_BASE}/contacts/research`, {
       method: "POST",
       headers,
-      body: JSON.stringify({ contacts: [contact] }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(20_000),
     });
     if (!submit.ok) {
-      logger.warn({ lead_id: lead.lead_id, status: submit.status }, "seamless submit failed");
+      logger.warn({ ...ctx, status: submit.status }, "seamless submit failed");
       return undefined;
     }
     const requestId = firstRequestId(await submit.json());
     if (!requestId) {
-      logger.warn({ lead_id: lead.lead_id }, "seamless submit returned no requestId");
+      logger.warn(ctx, "seamless submit returned no requestId");
       return undefined;
     }
 
@@ -139,7 +148,7 @@ export async function seamlessMatch(
         signal: AbortSignal.timeout(20_000),
       });
       if (!res.ok) {
-        logger.warn({ lead_id: lead.lead_id, status: res.status }, "seamless poll failed");
+        logger.warn({ ...ctx, status: res.status }, "seamless poll failed");
         return undefined;
       }
       const rows = pollRows(await res.json());
@@ -148,21 +157,101 @@ export async function seamlessMatch(
 
       if (PENDING.has(status) || status === "") continue;
       if (status !== "done") {
-        logger.info({ lead_id: lead.lead_id, status }, "seamless: no email");
+        logger.info({ ...ctx, status }, "seamless: no email");
         return undefined; // not found | missing | duplicate | error
       }
       if (row?.contact?.isDneAll) {
-        logger.info({ lead_id: lead.lead_id }, "seamless: contact is marked Do Not Email");
+        logger.info(ctx, "seamless: contact is marked Do Not Email");
         return undefined;
       }
-      const email = pickEmail(row?.contact);
-      if (!email) logger.info({ lead_id: lead.lead_id }, "seamless: done, but no usable work email");
-      return email;
+      return (row?.contact ?? undefined) as ResearchContact | undefined;
     }
-    logger.warn({ lead_id: lead.lead_id, requestId }, "seamless research timed out");
+    logger.warn({ ...ctx, requestId }, "seamless research timed out");
     return undefined;
   } catch (err) {
-    logger.warn({ lead_id: lead.lead_id, err: (err as Error).message }, "seamless match error");
+    logger.warn({ ...ctx, err: (err as Error).message }, "seamless match error");
+    return undefined;
+  }
+}
+
+export async function seamlessMatch(
+  lead: LeadRecord,
+  apiKey: string,
+  fetchFn: typeof fetch = fetch,
+  opts: SeamlessOptions = {},
+): Promise<string | undefined> {
+  const contact: Record<string, string> = { contactName: `${lead.first_name} ${lead.last_name}`.trim() };
+  if (lead.company_domain) contact.domain = lead.company_domain;
+  else contact.companyName = lead.company_name;
+  if (lead.linkedin_url) contact.liProfileUrl = lead.linkedin_url;
+
+  const found = await researchAndPoll({ contacts: [contact] }, apiKey, fetchFn, opts, { lead_id: lead.lead_id });
+  if (!found) return undefined;
+  const email = pickEmail(found);
+  if (!email) logger.info({ lead_id: lead.lead_id }, "seamless: done, but no usable work email");
+  return email;
+}
+
+/** Titles tried when a job post names no person. */
+export const RECRUITER_TITLES = ["Recruiter", "Talent Acquisition", "HR Manager", "Human Resources Manager", "HR Director"];
+
+export interface RecruiterHit {
+  email: string;
+  name?: string;
+  title?: string;
+}
+
+/** First searchResultId in a POST /search/contacts reply: { data: [ { searchResultId, ... } ], supplementalData }. */
+export function firstSearchResultId(body: unknown): string | undefined {
+  const rows = Array.isArray(body) ? body : (body as { data?: unknown } | null)?.data;
+  if (!Array.isArray(rows)) return undefined;
+  for (const r of rows) {
+    const id = (r as { searchResultId?: unknown })?.searchResultId;
+    if (typeof id === "string" && id.trim()) return id.trim();
+    if (typeof id === "number") return String(id);
+  }
+  return undefined;
+}
+
+/**
+ * Finds a recruiter or HR person at a company and their work email.
+ * Step 1: POST /search/contacts (1 credit per started block of results; we ask for 1).
+ * Step 2: research that searchResultId (1 credit) and poll.
+ * Returns undefined when nothing usable is found. Never throws.
+ */
+export async function seamlessFindRecruiter(
+  company: { name: string; domain?: string },
+  apiKey: string,
+  fetchFn: typeof fetch = fetch,
+  opts: SeamlessOptions = {},
+): Promise<RecruiterHit | undefined> {
+  const ctx = { company: company.name };
+  const filter: Record<string, unknown> = company.domain
+    ? { companyDomain: [company.domain] }
+    : { companyName: [company.name] };
+  try {
+    const res = await fetchFn(`${SEAMLESS_BASE}/search/contacts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Token: apiKey },
+      body: JSON.stringify({ ...filter, jobTitle: RECRUITER_TITLES, limit: 1 }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!res.ok) {
+      logger.warn({ ...ctx, status: res.status }, "seamless contact search failed");
+      return undefined;
+    }
+    const id = firstSearchResultId(await res.json());
+    if (!id) {
+      logger.info(ctx, "seamless: no recruiter or HR contact found");
+      return undefined;
+    }
+    const contact = await researchAndPoll({ searchResultIds: [id] }, apiKey, fetchFn, opts, ctx);
+    const email = pickEmail(contact);
+    if (!contact || !email) return undefined;
+    const name = (contact.name ?? `${contact.firstName ?? ""} ${contact.lastName ?? ""}`).trim();
+    return { email, ...(name ? { name } : {}), ...(contact.title ? { title: contact.title } : {}) };
+  } catch (err) {
+    logger.warn({ ...ctx, err: (err as Error).message }, "seamless recruiter search error");
     return undefined;
   }
 }
