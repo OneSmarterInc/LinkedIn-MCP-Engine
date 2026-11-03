@@ -30,9 +30,11 @@ import {
   JOB_SEARCH_DEFAULTS,
   latestJobSearchId,
   loadJobSearchRecord,
+  saveJobSearchRecord,
   searchJobs,
   startJobSearch
 } from "../core/jobs/job-search.js";
+import { exportJobsToSheet } from "../core/jobs/jobs-exporter.js";
 import { GeminiProvider } from "../lib/llm/gemini.js";
 import { geminiOptions } from "../lib/llm/index.js";
 
@@ -228,13 +230,14 @@ server.registerTool(
   {
     description:
       `Start a search for recent job posts on LinkedIn (any role, any company, posted in the last ${JOB_SEARCH_DEFAULTS.daysBack} days). ` +
-      "Takes no input. Returns a search_id at once with status RUNNING. Then call get_job_search every 15-20 seconds " +
-      "and tell the user each new step (which search is running, jobs found, emails found) until status is DONE (usually 2-6 minutes) or FAILED. The result has title, company, location, an unconfirmed " +
+      "Returns a search_id at once with status RUNNING. Then call get_job_search every 30 seconds " +
+      "until status is DONE (usually 2-6 minutes) or FAILED. The result has title, company, location, an unconfirmed " +
       "posted date, a short description, the link, and a contact email found by Seamless (the poster, or a recruiter/HR " +
-      `person; at most ${JOB_SEARCH_DEFAULTS.maxSeamlessLookups} lookups, 1 to 2 credits each).`,
-    inputSchema: {}
+      `person; at most ${JOB_SEARCH_DEFAULTS.maxSeamlessLookups} lookups, 1 to 2 credits each). ` +
+      "When the search is DONE the jobs are written to the Google Sheet's Jobs tab (one row each, Status New) unless export_to_sheet is false.",
+    inputSchema: { export_to_sheet: z.boolean().optional() }
   },
-  async () => {
+  async ({ export_to_sheet }) => {
     try {
       const key = process.env.GEMINI_API_KEY?.trim();
       if (!key) throw new Error("search_jobs needs GEMINI_API_KEY in .env.");
@@ -243,13 +246,19 @@ server.registerTool(
         throw new Error("search_jobs needs Google Search in Gemini: turn on billing and set GEMINI_GROUNDING=true.");
       }
       const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
-      const { record } = await startJobSearch((onProgress) =>
-        searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) })
+      const wantSheet = export_to_sheet !== false && !!process.env.GOOGLE_SHEET_ID?.trim();
+      const { record } = await startJobSearch(
+        () => searchJobs({ llm, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) }),
+        undefined,
+        undefined,
+        wantSheet ? (result) => exportJobsToSheet(result, createSheetsGateway()) : undefined
       );
       return success({
         search_id: record.search_id,
         status: record.status,
-        message: "Job search started. Call get_job_search every 15-20 seconds and report each new step until status is DONE."
+        writes_to_sheet: wantSheet,
+        message: "Job search started. Call get_job_search with this search_id every 30 seconds until status is DONE." +
+          (wantSheet ? " When DONE, the jobs are also in the Sheet's Jobs tab (see the sheet field)." : " GOOGLE_SHEET_ID is not set, so results stay in the chat and on disk.")
       });
     } catch (error) {
       return failure(error);
@@ -260,7 +269,7 @@ server.registerTool(
 server.registerTool(
   "get_job_search",
   {
-    description: "Live status of a job search started by search_jobs. RUNNING shows the current step, jobs found so far and recent steps (check again in 15-20 seconds and tell the user what changed). DONE shows the jobs; FAILED shows the reason. Leave search_id empty for the newest search.",
+    description: "Show a job search started by search_jobs: RUNNING (check again in 30 seconds), DONE with the jobs, or FAILED with the reason. Leave search_id empty for the newest search.",
     inputSchema: { search_id: z.string().min(1).optional() }
   },
   async ({ search_id }) => {
@@ -268,21 +277,32 @@ server.registerTool(
       const id = search_id ?? (await latestJobSearchId());
       if (!id) throw new Error("No job search yet. Call search_jobs first.");
       const rec = await loadJobSearchRecord(id);
-      const secs = Math.round((Date.now() - new Date(rec.started_at).getTime()) / 1000);
       if (rec.status === "RUNNING") {
-        // Newest line first, so the current step is the first thing read.
-        return success({
-          search_id: rec.search_id,
-          status: rec.status,
-          now: rec.progress?.message ?? "Starting",
-          running_for: `${secs}s`,
-          progress: rec.progress,
-          jobs_so_far: rec.jobs_so_far ?? [],
-          recent_steps: [...rec.log].reverse().slice(0, 10),
-          next: "Call get_job_search again in 15-20 seconds."
-        });
+        const secs = Math.round((Date.now() - new Date(rec.started_at).getTime()) / 1000);
+        return success({ ...rec, message: `Still searching, ${secs}s so far. Check again in 30 seconds.` });
       }
-      return success({ ...rec, log: rec.log });
+      return success(rec);
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+server.registerTool(
+  "export_job_search",
+  {
+    description: "Write a finished job search to the Google Sheet's Jobs tab (one row per job; jobs already there are skipped). Leave search_id empty for the newest search. Use when a search ran with export_to_sheet=false or the automatic export failed.",
+    inputSchema: { search_id: z.string().min(1).optional() }
+  },
+  async ({ search_id }) => {
+    try {
+      const id = search_id ?? (await latestJobSearchId());
+      if (!id) throw new Error("No job search yet. Call search_jobs first.");
+      const rec = await loadJobSearchRecord(id);
+      if (rec.status !== "DONE" || !rec.result) throw new Error(`Search ${id} is ${rec.status}; only a DONE search can be exported.`);
+      const res = await exportJobsToSheet(rec.result, createSheetsGateway());
+      await saveJobSearchRecord({ ...rec, sheet: res, updated_at: new Date().toISOString() });
+      return success({ search_id: id, ...res, message: `${res.added} job(s) added to the Jobs tab, ${res.already_present} were already there.` });
     } catch (error) {
       return failure(error);
     }

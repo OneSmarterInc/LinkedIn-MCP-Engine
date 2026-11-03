@@ -115,3 +115,13 @@ What emails are blocked, how a draft is shaped, what a valid campaign is. Users 
 - `src/mcp/server.ts` — five campaign tools
 - `apps_script/AutoBooker.gs` — `ensureCampaignsTab()` (dropdowns, checkboxes, example row) and `onEdit` stamp
 - `tests/unit/campaign-store.test.ts` — 15 tests
+
+## Jobs tab (job search results)
+
+`search_jobs` finds recent LinkedIn job posts and, when a Google Sheet is configured, writes them to a **Jobs** tab the moment the search is DONE. One row per job: FoundAt, JobTitle, Company, Domain, Location, PostedDate (unconfirmed), Description, URL, Email, EmailSource, ContactName, ContactTitle, Status (New / Contacted / Replied / Skip), Notes. A job already in the tab (same URL) is not added twice.
+
+- Automatic: `search_jobs` → poll `get_job_search` → when DONE, the record's `sheet` field says how many rows were added. If the Sheet write failed, `sheet.error` says why and the search is still DONE.
+- Manual: `export_job_search` (newest search, or a `search_id`), or `npx tsx src/main.ts jobs-export [--id jobs-<uuid>]`.
+- Opt out: `search_jobs` with `export_to_sheet: false`.
+
+The Jobs tab is a list of openings with a contact, not a sending queue. Nothing in it is emailed by AutoBooker. To email a contact, a person copies the row into a campaign's flow or waits for the hiring-signals provider, which feeds the normal Pipeline.

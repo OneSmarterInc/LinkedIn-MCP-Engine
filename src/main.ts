@@ -22,6 +22,8 @@ import type { Ledger } from "./core/db.js";
 import { getSearch } from "./lib/search/index.js";
 import { getLLM } from "./lib/llm/index.js";
 import { formatOptOutSync, syncOptOuts } from "./core/optout-sync.js";
+import { latestJobSearchId, loadJobSearchRecord, saveJobSearchRecord } from "./core/jobs/job-search.js";
+import { exportJobsToSheet, formatJobsExport } from "./core/jobs/jobs-exporter.js";
 
 type ExportTarget = "none" | "sheet" | "xlsx" | "both";
 
@@ -401,6 +403,21 @@ program
       ledger.close();
     }
     if (failures) process.exitCode = 1;
+  });
+
+program
+  .command("jobs-export")
+  .description("Write a finished job search (newest, or --id) to the Google Sheet's Jobs tab")
+  .option("--id <search_id>", "a jobs-<uuid> search id")
+  .action(async (o: { id?: string }) => {
+    const id = o.id ?? (await latestJobSearchId());
+    if (!id) throw new Error("No job search found in out/job-searches. Run search_jobs first.");
+    const rec = await loadJobSearchRecord(id);
+    if (rec.status !== "DONE" || !rec.result) throw new Error(`Search ${id} is ${rec.status}.`);
+    const { createSheetsGateway } = await import("./lib/google/sheets.js");
+    const res = await exportJobsToSheet(rec.result, createSheetsGateway());
+    await saveJobSearchRecord({ ...rec, sheet: res, updated_at: new Date().toISOString() });
+    console.log(formatJobsExport(res));
   });
 
 program.parseAsync().catch((err: Error) => {
