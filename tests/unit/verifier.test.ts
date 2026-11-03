@@ -93,7 +93,7 @@ describe("gate 3: CORPORATE mode", () => {
       lead({ email: "shatchett@ccf.org", company_domain: "clevelandclinic.org", email_source });
     expect(gate3Domain(l("seamless"), corporate)).toBeNull();
     expect(gate3Domain(l("apollo"), corporate)).toBeNull();
-    expect(gate3Domain(l("search"), corporate)).toBeNull();
+    expect(gate3Domain(l("search"), corporate)).toBe("DOMAIN_MISMATCH");
   });
   it("still rejects a mismatched domain when the email is a guess or has no source", () => {
     expect(gate3Domain(lead({ email: "jane@otherco.com", email_source: "pattern" }), corporate)).toBe("DOMAIN_MISMATCH");

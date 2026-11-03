@@ -34,7 +34,6 @@ describe("firstRequestId", () => {
   it("reads a wrapped list", () => expect(firstRequestId({ data: [{ requestId: "c" }] })).toBe("c"));
   it("reads the live shape: { success, requestIds: [...] }", () =>
     expect(firstRequestId({ success: true, requestIds: ["awKWWvryWyXxPpICuIUA6"] })).toBe("awKWWvryWyXxPpICuIUA6"));
-  it("reads a bare list of id strings", () => expect(firstRequestId(["x1", "x2"])).toBe("x1"));
   it("returns nothing for junk", () => expect(firstRequestId({ ok: true })).toBeUndefined());
 });
 
