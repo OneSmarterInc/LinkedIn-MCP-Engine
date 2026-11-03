@@ -11,8 +11,10 @@ import { researchAndPoll, pickEmail, seamlessFindRecruiter, type SeamlessOptions
 export const JOB_SEARCH_DEFAULTS = {
   /** Jobs posted in the last N days (up to today). */
   daysBack: 7,
-  /** Most jobs returned by one run. */
-  maxJobs: 20,
+  /** Jobs wanted per run. Searches stop once this many are found. */
+  maxJobs: 10,
+  /** Most Gemini searches per run, so a slow day cannot run up the bill. */
+  maxSearches: 8,
   /** Most Seamless lookups in one run. Each costs 1 to 2 credits. */
   maxSeamlessLookups: 10,
 };
@@ -61,6 +63,8 @@ export interface JobView {
 
 export interface JobSearchOutput {
   searched_at: string;
+  /** Gemini searches used. */
+  searches: number;
   window: { from: string; to: string };
   total: number;
   with_email: number;
@@ -92,32 +96,44 @@ export function jobWindow(now: Date, daysBack: number): { from: string; to: stri
 }
 
 /**
- * Two searches per run: LinkedIn job pages, and "we're hiring" posts (where CV emails usually are).
- * Natural-language instructions work better with Gemini's search than raw Google operators like after:.
+ * Search angles, tried in order until a run has enough jobs. Gemini's search returns only a few posts per call,
+ * so different angles find different posts. The last one looks for "send your CV" posts.
  */
+export const JOB_SEARCH_ANGLES = [
+  "software, data and AI jobs",
+  "jobs in the United States",
+  "jobs in India",
+  "healthcare and pharma jobs",
+  "finance, banking and accounting jobs",
+  "sales, marketing and customer jobs",
+  "jobs in Europe and the UK",
+  "operations, HR and manufacturing jobs",
+];
+
+/** One prompt per angle: LinkedIn job pages, plus "we're hiring" posts for the first angle. */
 export function buildJobPrompts(window: { from: string; to: string }, limit: number): string[] {
   const common = [
     `Today is ${window.to}. Only include posts from ${window.from} to ${window.to}.`,
     `LinkedIn shows age as "3 days ago" or "1 week ago": convert it to a YYYY-MM-DD posted_date using today's date. If you cannot tell the date, use null.`,
-    "Any role, any company, any country.",
     "For each give job_title, company_name, company_domain (the company's own website, not linkedin.com), location,",
     "posted_date, a two-sentence description, url (the LinkedIn link you found),",
     "poster_name and poster_title (only if the page shows who posted it).",
   ];
-  return [
-    [
-      `Use Google Search to find up to ${limit} job openings published on LinkedIn job pages in the last week.`,
-      'Try searches like: site:linkedin.com/jobs/view hiring, linkedin.com/jobs/view "days ago", linkedin jobs posted this week.',
-      "The url must start with https://www.linkedin.com/jobs/view/ (or a country subdomain like in.linkedin.com).",
-      ...common,
-    ].join("\n"),
-    [
-      `Use Google Search to find up to ${limit} LinkedIn posts from the last week where someone announces a job opening and asks people to send a CV or resume.`,
-      `Try searches like: site:linkedin.com/posts "we are hiring" "send your CV", site:linkedin.com/posts "hiring" "share your resume at", site:linkedin.com/posts "email your resume".`,
-      "The url must start with https://www.linkedin.com/posts/ or https://www.linkedin.com/feed/update/.",
-      ...common,
-    ].join("\n"),
-  ];
+  const pages = JOB_SEARCH_ANGLES.map((angle) => [
+    `Use Google Search to find up to ${limit} ${angle} published on LinkedIn job pages in the last week.`,
+    `Try searches like: site:linkedin.com/jobs/view ${angle}, linkedin.com/jobs/view "days ago" ${angle}.`,
+    "The url must start with https://www.linkedin.com/jobs/view/ (or a country subdomain like in.linkedin.com).",
+    ...common,
+  ].join("\n"));
+  const posts = [
+    `Use Google Search to find up to ${limit} LinkedIn posts from the last week where someone announces a job opening and asks people to send a CV or resume.`,
+    `Try searches like: site:linkedin.com/posts "we are hiring" "send your CV", site:linkedin.com/posts "hiring" "share your resume at".`,
+    "The url must start with https://www.linkedin.com/posts/ or https://www.linkedin.com/feed/update/.",
+    "Any role, any company, any country.",
+    ...common,
+  ].join("\n");
+  // Hiring posts second: they often name the poster, which makes the Seamless lookup cheaper.
+  return [pages[0]!, posts, ...pages.slice(1)];
 }
 
 /** Normalized LinkedIn job/post URL without query string, or undefined when it is not one. */
@@ -134,12 +150,28 @@ export function inWindow(date: string | null | undefined, window: { from: string
   return d >= window.from && d <= window.to;
 }
 
+/** A live status update while a search runs. */
+export interface JobSearchProgress {
+  stage: "searching" | "finding_email" | "done";
+  /** One plain sentence, e.g. "Search 3 of 8 (jobs in India): found 2 new jobs". */
+  message: string;
+  searches_done: number;
+  searches_max: number;
+  jobs_found: number;
+  with_email: number;
+  lookups_used: number;
+  /** Jobs so far, with emails filled in as they are found. */
+  jobs: JobView[];
+}
+
 export interface JobSearchDeps {
   llm: LLMProvider;
   /** Leave out to skip Seamless (emails come only from the posts). */
   seamless?: { apiKey: string; fetchFn?: typeof fetch; poll?: SeamlessOptions };
   now?: Date;
   settings?: Partial<typeof JOB_SEARCH_DEFAULTS>;
+  /** Called at every step, so a caller can save live status. */
+  onProgress?: (p: JobSearchProgress) => void;
 }
 
 export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> {
@@ -147,87 +179,114 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   const now = deps.now ?? new Date();
   const window = jobWindow(now, settings.daysBack);
 
-  const hits: JobHit[] = [];
-  for (const [n, prompt] of buildJobPrompts(window, settings.maxJobs).entries()) {
-    // Gemini's search answer changes from call to call, so an empty or failed answer is tried once more.
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const r = await deps.llm.generateJSON(prompt, JobSearchResult, { grounded: true, system: SYSTEM });
-        if (r.jobs.length || attempt === 2) {
-          hits.push(...r.jobs);
-          break;
-        }
-        logger.info({ search: n + 1 }, "job search returned nothing, trying once more");
-      } catch (err) {
-        // One failed search should not lose the other one's jobs.
-        logger.warn({ search: n + 1, attempt, err: (err as Error).message }, "job search query failed");
-      }
-    }
-  }
-  const result = { jobs: hits };
-
-  const jobs: JobView[] = [];
+  type Candidate = { view: JobView; poster?: string; posterTitle?: string };
+  const candidates: Candidate[] = [];
   const skipped: JobSearchOutput["skipped"] = [];
   const seen = new Set<string>();
-  let lookups = 0;
 
-  for (const h of result.jobs) {
-    if (jobs.length >= settings.maxJobs) break;
+  const keep = (h: JobHit) => {
     const url = normalizeJobUrl(h.url);
-    if (!url) { skipped.push({ url: h.url, reason: "NOT_A_LINKEDIN_JOB_URL" }); continue; }
-    if (seen.has(url)) { skipped.push({ url, reason: "DUPLICATE" }); continue; }
+    if (!url) { skipped.push({ url: h.url, reason: "NOT_A_LINKEDIN_JOB_URL" }); return; }
+    if (seen.has(url)) { skipped.push({ url, reason: "DUPLICATE" }); return; }
     seen.add(url);
-    if (!inWindow(h.posted_date, window)) { skipped.push({ url, reason: "OUTSIDE_DATE_WINDOW" }); continue; }
-
+    if (!inWindow(h.posted_date, window)) { skipped.push({ url, reason: "OUTSIDE_DATE_WINDOW" }); return; }
     const domain = h.company_domain?.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || undefined;
-    const view: JobView = {
-      job_title: h.job_title.trim(),
-      company: h.company_name.trim(),
-      ...(domain && !domain.includes("linkedin.com") ? { company_domain: domain } : {}),
-      location: h.location.trim(),
-      posted_date_unconfirmed: h.posted_date?.slice(0, 10) || null,
-      description: h.description.trim(),
-      url,
-      email: null,
-      email_source: "seamless_off",
-    };
+    candidates.push({
+      view: {
+        job_title: h.job_title.trim(),
+        company: h.company_name.trim(),
+        ...(domain && !domain.includes("linkedin.com") ? { company_domain: domain } : {}),
+        location: h.location.trim(),
+        posted_date_unconfirmed: h.posted_date?.slice(0, 10) || null,
+        description: h.description.trim(),
+        url,
+        email: null,
+        email_source: "seamless_off",
+      },
+      ...(h.poster_name?.trim() ? { poster: h.poster_name.trim() } : {}),
+      ...(h.poster_title?.trim() ? { posterTitle: h.poster_title.trim() } : {}),
+    });
+  };
 
-    if (!deps.seamless) {
-      view.email_source = "seamless_off";
-    } else if (lookups >= settings.maxSeamlessLookups) {
-      view.email_source = "lookup_limit";
-    } else {
-      lookups += 1;
-      const s = deps.seamless;
-      const poster = h.poster_name?.trim();
-      // A post by the company page names the company, not a person: go straight to the recruiter search.
-      if (poster && !samePlace(poster, view.company)) {
-        const body = { contacts: [{ contactName: poster, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
-        const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url }));
-        if (email) {
-          view.email = email;
-          view.email_source = "seamless_poster";
-          view.contact_name = poster;
-          if (h.poster_title) view.contact_title = h.poster_title.trim();
-        }
+  const jobs: JobView[] = [];
+  let searches = 0;
+  let lookups = 0;
+  const prompts = buildJobPrompts(window, settings.maxJobs);
+  const labels = ["software, data and AI jobs", "hiring posts asking for a CV", ...JOB_SEARCH_ANGLES.slice(1)];
+  const searchesMax = Math.min(settings.maxSearches, prompts.length);
+  const report = (stage: JobSearchProgress["stage"], message: string) => {
+    logger.info({ stage, searches, jobs: jobs.length, lookups }, message);
+    deps.onProgress?.({
+      stage, message, searches_done: searches, searches_max: searchesMax, jobs_found: jobs.length,
+      with_email: jobs.filter((j) => j.email).length, lookups_used: lookups, jobs: jobs.map((j) => ({ ...j })),
+    });
+  };
+
+  /** Finds a contact email for one job. Fills the view in place. */
+  const findEmail = async ({ view, poster, posterTitle }: Candidate) => {
+    if (!deps.seamless) { view.email_source = "seamless_off"; return; }
+    if (lookups >= settings.maxSeamlessLookups) { view.email_source = "lookup_limit"; return; }
+    lookups += 1;
+    const s = deps.seamless;
+    report("finding_email", `Finding an email for ${view.job_title} at ${view.company} (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
+    // A post by the company page names the company, not a person: go straight to the recruiter search.
+    if (poster && !samePlace(poster, view.company)) {
+      const body = { contacts: [{ contactName: poster, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
+      const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: view.url }));
+      if (email) {
+        view.email = email;
+        view.email_source = "seamless_poster";
+        view.contact_name = poster;
+        if (posterTitle) view.contact_title = posterTitle;
       }
-      if (!view.email) {
-        const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll);
-        if (r) {
-          view.email = r.email;
-          view.email_source = "seamless_recruiter";
-          if (r.name) view.contact_name = r.name;
-          if (r.title) view.contact_title = r.title;
-        }
-      }
-      if (!view.email) view.email_source = "not_found";
     }
-    jobs.push(view);
-  }
+    if (!view.email) {
+      const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll);
+      if (r) {
+        view.email = r.email;
+        view.email_source = "seamless_recruiter";
+        if (r.name) view.contact_name = r.name;
+        if (r.title) view.contact_title = r.title;
+      }
+    }
+    if (!view.email) view.email_source = "not_found";
+  };
 
-  logger.info({ found: result.jobs.length, kept: jobs.length, lookups }, "job search");
+  // Search angle by angle. After each search, find emails for its new jobs, so results show up as they come.
+  report("searching", `Starting: up to ${settings.maxJobs} jobs posted ${window.from} to ${window.to}`);
+  for (const prompt of prompts) {
+    if (jobs.length >= settings.maxJobs || searches >= searchesMax) break;
+    searches += 1;
+    const label = labels[searches - 1] ?? "jobs";
+    report("searching", `Search ${searches} of ${searchesMax} (${label})...`);
+    const before = candidates.length;
+    try {
+      const r = await deps.llm.generateJSON(prompt, JobSearchResult, { grounded: true, system: SYSTEM });
+      for (const h of r.jobs) {
+        if (candidates.length - before + jobs.length >= settings.maxJobs) break;
+        keep(h);
+      }
+    } catch (err) {
+      // One failed search should not lose the other searches' jobs.
+      logger.warn({ search: searches, err: (err as Error).message }, "job search query failed");
+      report("searching", `Search ${searches} of ${searchesMax} (${label}) failed: ${(err as Error).message}`);
+    }
+    const fresh = candidates.slice(before);
+    report("searching", `Search ${searches} of ${searchesMax} (${label}): found ${fresh.length} new job${fresh.length === 1 ? "" : "s"}, ${jobs.length + fresh.length} in total`);
+    for (const c of fresh) {
+      jobs.push(c.view);
+      await findEmail(c);
+      report("finding_email", c.view.email
+        ? `Email found for ${c.view.company} (${c.view.email_source})`
+        : `No email for ${c.view.company} (${c.view.email_source})`);
+    }
+  }
+  report("done", `Done: ${jobs.length} jobs, ${jobs.filter((j) => j.email).length} with email, ${searches} searches, ${lookups} Seamless lookups`);
+
+  logger.info({ searches, kept: jobs.length, lookups }, "job search done");
   return {
     searched_at: now.toISOString(),
+    searches,
     window,
     total: jobs.length,
     with_email: jobs.filter((j) => j.email).length,
@@ -258,6 +317,12 @@ export interface JobSearchRecord {
   started_at: string;
   updated_at: string;
   error?: string;
+  /** Live status while RUNNING. */
+  progress?: Omit<JobSearchProgress, "jobs">;
+  /** Jobs found so far, while RUNNING. */
+  jobs_so_far?: JobView[];
+  /** Every status line with its time, oldest first (last 50). */
+  log: string[];
   result?: JobSearchOutput;
 }
 
@@ -309,27 +374,44 @@ export async function latestJobSearchId(dir = JOBS_DIR): Promise<string | undefi
 }
 
 /**
- * Saves a RUNNING record, then runs the search and saves DONE or FAILED.
+ * Saves a RUNNING record, then runs the search, saving every progress update, and finally DONE or FAILED.
+ * Writes are queued one after another, so a late progress write can never overwrite DONE.
  * Returns the RUNNING record and the work promise (the server does not wait for it).
  */
 export async function startJobSearch(
-  run: () => Promise<JobSearchOutput>,
+  run: (onProgress: (p: JobSearchProgress) => void) => Promise<JobSearchOutput>,
   dir = JOBS_DIR,
   now: () => Date = () => new Date(),
 ): Promise<{ record: JobSearchRecord; done: Promise<void> }> {
   const started = now().toISOString();
-  const record: JobSearchRecord = { search_id: createJobSearchId(), status: "RUNNING", started_at: started, updated_at: started };
-  await saveJobSearchRecord(record, dir);
+  let current: JobSearchRecord = {
+    search_id: createJobSearchId(), status: "RUNNING", started_at: started, updated_at: started, log: [],
+  };
+  await saveJobSearchRecord(current, dir);
+  const first = current;
+
+  let queue: Promise<void> = Promise.resolve();
+  const write = (next: JobSearchRecord) => {
+    current = next;
+    queue = queue.then(() => saveJobSearchRecord(next, dir)).catch(() => { /* keep going; next write retries */ });
+    return queue;
+  };
+  const line = (msg: string) => [...current.log, `${now().toISOString().slice(11, 19)} ${msg}`].slice(-50);
+
+  const onProgress = (p: JobSearchProgress) => {
+    const { jobs, ...progress } = p;
+    void write({ ...current, progress, jobs_so_far: jobs, log: line(p.message), updated_at: now().toISOString() });
+  };
 
   const done = (async () => {
     try {
-      const result = await run();
-      await saveJobSearchRecord({ ...record, status: "DONE", result, updated_at: now().toISOString() }, dir);
+      const result = await run(onProgress);
+      const { progress: _p, jobs_so_far: _j, ...rest } = current;
+      await write({ ...rest, status: "DONE", result, updated_at: now().toISOString() });
     } catch (err) {
-      try {
-        await saveJobSearchRecord({ ...record, status: "FAILED", error: (err as Error).message, updated_at: now().toISOString() }, dir);
-      } catch { /* nothing more to do */ }
+      const msg = (err as Error).message;
+      await write({ ...current, status: "FAILED", error: msg, log: line(`Failed: ${msg}`), updated_at: now().toISOString() });
     }
   })();
-  return { record, done };
+  return { record: first, done };
 }

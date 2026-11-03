@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildJobPrompts, inWindow, samePlace, jobWindow, normalizeJobUrl, saveJobSearch, searchJobs, type JobHit,
-  latestJobSearchId, loadJobSearchRecord, startJobSearch,
+  latestJobSearchId, loadJobSearchRecord, startJobSearch, type JobSearchProgress,
 } from "../../src/core/jobs/job-search.js";
 import { firstSearchResultId, seamlessFindRecruiter } from "../../src/core/sources/seamless-finder.js";
 import type { LLMProvider } from "../../src/lib/llm/provider.js";
@@ -70,8 +70,10 @@ describe("job search helpers", () => {
   it("window is the last 7 days up to today", () => {
     expect(jobWindow(NOW, 7)).toEqual({ from: "2026-10-27", to: "2026-11-03" });
   });
-  it("runs two searches: job pages and hiring posts, both bounded by the window", () => {
-    const [pages, posts] = buildJobPrompts({ from: "2026-10-27", to: "2026-11-03" }, 20);
+  it("builds 9 prompts: job pages per angle, with hiring posts second, all bounded by the window", () => {
+    const all = buildJobPrompts({ from: "2026-10-27", to: "2026-11-03" }, 10);
+    expect(all).toHaveLength(9);
+    const [pages, posts] = all;
     expect(pages).toContain("site:linkedin.com/jobs/view");
     expect(posts).toContain("site:linkedin.com/posts");
     for (const p of [pages!, posts!]) {
@@ -80,12 +82,25 @@ describe("job search helpers", () => {
       expect(p).not.toContain("after:");
     }
   });
-  it("runs both searches and merges them", async () => {
-    const { llm, prompts } = fakeLLM({ jobs: [job()] });
-    await searchJobs({ llm, now: NOW });
-    // search 1 answers; search 2 is empty, so it is tried once more
-    expect(prompts).toHaveLength(3);
-    expect(prompts[1]).toBe(prompts[2]);
+  it("keeps searching other angles while it has fewer than 10 jobs, up to the search limit", async () => {
+    const { llm, prompts } = fakeLLM({ jobs: [job()] }); // only the first search finds anything
+    const out = await searchJobs({ llm, now: NOW });
+    expect(prompts).toHaveLength(8);
+    expect(out.searches).toBe(8);
+    expect(out.total).toBe(1);
+  });
+  it("stops searching once it has 10 jobs", async () => {
+    const many = (start: number) => ({ jobs: Array.from({ length: 6 }, (_, i) => job({ url: `https://www.linkedin.com/jobs/view/${start + i}` })) });
+    const answers = [many(100), many(200), many(300)];
+    let i = 0;
+    const llm = {
+      name: "fake", supportsGrounding: true,
+      async generateJSON(_p: string, schema: { parse(x: unknown): unknown }) { return schema.parse(answers[i++] ?? { jobs: [] }); },
+      async generateText() { return ""; },
+    } as unknown as LLMProvider;
+    const out = await searchJobs({ llm, now: NOW });
+    expect(i).toBe(2);
+    expect(out.total).toBe(10);
   });
   it("keeps the jobs from one search when the other search fails", async () => {
     let call = 0;
@@ -139,19 +154,6 @@ describe("searchJobs", () => {
     const s = fakeSeamless({ recruiterEmail: "rita@acme.com" });
     await searchJobs({ llm, now: NOW, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
     expect(s.calls).toEqual(["search", "research:recruiter"]);
-  });
-
-  it("tries an empty search once more", async () => {
-    const answers = [{ jobs: [] }, { jobs: [job()] }, { jobs: [] }, { jobs: [] }];
-    let i = 0;
-    const llm = {
-      name: "fake", supportsGrounding: true,
-      async generateJSON(_p: string, schema: { parse(x: unknown): unknown }) { return schema.parse(answers[i++]); },
-      async generateText() { return ""; },
-    } as unknown as LLMProvider;
-    const out = await searchJobs({ llm, now: NOW });
-    expect(i).toBe(4);
-    expect(out.total).toBe(1);
   });
 
   it("asks Seamless for the poster when the post names one", async () => {
@@ -265,9 +267,32 @@ describe("samePlace", () => {
   ])("%s vs %s -> %s", (poster, company, want) => expect(samePlace(poster, company)).toBe(want));
 });
 
+describe("live progress", () => {
+  it("reports each step in order: start, each search, each email, done", async () => {
+    const { llm } = fakeLLM({ jobs: [job(), job({ url: "https://www.linkedin.com/jobs/view/222" })] });
+    const s = fakeSeamless({ recruiterEmail: "rita@acme.com" });
+    const steps: JobSearchProgress[] = [];
+    await searchJobs({
+      llm, now: NOW, settings: { maxSearches: 2 }, onProgress: (p) => steps.push(p),
+      seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast },
+    });
+    const msgs = steps.map((p) => p.message);
+    expect(msgs[0]).toMatch(/^Starting: up to 10 jobs/);
+    expect(msgs).toContain("Search 1 of 2 (software, data and AI jobs)...");
+    expect(msgs).toContain("Search 1 of 2 (software, data and AI jobs): found 2 new jobs, 2 in total");
+    expect(msgs.filter((m) => m.startsWith("Email found for Acme"))).toHaveLength(2);
+    expect(msgs).toContain("Search 2 of 2 (hiring posts asking for a CV): found 0 new jobs, 2 in total");
+    expect(msgs.at(-1)).toBe("Done: 2 jobs, 2 with email, 2 searches, 2 Seamless lookups");
+    // emails show up in the job list as soon as they are found
+    const afterFirstEmail = steps.find((p) => p.message.startsWith("Email found"))!;
+    expect(afterFirstEmail.with_email).toBe(1);
+    expect(afterFirstEmail.jobs_found).toBe(1);
+  });
+});
+
 describe("background job search", () => {
   const out = (n: number) => ({
-    searched_at: "2026-11-03T10:00:00.000Z", window: { from: "2026-10-27", to: "2026-11-03" },
+    searched_at: "2026-11-03T10:00:00.000Z", searches: 1, window: { from: "2026-10-27", to: "2026-11-03" },
     total: n, with_email: 0, seamless_lookups_used: 0, jobs: [], skipped: [],
   });
 
@@ -275,14 +300,45 @@ describe("background job search", () => {
     const dir = await mkdtemp(join(tmpdir(), "jobs-bg-"));
     let finish!: () => void;
     const gate = new Promise<void>((r) => (finish = r));
-    const { record, done } = await startJobSearch(async () => { await gate; return out(3); }, dir);
+    let report!: (p: JobSearchProgress) => void;
+    const { record, done } = await startJobSearch(async (onProgress) => { report = onProgress; await gate; return out(3); }, dir);
     expect(record.status).toBe("RUNNING");
     expect((await loadJobSearchRecord(record.search_id, dir)).status).toBe("RUNNING");
+
+    // A progress update while running is saved: current step, jobs so far, and a log line.
+    await new Promise((r) => setTimeout(r, 0));
+    report({
+      stage: "searching", message: "Search 1 of 8 (software, data and AI jobs): found 1 new job, 1 in total",
+      searches_done: 1, searches_max: 8, jobs_found: 1, with_email: 0, lookups_used: 0,
+      jobs: [{ job_title: "RPG Developer", company: "Acme", location: "Dayton, OH", posted_date_unconfirmed: null,
+        description: "x", url: "https://www.linkedin.com/jobs/view/1", email: null, email_source: "seamless_off" }],
+    });
+    await new Promise((r) => setTimeout(r, 50));
+    const mid = await loadJobSearchRecord(record.search_id, dir);
+    expect(mid.status).toBe("RUNNING");
+    expect(mid.progress?.jobs_found).toBe(1);
+    expect(mid.jobs_so_far).toHaveLength(1);
+    expect(mid.log.at(-1)).toMatch(/found 1 new job/);
+
     finish();
     await done;
     const rec = await loadJobSearchRecord(record.search_id, dir);
     expect(rec.status).toBe("DONE");
     expect(rec.result?.total).toBe(3);
+    expect(rec.progress).toBeUndefined();
+    expect(rec.log.length).toBeGreaterThan(0);
+  });
+
+  it("a late progress write never overwrites DONE", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-bg-"));
+    const { record, done } = await startJobSearch(async (onProgress) => {
+      for (let i = 0; i < 20; i++) {
+        onProgress({ stage: "searching", message: `step ${i}`, searches_done: i, searches_max: 20, jobs_found: 0, with_email: 0, lookups_used: 0, jobs: [] });
+      }
+      return out(0);
+    }, dir);
+    await done;
+    expect((await loadJobSearchRecord(record.search_id, dir)).status).toBe("DONE");
   });
 
   it("saves FAILED with the error", async () => {

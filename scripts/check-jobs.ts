@@ -34,6 +34,7 @@ if (process.argv.includes("--raw")) {
 const t = Date.now();
 const out = await searchJobs({
   llm,
+  onProgress: (p) => console.log(`[${((Date.now() - t) / 1000).toFixed(0)}s] ${p.message}`),
   settings: { maxSeamlessLookups: lookups },
   ...(lookups > 0 && seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}),
 });
