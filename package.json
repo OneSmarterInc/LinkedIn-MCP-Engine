@@ -15,13 +15,16 @@
     "coverage": "vitest run --coverage",
     "typecheck": "tsc --noEmit",
     "mcp": "tsx src/mcp/server.ts",
-    "test:contract": "vitest run --config vitest.contract.config.ts"
+    "test:contract": "vitest run --config vitest.contract.config.ts",
+    "api": "tsx src/api/server.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@fastify/cors": "^11.0.1",
+    "@fastify/static": "^8.2.0",
     "@google/genai": "^2.31.0",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "better-sqlite3": "^13.0.3",
@@ -29,6 +32,7 @@
     "csv-parse": "^7.0.3",
     "dotenv": "^18.0.9",
     "exceljs": "^4.4.0",
+    "fastify": "^5.3.3",
     "googleapis": "^188.0.0",
     "p-limit": "^7.3.3",
     "p-retry": "^8.0.1",
