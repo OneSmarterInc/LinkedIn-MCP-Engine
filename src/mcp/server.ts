@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import { loadCampaign } from "../config/load.js";
-import { CampaignConfig, Mode, SourcingProvider } from "../config/schema.js";
+import { CampaignConfig, Mode } from "../config/schema.js";
 import { sheetCampaignStore } from "../config/store.js";
 import { openLedger } from "../core/db.js";
 import { buildAsyncGates } from "../core/gates/index.js";
@@ -21,6 +21,7 @@ import type { RunReport } from "../core/pipeline.js";
 
 import {
   createRunId,
+  listRuns,
   loadRunState,
   saveRunState
 } from "./run-store.js";
@@ -55,11 +56,15 @@ function failure(error: unknown) {
   };
 }
 
-// TOOL 1: SOURCE LEADS
+// TOOL 1: SOURCE LEADS (background). Searching plus email lookups can take a few minutes, longer than a chat
+// client waits. So this returns a run_id at once and keeps working; get_run shows progress and the result.
 server.registerTool(
   "source_leads",
   {
-    description: "Source leads for a campaign and create a persistent run. campaign_path is a JSON path, or the Name of a row in the Campaigns tab.",
+    description:
+      "Start sourcing leads for a campaign. campaign_path is a JSON path, or the Name of a row in the Campaigns tab. " +
+      "Returns immediately with a run_id and status SOURCING. Then call get_run with that run_id every 20-30 seconds " +
+      "until status is SOURCED (usually 1-3 minutes) or FAILED (error says why). Keep limit at 10 or less from chat.",
     inputSchema: {
       campaign_path: z.string().min(1),
       csv_path: z.string().min(1).optional(),
@@ -72,44 +77,91 @@ server.registerTool(
       const effectiveCsv = csv_path ??
         (cfg.sourcing_provider === "csv_import" ? cfg.csv_path : undefined);
 
-      const llm = getLLM(process.env);
-
-      const source = await sourceLeads(
-        cfg,
-        {
-          limit: limit ?? 50,
-          csvPath: csv_path
-        },
-        {
-          ...(!effectiveCsv && cfg.sourcing_provider === "gemini_xray"
-            ? { search: getSearch(process.env, llm) }
-            : {})
-        }
-      );
-
       const runId = createRunId();
       const now = new Date().toISOString();
-
       await saveRunState({
         run_id: runId,
-        status: "SOURCED",
+        status: "SOURCING",
         campaign_path,
         config: cfg,
-        source,
+        source: { provider: "pending", leads: [], skipped: [] },
         created_at: now,
         updated_at: now
       });
 
+      // Fire and forget. Every outcome is written to the run file, so nothing is lost if the client stops waiting.
+      void (async () => {
+        try {
+          const llm = getLLM(process.env);
+          const source = await sourceLeads(
+            cfg,
+            { limit: limit ?? 50, csvPath: csv_path },
+            { ...(!effectiveCsv && cfg.sourcing_provider === "gemini_xray" ? { search: getSearch(process.env, llm) } : {}) }
+          );
+          const st = await loadRunState(runId);
+          st.source = source;
+          st.status = "SOURCED";
+          st.updated_at = new Date().toISOString();
+          await saveRunState(st);
+        } catch (err) {
+          try {
+            const st = await loadRunState(runId);
+            st.status = "FAILED";
+            st.error = (err as Error).message;
+            st.updated_at = new Date().toISOString();
+            await saveRunState(st);
+          } catch { /* nothing more to do */ }
+        }
+      })();
+
       return success({
         run_id: runId,
-        status: "SOURCED",
-        provider: source.provider,
-        leads_found: source.leads.length,
-        skipped: source.skipped.length
+        status: "SOURCING",
+        campaign: cfg.campaign_name,
+        message: `Sourcing started for "${cfg.campaign_name}" (limit ${limit ?? 50}). Call get_run with this run_id every 20-30 seconds until status is SOURCED.`
       });
     } catch (error) {
       return failure(error);
     }
+  }
+);
+
+// TOOL 1b: LIST RUNS / GET RUN. If source_leads times out in the client, the server still finishes and saves the run.
+server.registerTool(
+  "list_runs",
+  {
+    description: "Recent runs, newest first, with status (SOURCED, VERIFIED, DRAFTED, EXPORTED). Use this to find a run_id when an earlier call timed out.",
+    inputSchema: { limit: z.number().int().min(1).max(50).optional() }
+  },
+  async ({ limit }) => {
+    try { return success({ runs: await listRuns(limit ?? 10) }); } catch (error) { return failure(error); }
+  }
+);
+
+server.registerTool(
+  "get_run",
+  {
+    description: "Full detail of one run: every lead with email and email_source, verification results, and drafts if present.",
+    inputSchema: { run_id: z.string().min(1) }
+  },
+  async ({ run_id }) => {
+    try {
+      const st = await loadRunState(run_id);
+      const secs = Math.round((Date.now() - new Date(st.created_at).getTime()) / 1000);
+      return success({
+        run_id, status: st.status, campaign: st.config.campaign_name, provider: st.source.provider,
+        ...(st.status === "SOURCING" ? { message: `Still sourcing, ${secs}s so far. Check again in 20-30 seconds.` } : {}),
+        ...(st.error ? { error: st.error } : {}),
+        leads_found: st.source.leads.length,
+        with_email: st.source.leads.filter((l) => l.email).length,
+        leads: st.source.leads.map((l) => ({
+          name: `${l.first_name} ${l.last_name}`, title: l.title, company: l.company_name,
+          company_domain: l.company_domain, linkedin_url: l.linkedin_url, email: l.email, email_source: l.email_source
+        })),
+        skipped: st.source.skipped,
+        verification: st.verification, drafts: st.drafts, created_at: st.created_at, updated_at: st.updated_at
+      });
+    } catch (error) { return failure(error); }
   }
 );
 
@@ -127,6 +179,8 @@ server.registerTool(
       const state = await loadRunState(run_id);
 
       if (state.status !== "SOURCED") {
+        if (state.status === "SOURCING") throw new Error("Sourcing is still running. Call get_run until status is SOURCED, then verify.");
+        if (state.status === "FAILED") throw new Error(`Sourcing failed: ${state.error ?? "unknown error"}. Fix the cause and call source_leads again.`);
         throw new Error(`Verification requires SOURCED status. Current status: ${state.status}`);
       }
 
@@ -797,7 +851,7 @@ server.registerTool(
       sender_company: z.string().min(1),
       persona: z.string().optional(),
       signal_query: z.string().optional(),
-      provider: SourcingProvider.default("gemini_xray"),
+      provider: z.enum(["gemini_xray", "csv_import"]).default("gemini_xray").describe("gemini_xray searches LinkedIn via Google; csv_import reads a file. apify_or_apollo is not built; never choose it."),
       meeting_minutes: z.number().int().positive().default(15),
       daily_cap: z.number().int().positive().default(20),
       active: z.boolean().default(false)
@@ -844,6 +898,64 @@ server.registerTool(
     try {
       await campaignStore().setActive(name, active);
       return success({ name, active, message: `"${name}" is now ${active ? "active" : "paused"}.` });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL 11b: UPDATE CAMPAIGN (partial)
+server.registerTool(
+  "update_campaign",
+  {
+    description:
+      "Change some fields of an existing campaign and keep the rest. Pass the campaign name plus only the fields to change. " +
+      "Lists (titles, states, keywords) replace the old list entirely.",
+    inputSchema: {
+      name: z.string().min(1),
+      new_name: z.string().min(1).optional(),
+      mode: Mode.optional(),
+      titles: z.array(z.string().min(1)).min(1).optional(),
+      states: z.array(z.string().min(1)).min(1).optional(),
+      keywords: z.array(z.string()).optional(),
+      offer: z.string().min(10).optional(),
+      sender_company: z.string().min(1).optional(),
+      persona: z.string().optional(),
+      signal_query: z.string().optional(),
+      provider: z.enum(["gemini_xray", "csv_import"]).optional(),
+      meeting_minutes: z.number().int().positive().optional(),
+      daily_cap: z.number().int().positive().optional(),
+      active: z.boolean().optional()
+    }
+  },
+  async (a) => {
+    try {
+      const store = campaignStore();
+      const current = await store.get(a.name);
+      const mode = a.mode ?? current.mode;
+      const next = CampaignConfig.parse({
+        ...current,
+        campaign_name: a.new_name ?? current.campaign_name,
+        mode,
+        sourcing_provider: a.provider ?? current.sourcing_provider,
+        decision_maker_titles: a.titles ?? current.decision_maker_titles,
+        target_geography: a.states ?? current.target_geography,
+        industry_keywords: a.keywords ?? current.industry_keywords,
+        offer: a.offer ?? current.offer,
+        sender_company: a.sender_company ?? current.sender_company,
+        ...(a.persona !== undefined ? { outreach_persona: a.persona } : {}),
+        ...(a.signal_query !== undefined ? { signal_query: a.signal_query } : {}),
+        calendar_duration_minutes: a.meeting_minutes ?? current.calendar_duration_minutes,
+        daily_send_cap: a.daily_cap ?? current.daily_send_cap,
+        block_current_employer_domain: a.mode ? a.mode === "CANDIDATE" : current.block_current_employer_domain
+      });
+      if (a.new_name && a.new_name !== a.name) {
+        // Renaming: write the new row, then blank the old name so it is not run twice.
+        const saved = await store.save(next, { active: a.active });
+        return success({ ...saved, message: `Saved as "${saved.name}". The old row "${a.name}" still exists; delete it in the Sheet if not wanted.` });
+      }
+      const saved = await store.save(next, { active: a.active });
+      return success({ ...saved, message: `"${saved.name}" updated.` });
     } catch (error) {
       return failure(error);
     }
