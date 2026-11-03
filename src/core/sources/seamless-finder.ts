@@ -5,9 +5,10 @@ const SEAMLESS_BASE = "https://api.seamless.ai/api/client/v1";
 
 /**
  * Seamless.AI Contact Research. Unlike Apollo it is asynchronous:
- *   1. POST /contacts/research with the person  -> a requestId (1 credit)
- *   2. GET  /contacts/research/poll?requestIds=  -> status queued | researching | done | not found | ...
- * This function does both and returns a usable email, or undefined.
+ *   1. POST /contacts/research with the person        -> { success, requestIds: ["..."] }   (1 credit)
+ *   2. GET  /contacts/research/poll?requestIds=<id>    -> { success, data: [{ requestId, status, contact }] }
+ *      status: queued | researching | done | not found | ...
+ * This function does both and returns a usable work email, or undefined.
  * It never invents a domain: without company_domain it sends the company name and lets Seamless match.
  * Errors are logged, not thrown, so the lead simply arrives without an email and fails Gate 1.
  */
@@ -15,7 +16,7 @@ const SEAMLESS_BASE = "https://api.seamless.ai/api/client/v1";
 export interface SeamlessOptions {
   /** Wait between polls. Tests pass 0. */
   pollMs?: number;
-  /** Give up after this long. Seamless usually answers in a few seconds. */
+  /** Give up after this long. */
   maxWaitMs?: number;
 }
 
@@ -31,27 +32,54 @@ type ResearchRow = {
     email2EmailAI?: string | null;
     email3EmailAI?: string | null;
     personalEmail?: string | null;
+    /** Seamless "Do Not Email" flags. isDneAll = never email this person. */
+    isDneAll?: boolean | null;
+    isDneSome?: boolean | null;
   } | null;
 };
 
-const PENDING = new Set(["queued", "researching", "pending", "processing"]);
+const PENDING = new Set(["queued", "researching", "pending", "processing", "in progress", "in_progress"]);
 
-/** The submit response may be one row or a list of rows. Either way we want the first requestId. */
+/**
+ * The first requestId in a submit response. Handles the real shape { requestIds: [...] }
+ * and the older guesses (one row, a list of rows, or rows under data/results).
+ */
 export function firstRequestId(body: unknown): string | undefined {
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const ids = (body as { requestIds?: unknown }).requestIds;
+    if (Array.isArray(ids)) {
+      const id = ids.find((x): x is string => typeof x === "string" && x.trim() !== "");
+      if (id) return id.trim();
+    }
+  }
   const rows = Array.isArray(body) ? body : body && typeof body === "object" ? [body as ResearchRow] : [];
   for (const r of rows) {
     const id = (r as ResearchRow)?.requestId;
     if (typeof id === "string" && id.trim()) return id.trim();
   }
-  // Some responses wrap rows: { data: [...] } or { results: [...] }
   const o = body as { data?: unknown; results?: unknown } | null;
-  if (o && (o.data || o.results)) return firstRequestId(o.data ?? o.results);
+  if (o && typeof o === "object" && (o.data || o.results)) return firstRequestId(o.data ?? o.results);
   return undefined;
 }
 
+/** Rows from a poll response. Real shape: { success, data: [ ...rows ] }. Also accepts a bare list or row. */
+export function pollRows(body: unknown): ResearchRow[] {
+  if (Array.isArray(body)) return body as ResearchRow[];
+  if (body && typeof body === "object") {
+    const o = body as { data?: unknown; results?: unknown };
+    const inner = o.data ?? o.results;
+    if (Array.isArray(inner)) return inner as ResearchRow[];
+    if (inner && typeof inner === "object") return [inner as ResearchRow];
+    return [body as ResearchRow];
+  }
+  return [];
+}
+
 /**
- * Picks the first email Seamless did not mark invalid. Prefers the main `email`, then email1..3.
- * Seamless's own label is a free early filter; Gate 5 still runs ZeroBounce on whatever is returned.
+ * Picks the first work email Seamless did not mark invalid. Prefers the main `email`, then email1..3.
+ * personalEmail is never used: business campaigns write to work addresses only.
+ * Seamless's own label (e.g. "accept all" = catch-all domain) is a free early filter;
+ * Gate 5 still runs ZeroBounce on whatever is returned.
  */
 export function pickEmail(contact: ResearchRow["contact"]): string | undefined {
   if (!contact) return undefined;
@@ -77,7 +105,7 @@ export async function seamlessMatch(
   opts: SeamlessOptions = {},
 ): Promise<string | undefined> {
   const pollMs = opts.pollMs ?? 3_000;
-  const maxWaitMs = opts.maxWaitMs ?? 45_000;
+  const maxWaitMs = opts.maxWaitMs ?? 60_000;
   const headers = { "Content-Type": "application/json", Token: apiKey };
 
   const contact: Record<string, string> = { contactName: `${lead.first_name} ${lead.last_name}`.trim() };
@@ -114,17 +142,22 @@ export async function seamlessMatch(
         logger.warn({ lead_id: lead.lead_id, status: res.status }, "seamless poll failed");
         return undefined;
       }
-      const body = (await res.json()) as unknown;
-      const rows = Array.isArray(body) ? (body as ResearchRow[]) : [body as ResearchRow];
+      const rows = pollRows(await res.json());
       const row = rows.find((r) => r?.requestId === requestId) ?? rows[0];
-      const status = (row?.status ?? "").toLowerCase();
+      const status = (row?.status ?? "").toLowerCase().trim();
 
       if (PENDING.has(status) || status === "") continue;
       if (status !== "done") {
-        logger.debug({ lead_id: lead.lead_id, status }, "seamless: no email");
+        logger.info({ lead_id: lead.lead_id, status }, "seamless: no email");
         return undefined; // not found | missing | duplicate | error
       }
-      return pickEmail(row?.contact);
+      if (row?.contact?.isDneAll) {
+        logger.info({ lead_id: lead.lead_id }, "seamless: contact is marked Do Not Email");
+        return undefined;
+      }
+      const email = pickEmail(row?.contact);
+      if (!email) logger.info({ lead_id: lead.lead_id }, "seamless: done, but no usable work email");
+      return email;
     }
     logger.warn({ lead_id: lead.lead_id, requestId }, "seamless research timed out");
     return undefined;
