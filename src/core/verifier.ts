@@ -68,6 +68,9 @@ export function gate2Dedup(leads: LeadRecord[], ledger: Ledger): { kept: LeadRec
 }
 
 // ---------- Gate 3: mode-specific inbox + domain ----------
+/** Emails from these sources were looked up for this person, not guessed. */
+const LOOKUP_SOURCES = new Set(["apollo", "seamless"]);
+
 function domainMatches(emailDomain: string, companyDomain: string): boolean {
   return emailDomain === companyDomain || emailDomain.endsWith(`.${companyDomain}`);
 }
@@ -82,15 +85,11 @@ export function gate3Domain(lead: LeadRecord, cfg: CampaignConfig): FailureReaso
 
   if (cfg.mode === "CORPORATE") {
     if (cfg.blocked_consumer_domains.includes(domain)) return "CONSUMER_DOMAIN";
-    if (!lead.company_domain || !domainMatches(domain, lead.company_domain)) {
-      // A found email (Seamless, or returned by the search) may legitimately sit on a different corporate domain:
-      // Cleveland Clinic mails from ccf.org, not clevelandclinic.org. Gate 4 still confirms the person and company,
-      // Gate 5 still confirms the mailbox. Only a guessed email (pattern) or one with no provenance must match exactly,
-      // because for a guess the domain IS the guess.
-      if (lead.email_source === "seamless" || lead.email_source === "apollo" || lead.email_source === "search") return null;
-      return "DOMAIN_MISMATCH";
-    }
-    return null;
+    if (lead.company_domain && domainMatches(domain, lead.company_domain)) return null;
+    // A lookup service (Seamless, Apollo) found this person's real work email on another domain,
+    // e.g. whirlpoolcorp.com for Whirlpool. Gate 4 decides if that domain belongs to the company.
+    if (LOOKUP_SOURCES.has(lead.email_source ?? "")) return null;
+    return "DOMAIN_MISMATCH";
   }
 
   // CANDIDATE

@@ -50,7 +50,7 @@ export const LeadRecord = z.object({
    * Where the email came from. "pattern" means it was guessed (first.last@domain) and is
    * unproven: Gate 5 rejects it unless a real mailbox check (ZeroBounce) confirms it.
    */
-  email_source: z.enum(["csv", "search", "apollo", "pattern"]).optional(),
+  email_source: z.enum(["csv", "search", "apollo", "seamless", "pattern"]).optional(),
   source: SourcingProvider,
 });
 export type LeadRecord = z.infer<typeof LeadRecord>;

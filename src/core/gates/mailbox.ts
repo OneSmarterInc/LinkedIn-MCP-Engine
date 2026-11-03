@@ -67,6 +67,9 @@ export interface MailboxCheckDeps {
  * Gate 5: free DNS MX check, then the paid mailbox check.
  * MX results are cached per domain for the run. Fails closed on unexpected errors.
  */
+/** Email sources that are guesses, not lookups. They need a real mailbox check (ZeroBounce). */
+export const GUESS_SOURCES = new Set(["pattern", "search"]);
+
 export function makeMailboxCheck(deps: MailboxCheckDeps) {
   const resolveMx = deps.resolveMx ?? dns.resolveMx;
   const mxCache = new Map<string, Promise<boolean>>();
@@ -99,7 +102,8 @@ export function makeMailboxCheck(deps: MailboxCheckDeps) {
 
   return async (lead: LeadRecord): Promise<FailureReason | null> => {
     // A guessed address is only trusted after a real mailbox check. dev_skip is not one.
-    if (lead.email_source === "pattern" && deps.verifier.name === "dev_skip") return "UNVERIFIED_GUESS";
+    // "search" counts as a guess: the AI search can write an address that looks right but is not.
+    if (GUESS_SOURCES.has(lead.email_source ?? "") && deps.verifier.name === "dev_skip") return "UNVERIFIED_GUESS";
     const email = lead.email!;
     const { domain } = emailParts(email);
     try {
