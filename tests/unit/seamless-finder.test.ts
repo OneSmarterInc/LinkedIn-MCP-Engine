@@ -117,10 +117,10 @@ describe("seamlessEmailFinder", () => {
     const f = seamlessEmailFinder({ apiKey: "k", guessPattern: false, fetchFn, poll: fast });
     expect(await f.find(noEmailLead())).toEqual({});
   });
-  it("does not call Seamless when the lead already has an email", async () => {
+  it("does not call Seamless when the lead already has a CSV email", async () => {
     const fetchFn = seamlessReplies([{ body: submitted }]);
     const f = seamlessEmailFinder({ apiKey: "k", guessPattern: true, fetchFn, poll: fast });
-    await f.find(makeLead({ email: "x@acme.com" }));
+    await f.find(makeLead({ email: "x@acme.com", email_source: "csv" }));
     expect(fetchFn).not.toHaveBeenCalled();
   });
 });

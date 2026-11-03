@@ -6,7 +6,7 @@ import { seamlessMatch, type SeamlessOptions } from "./seamless-finder.js";
 /**
  * Turns a person + company domain into an email address.
  * LinkedIn search gives names, not emails, so gemini_xray leads need one of these.
- * Every finder keeps an email the lead already has, and labels where a new one came from.
+ * Finders keep a CSV or lookup email, look up again when the search wrote the email, and label the source.
  */
 export interface EmailFinder {
   readonly name: string;
@@ -21,6 +21,14 @@ export const noEmailFinder: EmailFinder = {
   },
 };
 
+/**
+ * An email from a CSV, Apollo or Seamless is kept as is.
+ * An email the AI search wrote ("search", or no label) is only a guess, so the paid lookup runs anyway.
+ */
+function hasTrustedEmail(lead: LeadRecord): boolean {
+  return !!lead.email && !!lead.email_source && lead.email_source !== "search";
+}
+
 export interface ApolloFinderOptions {
   apiKey: string;
   /** Also guess first.last@domain when Apollo has nothing. Guesses must pass ZeroBounce at Gate 5. */
@@ -32,10 +40,13 @@ export function apolloEmailFinder(opts: ApolloFinderOptions): EmailFinder {
   return {
     name: opts.guessPattern ? "apollo+pattern" : "apollo",
     async find(lead) {
-      if (lead.email) return { email: lead.email, email_source: lead.email_source ?? "search" };
+      if (hasTrustedEmail(lead)) return { email: lead.email!, email_source: lead.email_source! };
 
       const found = await apolloMatch(lead, opts.apiKey, opts.fetchFn);
       if (found) return { email: found, email_source: "apollo" };
+
+      // The search wrote an email but the service has none: keep it, still labelled a guess.
+      if (lead.email) return { email: lead.email, email_source: "search" };
 
       if (opts.guessPattern) {
         const guess = guessEmail(lead);
@@ -61,10 +72,13 @@ export function seamlessEmailFinder(opts: SeamlessFinderOptions): EmailFinder {
   return {
     name: opts.guessPattern ? "seamless+pattern" : "seamless",
     async find(lead) {
-      if (lead.email) return { email: lead.email, email_source: lead.email_source ?? "search" };
+      if (hasTrustedEmail(lead)) return { email: lead.email!, email_source: lead.email_source! };
 
       const found = await seamlessMatch(lead, opts.apiKey, opts.fetchFn, opts.poll);
       if (found) return { email: found, email_source: "seamless" };
+
+      // The search wrote an email but the service has none: keep it, still labelled a guess.
+      if (lead.email) return { email: lead.email, email_source: "search" };
 
       if (opts.guessPattern) {
         const guess = guessEmail(lead);

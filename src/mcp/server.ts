@@ -24,6 +24,7 @@ import {
   loadRunState,
   saveRunState
 } from "./run-store.js";
+import { listRunIds, viewRun } from "./run-view.js";
 
 const server = new McpServer({
   name: "linkedin-mcp-engine",
@@ -155,6 +156,41 @@ server.registerTool(
           {} as Record<string, number>
         )
       });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+// TOOL 2b: SEE A RUN
+server.registerTool(
+  "get_run",
+  {
+    description:
+      "Show the leads in a run: name, title, company, location, LinkedIn, email, where the email came from, " +
+      "and whether each lead PASSED or which gate it FAILED and why. Shows draft subjects once drafted. " +
+      "Leave run_id empty to list the newest runs.",
+    inputSchema: {
+      run_id: z.string().min(1).optional(),
+      include_email_bodies: z.boolean().optional()
+    }
+  },
+  async ({ run_id, include_email_bodies }) => {
+    try {
+      if (!run_id) {
+        const ids = await listRunIds(10);
+        const runs = [];
+        for (const id of ids) {
+          try {
+            const v = viewRun(await loadRunState(id));
+            runs.push({ run_id: v.run_id, status: v.status, campaign: v.campaign, updated_at: v.updated_at, counts: v.counts });
+          } catch {
+            runs.push({ run_id: id, status: "UNREADABLE" });
+          }
+        }
+        return success({ runs });
+      }
+      return success(viewRun(await loadRunState(run_id), { includeBodies: include_email_bodies ?? false }));
     } catch (error) {
       return failure(error);
     }

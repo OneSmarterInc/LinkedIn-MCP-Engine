@@ -81,10 +81,10 @@ describe("apolloEmailFinder", () => {
     const f = apolloEmailFinder({ apiKey: "k", guessPattern: false, fetchFn: apolloReturns({}, 403) });
     expect(await f.find(noEmailLead())).toEqual({});
   });
-  it("does not call Apollo when the lead already has an email", async () => {
+  it("does not call Apollo when the lead already has a CSV email", async () => {
     const fetchFn = apolloReturns({});
     const f = apolloEmailFinder({ apiKey: "k", guessPattern: true, fetchFn });
-    await f.find(makeLead({ email: "x@acme.com" }));
+    await f.find(makeLead({ email: "x@acme.com", email_source: "csv" }));
     expect(fetchFn).not.toHaveBeenCalled();
   });
 });
