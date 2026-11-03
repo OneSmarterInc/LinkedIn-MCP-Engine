@@ -193,8 +193,28 @@ describe("searchJobs", () => {
     expect(out.with_email).toBe(0);
   });
 
+  it("looks a company up once and reuses the answer for its other openings (no extra credits)", async () => {
+    const jobs = [1, 2, 3].map((i) => job({ url: `https://www.linkedin.com/jobs/view/${i}`, company_name: "Boston Scientific", company_domain: "bostonscientific.com" }));
+    const { llm } = fakeLLM({ jobs }, true);
+    const s = fakeSeamless({ recruiterEmail: "rita@bostonscientific.com" });
+    const out = await searchJobs({ llm, now: NOW, settings: { maxSeamlessLookups: 10 }, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    expect(out.jobs.map((j) => j.email)).toEqual(["rita@bostonscientific.com", "rita@bostonscientific.com", "rita@bostonscientific.com"]);
+    expect(out.jobs.every((j) => j.email_source === "seamless_recruiter" && j.contact_name === "Rita Recruit")).toBe(true);
+    expect(out.seamless_lookups_used).toBe(1);
+    expect(s.calls).toEqual(["search", "research:recruiter"]);
+  });
+
+  it("remembers a company with no email too, so it is not asked again", async () => {
+    const jobs = [1, 2].map((i) => job({ url: `https://www.linkedin.com/jobs/view/${i}` }));
+    const { llm } = fakeLLM({ jobs }, true);
+    const s = fakeSeamless({ searchHasRow: false });
+    const out = await searchJobs({ llm, now: NOW, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    expect(out.jobs.map((j) => j.email_source)).toEqual(["not_found", "not_found"]);
+    expect(out.seamless_lookups_used).toBe(1);
+  });
+
   it("stops Seamless lookups at the limit", async () => {
-    const jobs = [1, 2, 3].map((i) => job({ url: `https://www.linkedin.com/jobs/view/${i}` }));
+    const jobs = [1, 2, 3].map((i) => job({ url: `https://www.linkedin.com/jobs/view/${i}`, company_name: `Company ${i}`, company_domain: `company${i}.com` }));
     const { llm } = fakeLLM({ jobs }, true);
     const s = fakeSeamless({ recruiterEmail: "rita@acme.com" });
     const out = await searchJobs({
@@ -282,7 +302,8 @@ describe("live progress", () => {
     expect(msgs).toContain("Search 1 of 2 (software, data and AI jobs): found 2 new jobs, 2 in total");
     expect(msgs.filter((m) => m.startsWith("Email found for Acme"))).toHaveLength(2);
     expect(msgs).toContain("Search 2 of 2 (hiring posts asking for a CV): found 0 new jobs, 2 in total");
-    expect(msgs.at(-1)).toBe("Done: 2 jobs, 2 with email, 2 searches, 2 Seamless lookups");
+    // Both jobs are at Acme: the company is looked up once and the answer reused, so one Seamless lookup.
+    expect(msgs.at(-1)).toBe("Done: 2 jobs, 2 with email, 2 searches, 1 Seamless lookup");
     // emails show up in the job list as soon as they are found
     const afterFirstEmail = steps.find((p) => p.message.startsWith("Email found"))!;
     expect(afterFirstEmail.with_email).toBe(1);

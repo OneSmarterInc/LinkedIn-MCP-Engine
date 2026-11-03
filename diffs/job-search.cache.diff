@@ -1,0 +1,87 @@
+--- pristine/LinkedIn-MCP-Engine-main/src/core/jobs/job-search.ts	2026-11-03 09:26:20.000000000 +0000
++++ x/LinkedIn-MCP-Engine-main/src/core/jobs/job-search.ts	2026-11-03 09:29:14.500987666 +0000
+@@ -171,6 +171,13 @@
+   const seen = new Set<string>();
+   let lookups = 0;
+ 
++  // One Seamless answer per company (and per named poster) for the whole run. The same employer often has several
++  // openings in one search; the second and third reuse the first answer and cost no credits.
++  type Found = { email: string; name?: string; title?: string } | undefined;
++  const companyKey = (v: JobView) => (v.company_domain ?? v.company.toLowerCase().replace(/[^a-z0-9]/g, ""));
++  const recruiterCache = new Map<string, Found>();
++  const posterCache = new Map<string, Found>();
++
+   for (const h of result.jobs) {
+     if (jobs.length >= settings.maxJobs) break;
+     const url = normalizeJobUrl(h.url);
+@@ -194,33 +201,51 @@
+ 
+     if (!deps.seamless) {
+       view.email_source = "seamless_off";
+-    } else if (lookups >= settings.maxSeamlessLookups) {
+-      view.email_source = "lookup_limit";
+     } else {
+-      lookups += 1;
+       const s = deps.seamless;
++      const ck = companyKey(view);
+       const poster = h.poster_name?.trim();
+       // A post by the company page names the company, not a person: go straight to the recruiter search.
+-      if (poster && !samePlace(poster, view.company)) {
+-        const body = { contacts: [{ contactName: poster, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
++      const realPoster = poster && !samePlace(poster, view.company) ? poster : undefined;
++      const pk = realPoster ? `${realPoster.toLowerCase()}|${ck}` : undefined;
++
++      const apply = (found: Found, source: JobEmailSource, fallbackName?: string, fallbackTitle?: string) => {
++        if (!found) return;
++        view.email = found.email;
++        view.email_source = source;
++        const name = found.name ?? fallbackName;
++        const title = found.title ?? fallbackTitle;
++        if (name) view.contact_name = name;
++        if (title) view.contact_title = title;
++      };
++
++      // 1. Poster: reuse if this poster was already looked up this run.
++      if (pk && posterCache.has(pk)) {
++        apply(posterCache.get(pk), "seamless_poster", realPoster, h.poster_title?.trim());
++      } else if (pk && lookups < settings.maxSeamlessLookups) {
++        lookups += 1;
++        const body = { contacts: [{ contactName: realPoster!, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
+         const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url }));
+-        if (email) {
+-          view.email = email;
+-          view.email_source = "seamless_poster";
+-          view.contact_name = poster;
+-          if (h.poster_title) view.contact_title = h.poster_title.trim();
+-        }
++        const found: Found = email ? { email } : undefined;
++        posterCache.set(pk, found);
++        apply(found, "seamless_poster", realPoster, h.poster_title?.trim());
+       }
+-      if (!view.email) {
++
++      // 2. Recruiter at the company: reuse if this company was already looked up this run.
++      if (!view.email && recruiterCache.has(ck)) {
++        apply(recruiterCache.get(ck), "seamless_recruiter");
++      } else if (!view.email && lookups < settings.maxSeamlessLookups) {
++        lookups += 1;
+         const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll);
+-        if (r) {
+-          view.email = r.email;
+-          view.email_source = "seamless_recruiter";
+-          if (r.name) view.contact_name = r.name;
+-          if (r.title) view.contact_title = r.title;
+-        }
++        const found: Found = r ? { email: r.email, ...(r.name ? { name: r.name } : {}), ...(r.title ? { title: r.title } : {}) } : undefined;
++        recruiterCache.set(ck, found);
++        apply(found, "seamless_recruiter");
++      }
++
++      if (!view.email) {
++        const askedEverything = (pk ? posterCache.has(pk) : true) && recruiterCache.has(ck);
++        view.email_source = askedEverything ? "not_found" : "lookup_limit";
+       }
+-      if (!view.email) view.email_source = "not_found";
+     }
+     jobs.push(view);
+   }

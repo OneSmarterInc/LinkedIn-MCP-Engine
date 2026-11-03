@@ -32,7 +32,7 @@ function fakeSheets(initial: Record<string, string[][]> = {}) {
 }
 
 const out: JobSearchOutput = {
-  searched_at: "2026-11-03T09:00:00.000Z", window: { from: "2026-10-27", to: "2026-11-03" }, total: 2, with_email: 1, seamless_lookups_used: 2,
+  searched_at: "2026-11-03T09:00:00.000Z", searches: 2, window: { from: "2026-10-27", to: "2026-11-03" }, total: 2, with_email: 1, seamless_lookups_used: 2,
   jobs: [
     { job_title: "Senior Java Developer", company: "Buckeye Logistics", company_domain: "buckeyelogistics.com", location: "Columbus, OH", posted_date_unconfirmed: "2026-11-01", description: "Build the TMS backend.", url: "https://www.linkedin.com/jobs/view/111", email: "maria@buckeyelogistics.com", email_source: "seamless_poster", contact_name: "Maria Lopez", contact_title: "CTO" },
     { job_title: "Data Engineer", company: "=Evil Corp", location: "Remote", posted_date_unconfirmed: null, description: "Pipelines.", url: "https://www.linkedin.com/posts/x_y-activity-222", email: null, email_source: "not_found" },

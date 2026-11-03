@@ -248,7 +248,7 @@ server.registerTool(
       const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
       const wantSheet = export_to_sheet !== false && !!process.env.GOOGLE_SHEET_ID?.trim();
       const { record } = await startJobSearch(
-        () => searchJobs({ llm, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) }),
+        (onProgress) => searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) }),
         undefined,
         undefined,
         wantSheet ? (result) => exportJobsToSheet(result, createSheetsGateway()) : undefined
@@ -279,7 +279,8 @@ server.registerTool(
       const rec = await loadJobSearchRecord(id);
       if (rec.status === "RUNNING") {
         const secs = Math.round((Date.now() - new Date(rec.started_at).getTime()) / 1000);
-        return success({ ...rec, message: `Still searching, ${secs}s so far. Check again in 30 seconds.` });
+        const step = rec.progress ? ` Current step: ${rec.progress.message} (${rec.progress.jobs_found} jobs, ${rec.progress.with_email} with email so far).` : "";
+        return success({ ...rec, message: `Still searching, ${secs}s so far.${step} Check again in 30 seconds.` });
       }
       return success(rec);
     } catch (error) {
