@@ -1,4 +1,4 @@
-﻿import "dotenv/config";
+import "dotenv/config";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -25,8 +25,14 @@ import {
   loadRunState,
   saveRunState
 } from "./run-store.js";
-import { listRunIds, viewRun } from "./run-view.js";
-import { JOB_SEARCH_DEFAULTS, saveJobSearch, searchJobs } from "../core/jobs/job-search.js";
+import { viewRun } from "./run-view.js";
+import {
+  JOB_SEARCH_DEFAULTS,
+  latestJobSearchId,
+  loadJobSearchRecord,
+  searchJobs,
+  startJobSearch
+} from "../core/jobs/job-search.js";
 import { GeminiProvider } from "../lib/llm/gemini.js";
 import { geminiOptions } from "../lib/llm/index.js";
 
@@ -138,33 +144,6 @@ server.registerTool(
   }
 );
 
-server.registerTool(
-  "get_run",
-  {
-    description: "Full detail of one run: every lead with email and email_source, verification results, and drafts if present.",
-    inputSchema: { run_id: z.string().min(1) }
-  },
-  async ({ run_id }) => {
-    try {
-      const st = await loadRunState(run_id);
-      const secs = Math.round((Date.now() - new Date(st.created_at).getTime()) / 1000);
-      return success({
-        run_id, status: st.status, campaign: st.config.campaign_name, provider: st.source.provider,
-        ...(st.status === "SOURCING" ? { message: `Still sourcing, ${secs}s so far. Check again in 20-30 seconds.` } : {}),
-        ...(st.error ? { error: st.error } : {}),
-        leads_found: st.source.leads.length,
-        with_email: st.source.leads.filter((l) => l.email).length,
-        leads: st.source.leads.map((l) => ({
-          name: `${l.first_name} ${l.last_name}`, title: l.title, company: l.company_name,
-          company_domain: l.company_domain, linkedin_url: l.linkedin_url, email: l.email, email_source: l.email_source
-        })),
-        skipped: st.source.skipped,
-        verification: st.verification, drafts: st.drafts, created_at: st.created_at, updated_at: st.updated_at
-      });
-    } catch (error) { return failure(error); }
-  }
-);
-
 // TOOL 2: VERIFY LEADS
 server.registerTool(
   "verify_leads",
@@ -219,13 +198,14 @@ server.registerTool(
   }
 );
 
-// TOOL 2b: SEE A RUN
+// TOOL 2b: SEE A RUN (one get_run: your friend's progress info + per-lead results)
 server.registerTool(
   "get_run",
   {
     description:
-      "Show the leads in a run: name, title, company, location, LinkedIn, email, where the email came from, " +
-      "and whether each lead PASSED or which gate it FAILED and why. Shows draft subjects once drafted. " +
+      "Show one run. While sourcing: status SOURCING and how long it has run (check again in 20-30 seconds). " +
+      "After: every lead with name, title, company, location, LinkedIn, email and where it came from, " +
+      "whether it PASSED or which gate it FAILED and why, and draft subjects once drafted. " +
       "Leave run_id empty to list the newest runs.",
     inputSchema: {
       run_id: z.string().min(1).optional(),
@@ -234,19 +214,7 @@ server.registerTool(
   },
   async ({ run_id, include_email_bodies }) => {
     try {
-      if (!run_id) {
-        const ids = await listRunIds(10);
-        const runs = [];
-        for (const id of ids) {
-          try {
-            const v = viewRun(await loadRunState(id));
-            runs.push({ run_id: v.run_id, status: v.status, campaign: v.campaign, updated_at: v.updated_at, counts: v.counts });
-          } catch {
-            runs.push({ run_id: id, status: "UNREADABLE" });
-          }
-        }
-        return success({ runs });
-      }
+      if (!run_id) return success({ runs: await listRuns(10) });
       return success(viewRun(await loadRunState(run_id), { includeBodies: include_email_bodies ?? false }));
     } catch (error) {
       return failure(error);
@@ -254,15 +222,16 @@ server.registerTool(
   }
 );
 
-// TOOL: RECENT JOB POSTS
+// TOOL: RECENT JOB POSTS (background, like source_leads)
 server.registerTool(
   "search_jobs",
   {
     description:
-      `Find recent job posts on LinkedIn (any role, any company, posted in the last ${JOB_SEARCH_DEFAULTS.daysBack} days). ` +
-      "Returns title, company, location, an unconfirmed posted date, a short description, the link, and a contact email. " +
-      "Emails come only from Seamless: the poster, or a recruiter/HR person at the company " +
-      `(at most ${JOB_SEARCH_DEFAULTS.maxSeamlessLookups} lookups, 1 to 2 credits each). Takes no input.`,
+      `Start a search for recent job posts on LinkedIn (any role, any company, posted in the last ${JOB_SEARCH_DEFAULTS.daysBack} days). ` +
+      "Takes no input. Returns a search_id at once with status RUNNING. Then call get_job_search every 30 seconds " +
+      "until status is DONE (usually 2-6 minutes) or FAILED. The result has title, company, location, an unconfirmed " +
+      "posted date, a short description, the link, and a contact email found by Seamless (the poster, or a recruiter/HR " +
+      `person; at most ${JOB_SEARCH_DEFAULTS.maxSeamlessLookups} lookups, 1 to 2 credits each).`,
     inputSchema: {}
   },
   async () => {
@@ -274,9 +243,36 @@ server.registerTool(
         throw new Error("search_jobs needs Google Search in Gemini: turn on billing and set GEMINI_GROUNDING=true.");
       }
       const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
-      const result = await searchJobs({ llm, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
-      const saved_to = await saveJobSearch(result);
-      return success({ ...result, saved_to });
+      const { record } = await startJobSearch(() =>
+        searchJobs({ llm, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) })
+      );
+      return success({
+        search_id: record.search_id,
+        status: record.status,
+        message: "Job search started. Call get_job_search with this search_id every 30 seconds until status is DONE."
+      });
+    } catch (error) {
+      return failure(error);
+    }
+  }
+);
+
+server.registerTool(
+  "get_job_search",
+  {
+    description: "Show a job search started by search_jobs: RUNNING (check again in 30 seconds), DONE with the jobs, or FAILED with the reason. Leave search_id empty for the newest search.",
+    inputSchema: { search_id: z.string().min(1).optional() }
+  },
+  async ({ search_id }) => {
+    try {
+      const id = search_id ?? (await latestJobSearchId());
+      if (!id) throw new Error("No job search yet. Call search_jobs first.");
+      const rec = await loadJobSearchRecord(id);
+      if (rec.status === "RUNNING") {
+        const secs = Math.round((Date.now() - new Date(rec.started_at).getTime()) / 1000);
+        return success({ ...rec, message: `Still searching, ${secs}s so far. Check again in 30 seconds.` });
+      }
+      return success(rec);
     } catch (error) {
       return failure(error);
     }

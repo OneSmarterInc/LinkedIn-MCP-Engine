@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildJobPrompts, inWindow, samePlace, jobWindow, normalizeJobUrl, saveJobSearch, searchJobs, type JobHit,
+  latestJobSearchId, loadJobSearchRecord, startJobSearch,
 } from "../../src/core/jobs/job-search.js";
 import { firstSearchResultId, seamlessFindRecruiter } from "../../src/core/sources/seamless-finder.js";
 import type { LLMProvider } from "../../src/lib/llm/provider.js";
@@ -262,4 +263,48 @@ describe("samePlace", () => {
     ["Acme Inc", "Acme", true],
     ["Jane Miller", "Acme", false],
   ])("%s vs %s -> %s", (poster, company, want) => expect(samePlace(poster, company)).toBe(want));
+});
+
+describe("background job search", () => {
+  const out = (n: number) => ({
+    searched_at: "2026-11-03T10:00:00.000Z", window: { from: "2026-10-27", to: "2026-11-03" },
+    total: n, with_email: 0, seamless_lookups_used: 0, jobs: [], skipped: [],
+  });
+
+  it("saves RUNNING at once, then DONE with the result", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-bg-"));
+    let finish!: () => void;
+    const gate = new Promise<void>((r) => (finish = r));
+    const { record, done } = await startJobSearch(async () => { await gate; return out(3); }, dir);
+    expect(record.status).toBe("RUNNING");
+    expect((await loadJobSearchRecord(record.search_id, dir)).status).toBe("RUNNING");
+    finish();
+    await done;
+    const rec = await loadJobSearchRecord(record.search_id, dir);
+    expect(rec.status).toBe("DONE");
+    expect(rec.result?.total).toBe(3);
+  });
+
+  it("saves FAILED with the error", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-bg-"));
+    const { record, done } = await startJobSearch(async () => { throw new Error("Gemini quota"); }, dir);
+    await done;
+    expect(await loadJobSearchRecord(record.search_id, dir)).toMatchObject({ status: "FAILED", error: "Gemini quota" });
+  });
+
+  it("finds the newest search, and none in an empty folder", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-bg-"));
+    expect(await latestJobSearchId(dir)).toBeUndefined();
+    const times = [new Date("2026-11-01T00:00:00Z"), new Date("2026-11-02T00:00:00Z")];
+    const a = await startJobSearch(async () => out(1), dir, () => times[0]!);
+    const b = await startJobSearch(async () => out(2), dir, () => times[1]!);
+    await Promise.all([a.done, b.done]);
+    expect(await latestJobSearchId(dir)).toBe(b.record.search_id);
+  });
+
+  it("rejects a bad search id and says when one is missing", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-bg-"));
+    await expect(loadJobSearchRecord("../secrets", dir)).rejects.toThrow(/Invalid/);
+    await expect(loadJobSearchRecord("jobs-00000000-0000-0000-0000-000000000000", dir)).rejects.toThrow(/not found/);
+  });
 });

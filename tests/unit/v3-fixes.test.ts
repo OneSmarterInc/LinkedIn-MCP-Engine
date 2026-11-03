@@ -1,12 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
-import { mkdtemp, writeFile, utimes } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { CampaignConfig } from "../../src/config/schema.js";
 import { gate3Domain } from "../../src/core/verifier.js";
 import { makeMailboxCheck, type MailboxVerifier } from "../../src/core/gates/mailbox.js";
 import { apolloEmailFinder, seamlessEmailFinder } from "../../src/core/sources/email-finder.js";
-import { listRunIds, viewRun } from "../../src/mcp/run-view.js";
+import { viewRun } from "../../src/mcp/run-view.js";
 import type { McpRunState } from "../../src/mcp/run-store.js";
 import { makeLead } from "../helpers.js";
 
@@ -106,7 +103,7 @@ describe("Fix 3: get_run view", () => {
 
   it("shows NOT VERIFIED YET before verify_leads", () => {
     const v = viewRun(base);
-    expect(v.counts).toEqual({ sourced: 3 });
+    expect(v.counts).toEqual({ sourced: 3, with_email: 3, skipped: 0 });
     expect(v.leads.map((l) => l.result)).toEqual(["NOT VERIFIED YET", "NOT VERIFIED YET", "NOT VERIFIED YET"]);
     expect(v.leads[0]).toMatchObject({ name: "Jane Miller", email_source: "seamless", company: a.company_name });
   });
@@ -122,26 +119,22 @@ describe("Fix 3: get_run view", () => {
       drafts: [{ ...a, research_summary: [], email_subject: "Quick question", email_body: "Hi Jane", draft_status: "READY", draft_issues: [] }],
     };
     const v = viewRun(state);
-    expect(v.counts).toEqual({ sourced: 3, passed: 1, failed: 1, drafted: 1 });
+    expect(v.counts).toEqual({ sourced: 3, with_email: 3, skipped: 0, passed: 1, failed: 1, drafted: 1 });
     expect(v.leads.map((l) => l.result)).toEqual(["PASSED", "FAILED gate 3: DOMAIN_MISMATCH", "NOT VERIFIED YET"]);
     expect(v.leads[0]).toMatchObject({ draft_status: "READY", email_subject: "Quick question" });
     expect(v.leads[0]!.email_body).toBeUndefined();
     expect(viewRun(state, { includeBodies: true }).leads[0]!.email_body).toBe("Hi Jane");
   });
 
-  it("lists run files newest first and ignores other files", async () => {
-    const dir = await mkdtemp(join(tmpdir(), "runs-"));
-    const old = "mcp-00000000-0000-0000-0000-000000000001";
-    const recent = "mcp-00000000-0000-0000-0000-000000000002";
-    await writeFile(join(dir, `${old}.json`), "{}");
-    await writeFile(join(dir, `${recent}.json`), "{}");
-    await writeFile(join(dir, "notes.txt"), "x");
-    await utimes(join(dir, `${old}.json`), new Date(1000), new Date(1000));
-    expect(await listRunIds(10, dir)).toEqual([recent, old]);
-    expect(await listRunIds(1, dir)).toEqual([recent]);
-  });
-
-  it("returns no runs when the folder does not exist", async () => {
-    expect(await listRunIds(10, join(tmpdir(), "no-such-folder-xyz"))).toEqual([]);
+  it("shows SOURCING with elapsed time, and FAILED with the error", () => {
+    const sourcing = viewRun(
+      { ...base, status: "SOURCING", source: { provider: "pending", leads: [], skipped: [] } },
+      { now: new Date("2026-11-01T00:00:45Z") },
+    );
+    expect(sourcing.message).toBe("Still sourcing, 45s so far. Check again in 20-30 seconds.");
+    expect(sourcing.leads).toEqual([]);
+    const failed = viewRun({ ...base, status: "FAILED", error: "Gemini quota" });
+    expect(failed.error).toBe("Gemini quota");
+    expect(failed.message).toBeUndefined();
   });
 });

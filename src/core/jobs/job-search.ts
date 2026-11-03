@@ -1,4 +1,5 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
 
@@ -242,4 +243,93 @@ export async function saveJobSearch(out: JobSearchOutput, dir = resolve(process.
   const path = resolve(dir, `jobs-${out.searched_at.replace(/[:.]/g, "-")}.json`);
   await writeFile(path, JSON.stringify(out, null, 2), "utf8");
   return path;
+}
+
+// ---------------------------------------------------------------------------
+// Background runs. A search with Seamless lookups takes 2-6 minutes, longer than a chat client waits.
+// search_jobs starts one and returns a search_id at once; get_job_search shows progress and the result.
+// ---------------------------------------------------------------------------
+
+export type JobSearchStatus = "RUNNING" | "DONE" | "FAILED";
+
+export interface JobSearchRecord {
+  search_id: string;
+  status: JobSearchStatus;
+  started_at: string;
+  updated_at: string;
+  error?: string;
+  result?: JobSearchOutput;
+}
+
+const JOBS_DIR = resolve(process.cwd(), "out", "job-searches");
+const ID = /^jobs-[0-9a-f-]{36}$/i;
+
+export function createJobSearchId(): string {
+  return `jobs-${randomUUID()}`;
+}
+
+function recordPath(id: string, dir: string): string {
+  if (!ID.test(id)) throw new Error("Invalid job search ID.");
+  return resolve(dir, `${id}.json`);
+}
+
+export async function saveJobSearchRecord(rec: JobSearchRecord, dir = JOBS_DIR): Promise<void> {
+  await mkdir(dir, { recursive: true });
+  const target = recordPath(rec.search_id, dir);
+  const tmp = `${target}.${randomUUID()}.tmp`;
+  await writeFile(tmp, JSON.stringify(rec, null, 2), "utf8");
+  await rename(tmp, target);
+}
+
+export async function loadJobSearchRecord(id: string, dir = JOBS_DIR): Promise<JobSearchRecord> {
+  try {
+    return JSON.parse(await readFile(recordPath(id, dir), "utf8")) as JobSearchRecord;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Job search ${id} not found. Call search_jobs first.`);
+    throw err;
+  }
+}
+
+/** The newest job search, or undefined when there is none. */
+export async function latestJobSearchId(dir = JOBS_DIR): Promise<string | undefined> {
+  let files: string[];
+  try {
+    files = (await readdir(dir)).filter((f) => ID.test(f.replace(/\.json$/, "")) && f.endsWith(".json"));
+  } catch {
+    return undefined;
+  }
+  let best: { id: string; at: string } | undefined;
+  for (const f of files) {
+    try {
+      const rec = JSON.parse(await readFile(resolve(dir, f), "utf8")) as JobSearchRecord;
+      if (!best || rec.started_at > best.at) best = { id: rec.search_id, at: rec.started_at };
+    } catch { /* skip unreadable */ }
+  }
+  return best?.id;
+}
+
+/**
+ * Saves a RUNNING record, then runs the search and saves DONE or FAILED.
+ * Returns the RUNNING record and the work promise (the server does not wait for it).
+ */
+export async function startJobSearch(
+  run: () => Promise<JobSearchOutput>,
+  dir = JOBS_DIR,
+  now: () => Date = () => new Date(),
+): Promise<{ record: JobSearchRecord; done: Promise<void> }> {
+  const started = now().toISOString();
+  const record: JobSearchRecord = { search_id: createJobSearchId(), status: "RUNNING", started_at: started, updated_at: started };
+  await saveJobSearchRecord(record, dir);
+
+  const done = (async () => {
+    try {
+      const result = await run();
+      await saveJobSearchRecord({ ...record, status: "DONE", result, updated_at: now().toISOString() }, dir);
+    } catch (err) {
+      try {
+        await saveJobSearchRecord({ ...record, status: "FAILED", error: (err as Error).message, updated_at: now().toISOString() }, dir);
+      } catch { /* nothing more to do */ }
+    }
+  })();
+  return { record, done };
 }

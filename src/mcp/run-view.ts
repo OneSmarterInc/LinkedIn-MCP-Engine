@@ -1,6 +1,3 @@
-import { readdir, stat } from "node:fs/promises";
-import { resolve } from "node:path";
-
 import type { McpRunState } from "./run-store.js";
 
 /** One lead in a run, in plain words: who it is, which email, and what happened to it. */
@@ -26,17 +23,23 @@ export interface RunView {
   run_id: string;
   status: string;
   campaign: string;
+  provider: string;
+  /** Shown while sourcing runs in the background. */
+  message?: string;
+  /** Why the run FAILED. */
+  error?: string;
   created_at: string;
   updated_at: string;
-  counts: { sourced: number; passed?: number; failed?: number; drafted?: number };
+  counts: { sourced: number; with_email: number; skipped: number; passed?: number; failed?: number; drafted?: number };
   leads: LeadView[];
+  skipped: McpRunState["source"]["skipped"];
 }
 
 /**
  * Builds a readable view of a stored run. Uses the cleaned lead from verification when there is one,
  * so the email shown is the one the gates checked.
  */
-export function viewRun(state: McpRunState, opts: { includeBodies?: boolean } = {}): RunView {
+export function viewRun(state: McpRunState, opts: { includeBodies?: boolean; now?: Date } = {}): RunView {
   const passed = new Map((state.verification?.passed ?? []).map((l) => [l.lead_id, l]));
   const failed = new Map((state.verification?.quarantined ?? []).map((q) => [q.lead.lead_id, q]));
   const drafts = new Map((state.drafts ?? []).map((d) => [d.lead_id, d]));
@@ -72,35 +75,26 @@ export function viewRun(state: McpRunState, opts: { includeBodies?: boolean } = 
     };
   });
 
+  const secs = Math.round(((opts.now ?? new Date()).getTime() - new Date(state.created_at).getTime()) / 1000);
   return {
     run_id: state.run_id,
     status: state.status,
     campaign: state.config.campaign_name,
+    provider: state.source.provider,
+    ...(state.status === "SOURCING" ? { message: `Still sourcing, ${secs}s so far. Check again in 20-30 seconds.` } : {}),
+    ...(state.error ? { error: state.error } : {}),
     created_at: state.created_at,
     updated_at: state.updated_at,
     counts: {
       sourced: state.source.leads.length,
+      with_email: state.source.leads.filter((l) => l.email).length,
+      skipped: state.source.skipped.length,
       ...(state.verification
         ? { passed: state.verification.passed.length, failed: state.verification.quarantined.length }
         : {}),
       ...(state.drafts ? { drafted: state.drafts.length } : {}),
     },
     leads,
+    skipped: state.source.skipped,
   };
-}
-
-/** Run IDs in out/mcp-runs, newest first. */
-export async function listRunIds(limit = 10, dir = resolve(process.cwd(), "out", "mcp-runs")): Promise<string[]> {
-  let names: string[];
-  try {
-    names = await readdir(dir);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  const runs = names.filter((n) => /^mcp-[0-9a-f-]{36}\.json$/i.test(n));
-  const withTime = await Promise.all(
-    runs.map(async (n) => ({ id: n.slice(0, -5), t: (await stat(resolve(dir, n))).mtimeMs })),
-  );
-  return withTime.sort((a, b) => b.t - a.t).slice(0, limit).map((r) => r.id);
 }
