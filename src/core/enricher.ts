@@ -59,6 +59,16 @@ export function companyKeyword(company: string): string {
   return company.toLowerCase().replace(/^the\s+/, "").split(/[\s,]+/)[0]?.replace(/[^a-z0-9'&-]/g, "") ?? "";
 }
 
+const ROLE_FILLER = new Set([
+  "senior", "junior", "lead", "principal", "staff", "associate", "assistant", "intern", "remote", "hybrid",
+  "full", "time", "part", "contract", "with", "and", "for", "the", "of", "in", "to", "a", "an", "i", "ii", "iii", "iv",
+]);
+
+/** The words of a job title that a draft must repeat: "Senior RPG Developer (IBM i)" -> ["rpg", "developer", "ibm"]. */
+export function roleKeywords(role: string): string[] {
+  return role.toLowerCase().split(/[^a-z0-9+#]+/).filter((w) => w.length >= 2 && !ROLE_FILLER.has(w));
+}
+
 /** Code checks every draft must pass. Returns a list of problems (empty = READY). */
 export function checkDraft(d: DraftOutput, lead: LeadRecord, cfg: CampaignConfig): string[] {
   const issues: string[] = [];
@@ -77,6 +87,14 @@ export function checkDraft(d: DraftOutput, lead: LeadRecord, cfg: CampaignConfig
 
   const text = `${d.email_subject} ${d.email_body}`.toLowerCase();
   for (const p of BANNED_PHRASES) if (text.includes(p)) issues.push(`contains banned phrase "${p}"`);
+
+  if (lead.hiring_for) {
+    const words = roleKeywords(lead.hiring_for.role);
+    const body = d.email_body.toLowerCase();
+    if (words.length && !words.some((w) => body.includes(w))) {
+      issues.push(`body does not name the role they are hiring for: mention "${lead.hiring_for.role}" in the first sentence`);
+    }
+  }
 
   if (cfg.mode === "CORPORATE") {
     const key = companyKeyword(lead.company_name);
@@ -114,6 +132,14 @@ function userPrompt(lead: LeadRecord, cfg: CampaignConfig, feedback?: string[]):
     `Location: ${lead.location}`,
     `Call length: ${cfg.calendar_duration_minutes} minutes`,
   ];
+  if (lead.hiring_for) {
+    lines.push(
+      "",
+      `Why we are writing: ${short} posted a job opening on LinkedIn for "${lead.hiring_for.role}".`,
+      "The first sentence MUST say you saw that they are hiring and name this role.",
+      "Connect the offer to filling this role. Do not claim to know anything about the opening beyond its title.",
+    );
+  }
   if (feedback?.length) {
     lines.push("", "Your previous draft broke these rules. Fix every one:", ...feedback.map((f) => `- ${f}`));
   }

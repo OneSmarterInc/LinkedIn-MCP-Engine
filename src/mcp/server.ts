@@ -16,7 +16,7 @@ import { getLLM } from "../lib/llm/index.js";
 import { getSearch } from "../lib/search/index.js";
 import { createSheetsGateway } from "../lib/google/sheets.js";
 import { createCalendarGateway } from "../lib/google/calendar.js";
-import { TAB, PIPELINE_HEADERS, STATUS, exportToSheet, recordExported } from "../core/exporter.js";
+import { TAB, JOB_TABS, PIPELINE_HEADERS, STATUS, exportToSheet, recordExported } from "../core/exporter.js";
 import type { RunReport } from "../core/pipeline.js";
 
 import {
@@ -34,7 +34,13 @@ import {
   searchJobs,
   startJobSearch
 } from "../core/jobs/job-search.js";
-import { exportJobsToSheet } from "../core/jobs/jobs-exporter.js";
+import {
+  attachOutreach,
+  checkJobsCampaign,
+  DEFAULT_JOBS_CAMPAIGN,
+  formatOutreach,
+  type JobOutreachDeps
+} from "../core/jobs/job-outreach.js";
 import { GeminiProvider } from "../lib/llm/gemini.js";
 import { geminiOptions } from "../lib/llm/index.js";
 
@@ -224,20 +230,52 @@ server.registerTool(
   }
 );
 
-// TOOL: RECENT JOB POSTS (background, like source_leads)
+// TOOL: JOB POSTS -> OUTREACH (background, like source_leads)
+// Search LinkedIn job posts -> Seamless contact -> 5 gates -> AI draft -> Jobs_Pipeline "Ready for Review".
+// A human approves in Jobs_Pipeline; AutoBooker sends, tracks replies and books, exactly as for Pipeline.
+
+/** The campaign whose offer, sender and persona the job emails use. Checked before any search starts. */
+async function jobsCampaign(): Promise<CampaignConfig> {
+  const ref = process.env.JOBS_CAMPAIGN?.trim() || DEFAULT_JOBS_CAMPAIGN;
+  if (!process.env.GOOGLE_SHEET_ID?.trim()) {
+    throw new Error(`Job outreach writes to the Sheet (${JOB_TABS.pipeline}), so GOOGLE_SHEET_ID must be set in .env.`);
+  }
+  let cfg: CampaignConfig;
+  try {
+    cfg = await loadCampaign(ref);
+  } catch (error) {
+    throw new Error(
+      `Job outreach needs a campaign named "${ref}" (the offer, sender company and persona for job emails). ` +
+      `Create it with create_campaign (mode CORPORATE, provider gemini_xray, any titles/states), or set JOBS_CAMPAIGN in .env. ` +
+      `Details: ${(error as Error).message}`
+    );
+  }
+  checkJobsCampaign(cfg);
+  return cfg;
+}
+
+function outreachDeps(cfg: CampaignConfig, runId: string, onStep?: JobOutreachDeps["onStep"]): JobOutreachDeps {
+  return {
+    cfg, ledger, runId, onStep,
+    gates: buildAsyncGates(cfg),
+    llm: getLLM(process.env),
+    gw: createSheetsGateway()
+  };
+}
+
 server.registerTool(
   "search_jobs",
   {
     description:
-      `Start a search for recent job posts on LinkedIn (any role, any company, posted in the last ${JOB_SEARCH_DEFAULTS.daysBack} days). ` +
-      "Returns a search_id at once with status RUNNING. Then call get_job_search every 30 seconds " +
-      "until status is DONE (usually 2-6 minutes) or FAILED. The result has title, company, location, an unconfirmed " +
-      "posted date, a short description, the link, and a contact email found by Seamless (the poster, or a recruiter/HR " +
-      `person; at most ${JOB_SEARCH_DEFAULTS.maxSeamlessLookups} lookups, 1 to 2 credits each). ` +
-      "When the search is DONE the jobs are written to the Google Sheet's Jobs tab (one row each, Status New) unless export_to_sheet is false.",
-    inputSchema: { export_to_sheet: z.boolean().optional() }
+      `Find recent LinkedIn job posts (any role, last ${JOB_SEARCH_DEFAULTS.daysBack} days, up to ${JOB_SEARCH_DEFAULTS.maxJobs}) and turn them into ` +
+      `outreach: Seamless finds the poster or a recruiter/HR person, the 5 gates check each email, AI writes an email that names the role, ` +
+      `and drafts go to the Sheet's ${JOB_TABS.pipeline} tab as "Ready for Review" (failures to ${JOB_TABS.quarantined}). ` +
+      `A human approves rows there; AutoBooker then sends, tracks replies and books meetings. Takes no input. ` +
+      "Returns a search_id at once. Then call get_job_search every 15-20 seconds and tell the user each new step " +
+      "(which search is running, jobs found, emails found, gates, drafts, Sheet) until status is DONE (usually 3-8 minutes) or FAILED.",
+    inputSchema: {}
   },
-  async ({ export_to_sheet }) => {
+  async () => {
     try {
       const key = process.env.GEMINI_API_KEY?.trim();
       if (!key) throw new Error("search_jobs needs GEMINI_API_KEY in .env.");
@@ -245,20 +283,25 @@ server.registerTool(
       if (!llm.supportsGrounding) {
         throw new Error("search_jobs needs Google Search in Gemini: turn on billing and set GEMINI_GROUNDING=true.");
       }
+      const cfg = await jobsCampaign();
       const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
-      const wantSheet = export_to_sheet !== false && !!process.env.GOOGLE_SHEET_ID?.trim();
-      const { record } = await startJobSearch(
-        (onProgress) => searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) }),
-        undefined,
-        undefined,
-        wantSheet ? (result) => exportJobsToSheet(result, createSheetsGateway()) : undefined
-      );
+
+      const { record } = await startJobSearch(async (onProgress, searchId) => {
+        const out = await searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
+        const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
+          stage, message,
+          searches_done: out.searches, searches_max: out.searches,
+          jobs_found: out.total, with_email: out.with_email, lookups_used: out.seamless_lookups_used,
+          jobs: out.jobs
+        });
+        return attachOutreach(out, outreachDeps(cfg, searchId, onStep));
+      });
+
       return success({
         search_id: record.search_id,
         status: record.status,
-        writes_to_sheet: wantSheet,
-        message: "Job search started. Call get_job_search with this search_id every 30 seconds until status is DONE." +
-          (wantSheet ? " When DONE, the jobs are also in the Sheet's Jobs tab (see the sheet field)." : " GOOGLE_SHEET_ID is not set, so results stay in the chat and on disk.")
+        campaign: cfg.campaign_name,
+        message: "Job search started. Call get_job_search every 15-20 seconds and tell the user each new step until status is DONE."
       });
     } catch (error) {
       return failure(error);
@@ -269,7 +312,11 @@ server.registerTool(
 server.registerTool(
   "get_job_search",
   {
-    description: "Show a job search started by search_jobs: RUNNING (check again in 30 seconds), DONE with the jobs, or FAILED with the reason. Leave search_id empty for the newest search.",
+    description:
+      "Live status of a job search started by search_jobs. RUNNING: the current step first, then jobs found so far and the " +
+      "last 10 steps; check again in 15-20 seconds and tell the user what changed. DONE: how many drafts are in " +
+      `${JOB_TABS.pipeline} waiting for approval, what went to ${JOB_TABS.quarantined} and why, and every job. ` +
+      "FAILED: the reason. Leave search_id empty for the newest search.",
     inputSchema: { search_id: z.string().min(1).optional() }
   },
   async ({ search_id }) => {
@@ -277,12 +324,43 @@ server.registerTool(
       const id = search_id ?? (await latestJobSearchId());
       if (!id) throw new Error("No job search yet. Call search_jobs first.");
       const rec = await loadJobSearchRecord(id);
+      const secs = Math.round((Date.now() - new Date(rec.started_at).getTime()) / 1000);
+
       if (rec.status === "RUNNING") {
-        const secs = Math.round((Date.now() - new Date(rec.started_at).getTime()) / 1000);
-        const step = rec.progress ? ` Current step: ${rec.progress.message} (${rec.progress.jobs_found} jobs, ${rec.progress.with_email} with email so far).` : "";
-        return success({ ...rec, message: `Still searching, ${secs}s so far.${step} Check again in 30 seconds.` });
+        return success({
+          search_id: rec.search_id,
+          status: rec.status,
+          now: rec.progress?.message ?? "Starting",
+          running_for: `${secs}s`,
+          counts: rec.progress
+            ? { stage: rec.progress.stage, jobs_found: rec.progress.jobs_found, with_email: rec.progress.with_email,
+                searches: `${rec.progress.searches_done} of ${rec.progress.searches_max}`, seamless_lookups: rec.progress.lookups_used }
+            : undefined,
+          recent_steps: [...rec.log].reverse().slice(0, 10),
+          jobs_so_far: rec.jobs_so_far ?? [],
+          next: "Call get_job_search again in 15-20 seconds and tell the user the new steps."
+        });
       }
-      return success(rec);
+      if (rec.status === "FAILED") return success({ search_id: rec.search_id, status: rec.status, error: rec.error, steps: rec.log });
+
+      const r = rec.result!;
+      return success({
+        search_id: rec.search_id,
+        status: rec.status,
+        took: `${secs}s`,
+        summary: r.outreach
+          ? formatOutreach(r.outreach)
+          : `Search worked but outreach failed: ${r.outreach_error ?? "unknown"}. Fix the cause, then call export_job_search.`,
+        outreach: r.outreach,
+        outreach_error: r.outreach_error,
+        jobs_found: r.total,
+        with_email: r.with_email,
+        searches: r.searches,
+        seamless_lookups: r.seamless_lookups_used,
+        jobs: r.jobs,
+        skipped: r.skipped,
+        steps: rec.log
+      });
     } catch (error) {
       return failure(error);
     }
@@ -292,7 +370,10 @@ server.registerTool(
 server.registerTool(
   "export_job_search",
   {
-    description: "Write a finished job search to the Google Sheet's Jobs tab (one row per job; jobs already there are skipped). Leave search_id empty for the newest search. Use when a search ran with export_to_sheet=false or the automatic export failed.",
+    description:
+      `Retry the outreach for a finished job search (5 gates -> AI drafts -> ${JOB_TABS.pipeline} / ${JOB_TABS.quarantined}) without searching again. ` +
+      "Use when get_job_search shows outreach_error (for example the Sheet or a quota failed). Rows already in the Sheet are not added twice. " +
+      "Leave search_id empty for the newest search.",
     inputSchema: { search_id: z.string().min(1).optional() }
   },
   async ({ search_id }) => {
@@ -301,9 +382,11 @@ server.registerTool(
       if (!id) throw new Error("No job search yet. Call search_jobs first.");
       const rec = await loadJobSearchRecord(id);
       if (rec.status !== "DONE" || !rec.result) throw new Error(`Search ${id} is ${rec.status}; only a DONE search can be exported.`);
-      const res = await exportJobsToSheet(rec.result, createSheetsGateway());
-      await saveJobSearchRecord({ ...rec, sheet: res, updated_at: new Date().toISOString() });
-      return success({ search_id: id, ...res, message: `${res.added} job(s) added to the Jobs tab, ${res.already_present} were already there.` });
+      const cfg = await jobsCampaign();
+      const result = await attachOutreach(rec.result, outreachDeps(cfg, id));
+      await saveJobSearchRecord({ ...rec, result, updated_at: new Date().toISOString() });
+      if (!result.outreach) throw new Error(`Outreach failed again: ${result.outreach_error}`);
+      return success({ search_id: id, ...result.outreach, message: formatOutreach(result.outreach) });
     } catch (error) {
       return failure(error);
     }

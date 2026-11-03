@@ -11,7 +11,16 @@ import type { Quarantined } from "./verifier.js";
 // Layout. The Pipeline columns and their ORDER must match apps_script/AutoBooker.gs.
 // ---------------------------------------------------------------------------
 
+/** The three tabs one flow writes to. Leads use TAB; job posts use JOB_TABS, with the same columns. */
+export interface SheetTabs { pipeline: string; quarantined: string; summary: string }
+
 export const TAB = { pipeline: "Pipeline", quarantined: "Quarantined", summary: "Summary" } as const;
+
+/**
+ * Job-post outreach (search_jobs) lives in its own three tabs, with the same columns and Status values,
+ * so AutoBooker sends, tracks replies and books meetings for them exactly as for Pipeline.
+ */
+export const JOB_TABS = { pipeline: "Jobs_Pipeline", quarantined: "Jobs_Quarantine", summary: "Jobs_Summary" } as const;
 
 export const PIPELINE_HEADERS = [
   "Company", "Domain", "Name", "Title", "Email", "Research", "Status", "Subject", "DraftBody", "ThreadID",
@@ -74,8 +83,15 @@ function domainOf(l: { company_domain?: string; email?: string }): string {
   return l.company_domain || l.email?.split("@")[1] || "";
 }
 
+/** "HIRING: RPG Developer (posted 2026-11-01) https://..." for leads found from a job post. */
+export function hiringNote(l: { hiring_for?: { role: string; url: string; posted_date?: string } }): string {
+  const h = l.hiring_for;
+  if (!h) return "";
+  return `HIRING: ${h.role}${h.posted_date ? ` (posted ${h.posted_date}, unconfirmed)` : ""} ${h.url}`;
+}
+
 export function pipelineRow(d: DraftedLead): string[] {
-  const research = d.research_summary.join(" | ");
+  const research = [hiringNote(d), d.research_summary.join(" | ")].filter(Boolean).join(" | ");
   const note = d.draft_status === "NEEDS_REWRITE" ? `REWRITE NEEDED: ${d.draft_issues.join("; ")}` : "";
   return [
     d.company_name,
@@ -157,8 +173,8 @@ function summaryRowsFor(pipelineRange: RangeOf, quarRange: RangeOf): string[][] 
 }
 
 /** Google Sheets accepts open-ended ranges such as Pipeline!G2:G. */
-export function summaryRows(): string[][] {
-  return summaryRowsFor((c) => `${TAB.pipeline}!${c}2:${c}`, (c) => `${TAB.quarantined}!${c}2:${c}`);
+export function summaryRows(tabs: SheetTabs = TAB): string[][] {
+  return summaryRowsFor((c) => `${tabs.pipeline}!${c}2:${c}`, (c) => `${tabs.quarantined}!${c}2:${c}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,21 +263,22 @@ function statusDropdownRequest(pipelineSheetId: number): object {
 }
 
 /** Creates missing tabs, writes headers, sets the Status dropdown, and writes the Summary formulas. Safe to run every time. */
-export async function ensureSheetLayout(gw: SheetsGateway): Promise<{ pipelineSheetId: number }> {
+export async function ensureSheetLayout(gw: SheetsGateway, tabs: SheetTabs = TAB): Promise<{ pipelineSheetId: number }> {
   const ids = new Map((await gw.listTabs()).map((t) => [t.title, t.sheetId]));
-  const missing = Object.values(TAB).filter((t) => !ids.has(t));
+  const wanted = [tabs.pipeline, tabs.quarantined, tabs.summary];
+  const missing = wanted.filter((t) => !ids.has(t));
   if (missing.length) for (const t of await gw.addTabs(missing)) ids.set(t.title, t.sheetId);
 
-  const pid = ids.get(TAB.pipeline)!;
-  const qid = ids.get(TAB.quarantined)!;
-  const sid = ids.get(TAB.summary)!;
+  const pid = ids.get(tabs.pipeline)!;
+  const qid = ids.get(tabs.quarantined)!;
+  const sid = ids.get(tabs.summary)!;
 
-  await ensureHeader(gw, TAB.pipeline, PIPELINE_HEADERS, pid, PIPELINE_WIDTHS, [5, 7, 8]);
-  await ensureHeader(gw, TAB.quarantined, QUARANTINED_HEADERS, qid, QUARANTINED_WIDTHS, []);
-  if (missing.includes(TAB.summary)) await gw.batchUpdate(formatRequests(sid, [260, 90], []));
+  await ensureHeader(gw, tabs.pipeline, PIPELINE_HEADERS, pid, PIPELINE_WIDTHS, [5, 7, 8]);
+  await ensureHeader(gw, tabs.quarantined, QUARANTINED_HEADERS, qid, QUARANTINED_WIDTHS, []);
+  if (missing.includes(tabs.summary)) await gw.batchUpdate(formatRequests(sid, [260, 90], []));
 
   await gw.batchUpdate([statusDropdownRequest(pid)]);
-  await gw.writeValues(`${TAB.summary}!A1`, summaryRows(), "formulas");
+  await gw.writeValues(`${tabs.summary}!A1`, summaryRows(tabs), "formulas");
   return { pipelineSheetId: pid };
 }
 
@@ -274,20 +291,20 @@ export interface SheetExportResult {
 }
 
 /** Appends this run to the Sheet. Existing rows, and any Status a human already set, are never touched. */
-export async function exportToSheet(report: RunReport, gw: SheetsGateway): Promise<SheetExportResult> {
+export async function exportToSheet(report: RunReport, gw: SheetsGateway, tabs: SheetTabs = TAB): Promise<SheetExportResult> {
   const rows = buildExportRows(report);
-  const { pipelineSheetId } = await ensureSheetLayout(gw);
+  const { pipelineSheetId } = await ensureSheetLayout(gw, tabs);
 
   // Skip emails already in the Pipeline tab, so exporting the same run twice cannot create duplicate rows.
   const emailCol = col(PIPELINE_HEADERS, "Email");
   const present = new Set(
-    (await gw.getValues(`${TAB.pipeline}!${emailCol}2:${emailCol}`)).map((r) => (r[0] ?? "").trim().toLowerCase()),
+    (await gw.getValues(`${tabs.pipeline}!${emailCol}2:${emailCol}`)).map((r) => (r[0] ?? "").trim().toLowerCase()),
   );
   const emailIdx = PIPELINE_HEADERS.indexOf("Email");
   const fresh = rows.pipeline.filter((r) => !present.has((r[emailIdx] ?? "").toLowerCase()));
 
-  if (fresh.length) await gw.appendValues(`${TAB.pipeline}!A1`, fresh);
-  if (rows.quarantined.length) await gw.appendValues(`${TAB.quarantined}!A1`, rows.quarantined);
+  if (fresh.length) await gw.appendValues(`${tabs.pipeline}!A1`, fresh);
+  if (rows.quarantined.length) await gw.appendValues(`${tabs.quarantined}!A1`, rows.quarantined);
   // Belt and braces: make sure every row, including the ones just added, has the dropdown.
   if (fresh.length) await gw.batchUpdate([statusDropdownRequest(pipelineSheetId)]);
 

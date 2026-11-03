@@ -1,7 +1,8 @@
 /**
  * AutoBooker.gs — Phase 5 sender for the LinkedIn MCP Engine.
  *
- * Reads the "Pipeline" tab the TypeScript exporter writes (columns A–J),
+ * Reads the "Pipeline" tab the TypeScript exporter writes (columns A–J), and the "Jobs_Pipeline"
+ * tab search_jobs writes (same columns) when it exists,
  * sends Approved drafts, reads replies, offers open times, books meetings,
  * and honors opt-outs. It owns columns K onward; the exporter never looks there.
  *
@@ -15,7 +16,7 @@
 // Layout. A–J come from the exporter. K–O are ours.
 // ---------------------------------------------------------------------------
 
-var TAB = { pipeline: "Pipeline", config: "Config", log: "SendLog", campaigns: "Campaigns" };
+var TAB = { pipeline: "Pipeline", jobsPipeline: "Jobs_Pipeline", config: "Config", log: "SendLog", campaigns: "Campaigns" };
 
 var COL = {
   company: 1, domain: 2, name: 3, title: 4, email: 5, research: 6,
@@ -88,12 +89,17 @@ function installTriggers() {
 function sendApproved() {
   withLock_(function () {
     var cfg = readConfig_();
-    var sheet = pipeline_();
-    var rows = readRows_(sheet);
-    var sentToday = countSentToday_(rows, cfg.TimeZone);
+    addColumnsQuietly_();
+    // Pipeline first, then Jobs_Pipeline. The daily cap covers both, since they share one Gmail account.
+    var tabs = pipelines_().map(function (sheet) { return { sheet: sheet, rows: readRows_(sheet) }; });
+    var sentToday = tabs.reduce(function (n, t) { return n + countSentToday_(t.rows, cfg.TimeZone); }, 0);
     var cap = Number(cfg.DailySendCap) || 20;
     var sentNow = 0;
+    var capHit = false;
 
+    for (var ti = 0; ti < tabs.length && !capHit; ti++) {
+    var sheet = tabs[ti].sheet;
+    var rows = tabs[ti].rows;
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
       if (r.status !== STATUS.approved) continue;
@@ -101,7 +107,8 @@ function sendApproved() {
       if (!r.email) continue;
 
       if (sentToday + sentNow >= cap) {
-        log_("cap", r.email, "Daily cap of " + cap + " reached. Row " + r.rowNo + " waits for tomorrow.");
+        log_("cap", r.email, "Daily cap of " + cap + " reached. " + sheet.getName() + " row " + r.rowNo + " waits for tomorrow.");
+        capHit = true;
         break;
       }
 
@@ -137,6 +144,7 @@ function sendApproved() {
       }
       SpreadsheetApp.flush();
     }
+    }
   });
 }
 
@@ -144,9 +152,12 @@ function sendApproved() {
 function processReplies() {
   withLock_(function () {
     var cfg = readConfig_();
-    var sheet = pipeline_();
-    var rows = readRows_(sheet);
+    addColumnsQuietly_();
+    var sheets = pipelines_();
 
+    for (var si = 0; si < sheets.length; si++) {
+    var sheet = sheets[si];
+    var rows = readRows_(sheet);
     for (var i = 0; i < rows.length; i++) {
       var r = rows[i];
       if (!r.threadId) continue;
@@ -198,6 +209,7 @@ function processReplies() {
           setCells_(sheet, r.rowNo, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: stamp_("reply needs a person: " + fresh.slice(0, 200)) });
       }
       SpreadsheetApp.flush();
+    }
     }
   });
 }
@@ -476,8 +488,25 @@ function pipeline_() {
   return s;
 }
 
+/** Every tab AutoBooker works on: Pipeline always, Jobs_Pipeline once search_jobs has created it. */
+function pipelines_() {
+  var list = [pipeline_()];
+  var jobs = ss_().getSheetByName(TAB.jobsPipeline);
+  if (jobs) list.push(jobs);
+  return list;
+}
+
+/** Adds columns K–O to every pipeline tab. Also runs at the start of each send and reply run, for a new Jobs_Pipeline. */
 function ensureOurColumns() {
-  var s = pipeline_();
+  pipelines_().forEach(ensureColumnsOn_);
+}
+
+/** Gives a Jobs_Pipeline made after setup() its K–O headers. A problem is logged, never stops sending. */
+function addColumnsQuietly_() {
+  try { ensureOurColumns(); } catch (e) { log_("columns", "", String(e.message)); }
+}
+
+function ensureColumnsOn_(s) {
   if (s.getMaxColumns() < LAST_COL) s.insertColumnsAfter(s.getMaxColumns(), LAST_COL - s.getMaxColumns());
   var range = s.getRange(1, COL.messageId, 1, OUR_HEADERS.length);
   var cur = range.getValues()[0].map(String);

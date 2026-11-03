@@ -1,7 +1,8 @@
 import { z } from "zod";
 
 export const Mode = z.enum(["CORPORATE", "CANDIDATE"]);
-export const SourcingProvider = z.enum(["gemini_xray", "apify_or_apollo", "csv_import"]);
+/** job_search: leads made from LinkedIn job posts by search_jobs (never chosen in a campaign). */
+export const SourcingProvider = z.enum(["gemini_xray", "apify_or_apollo", "csv_import", "job_search"]);
 
 const DEFAULT_CONSUMER_DOMAINS = [
   "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
@@ -52,6 +53,12 @@ export const LeadRecord = z.object({
    */
   email_source: z.enum(["csv", "search", "apollo", "seamless", "pattern"]).optional(),
   source: SourcingProvider,
+  /** Set for leads made from a job post: the role the company is hiring for. The draft names it. */
+  hiring_for: z.object({
+    role: z.string(),
+    url: z.string(),
+    posted_date: z.string().optional(),
+  }).optional(),
 });
 export type LeadRecord = z.infer<typeof LeadRecord>;
 

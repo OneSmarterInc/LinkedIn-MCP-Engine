@@ -23,7 +23,7 @@ import { getSearch } from "./lib/search/index.js";
 import { getLLM } from "./lib/llm/index.js";
 import { formatOptOutSync, syncOptOuts } from "./core/optout-sync.js";
 import { latestJobSearchId, loadJobSearchRecord, saveJobSearchRecord } from "./core/jobs/job-search.js";
-import { exportJobsToSheet, formatJobsExport } from "./core/jobs/jobs-exporter.js";
+import { attachOutreach, checkJobsCampaign, DEFAULT_JOBS_CAMPAIGN, formatOutreach } from "./core/jobs/job-outreach.js";
 
 type ExportTarget = "none" | "sheet" | "xlsx" | "both";
 
@@ -407,17 +407,29 @@ program
 
 program
   .command("jobs-export")
-  .description("Write a finished job search (newest, or --id) to the Google Sheet's Jobs tab")
+  .description("Run the outreach (5 gates, drafts, Jobs_Pipeline / Jobs_Quarantine) for a finished job search (newest, or --id)")
   .option("--id <search_id>", "a jobs-<uuid> search id")
-  .action(async (o: { id?: string }) => {
+  .option("--campaign <ref>", "campaign for the offer and sender", process.env.JOBS_CAMPAIGN || DEFAULT_JOBS_CAMPAIGN)
+  .action(async (o: { id?: string; campaign: string }) => {
     const id = o.id ?? (await latestJobSearchId());
     if (!id) throw new Error("No job search found in out/job-searches. Run search_jobs first.");
     const rec = await loadJobSearchRecord(id);
     if (rec.status !== "DONE" || !rec.result) throw new Error(`Search ${id} is ${rec.status}.`);
+    const cfg = await loadCampaign(o.campaign);
+    checkJobsCampaign(cfg);
     const { createSheetsGateway } = await import("./lib/google/sheets.js");
-    const res = await exportJobsToSheet(rec.result, createSheetsGateway());
-    await saveJobSearchRecord({ ...rec, sheet: res, updated_at: new Date().toISOString() });
-    console.log(formatJobsExport(res));
+    const ledger = openLedger();
+    try {
+      const result = await attachOutreach(rec.result, {
+        cfg, ledger, runId: id, gates: buildAsyncGates(cfg), llm: getLLM(process.env), gw: createSheetsGateway(),
+        onStep: (_stage, message) => console.log(message),
+      });
+      await saveJobSearchRecord({ ...rec, result, updated_at: new Date().toISOString() });
+      if (!result.outreach) throw new Error(`Outreach failed: ${result.outreach_error}`);
+      console.log(formatOutreach(result.outreach));
+    } finally {
+      ledger.close();
+    }
   });
 
 program.parseAsync().catch((err: Error) => {

@@ -56,6 +56,7 @@ class FakeSheet {
   set(r: number, c: number, v: unknown) { (this.cells[r] ??= [])[c] = v; }
   getLastRow() { let n = 0; this.cells.forEach((row, i) => { if (row && row.some((v) => v !== "" && v !== undefined)) n = i; }); return n; }
   getMaxColumns() { return 26; }
+  getName() { return this.name; }
   getMaxRows() { return 1000; }
   insertColumnsAfter() {}
   setColumnWidth() {} setColumnWidths() {} setFrozenRows() {}
@@ -94,7 +95,7 @@ class FakeThread {
   reply(text: string) { this.replies.push(text); }
 }
 
-function setup(opts: { rows?: Row[]; config?: Record<string, string>; busy?: { s: Date; e: Date }[]; threads?: FakeThread[]; lockFree?: boolean; sendThrows?: boolean } = {}) {
+function setup(opts: { rows?: Row[]; jobRows?: Row[]; config?: Record<string, string>; busy?: { s: Date; e: Date }[]; threads?: FakeThread[]; lockFree?: boolean; sendThrows?: boolean } = {}) {
   const sheets = new Map<string, FakeSheet>();
   const pipeline = new FakeSheet("Pipeline");
   sheets.set("Pipeline", pipeline);
@@ -102,6 +103,15 @@ function setup(opts: { rows?: Row[]; config?: Record<string, string>; busy?: { s
   (opts.rows ?? []).forEach((row, i) => {
     for (const [k, v] of Object.entries(row)) pipeline.set(i + 2, COLS[k as keyof typeof COLS], v);
   });
+  // Jobs_Pipeline exists only when the test gives it rows, like a Sheet before the first search_jobs run.
+  const jobs = new FakeSheet("Jobs_Pipeline");
+  if (opts.jobRows) {
+    sheets.set("Jobs_Pipeline", jobs);
+    PIPELINE_HEADERS.forEach((h, i) => jobs.set(1, i + 1, h));
+    opts.jobRows.forEach((row, i) => {
+      for (const [k, v] of Object.entries(row)) jobs.set(i + 2, COLS[k as keyof typeof COLS], v);
+    });
+  }
 
   const config = new FakeSheet("Config");
   sheets.set("Config", config);
@@ -160,7 +170,8 @@ function setup(opts: { rows?: Row[]; config?: Record<string, string>; busy?: { s
   const ctx = vm.createContext(globals) as Record<string, (...a: unknown[]) => unknown>;
   vm.runInContext(SCRIPT, ctx);
   const cell = (row: number, col: keyof typeof COLS) => pipeline.get(row, COLS[col]);
-  return { ctx, pipeline, cell, sent, events, threads };
+  const jobCell = (row: number, col: keyof typeof COLS) => jobs.get(row, COLS[col]);
+  return { ctx, pipeline, jobs, cell, jobCell, sent, events, threads, sheets };
 }
 
 const et = (y: number, mo: number, d: number, h: number, mi = 0) =>
@@ -412,5 +423,65 @@ describe("compatibility with the exporter", () => {
     const order = ["company", "domain", "name", "title", "email", "research", "status", "subject", "body", "threadId"];
     order.forEach((k, i) => expect(col[k]).toBe(i + 1));
     expect(PIPELINE_HEADERS).toHaveLength(10);
+  });
+});
+
+// =====================================================================================
+describe("Jobs_Pipeline (search_jobs outreach)", () => {
+  const approved = (email: string, company = "Acme"): Row => ({
+    company, name: "Jane Miller", email, status: "Approved", subject: "Your RPG Developer opening", body: "Hi Jane,\n\nSaw you are hiring.",
+  });
+
+  it("sends Approved rows from both Pipeline and Jobs_Pipeline, and records each in its own tab", () => {
+    const { ctx, sent, cell, jobCell } = setup({ config: LIVE_CONFIG, rows: [approved("a@acme.com")], jobRows: [approved("b@beta.com", "Beta")] });
+    ctx.sendApproved!();
+    expect(sent.map((m) => m.to)).toEqual(["a@acme.com", "b@beta.com"]);
+    expect(cell(2, "status")).toBe("Sent");
+    expect(jobCell(2, "status")).toBe("Sent");
+    expect(jobCell(2, "threadId")).toBe("thread-2");
+    expect(jobCell(2, "sendState")).toBe("SENT");
+  });
+
+  it("gives a Jobs_Pipeline made after setup() its K-O headers", () => {
+    const { ctx, jobs } = setup({ config: LIVE_CONFIG, jobRows: [] });
+    ctx.sendApproved!();
+    expect([11, 12, 13, 14, 15].map((c) => jobs.get(1, c))).toEqual(["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"]);
+  });
+
+  it("one daily cap covers both tabs", () => {
+    const { ctx, sent, jobCell } = setup({
+      config: { ...LIVE_CONFIG, DailySendCap: "2" },
+      rows: [approved("a@acme.com"), approved("b@acme.com")],
+      jobRows: [approved("c@beta.com", "Beta")],
+    });
+    ctx.sendApproved!();
+    expect(sent).toHaveLength(2);
+    expect(jobCell(2, "status")).toBe("Approved"); // waits for tomorrow
+  });
+
+  it("does not send Ready for Review job rows: a human must approve", () => {
+    const { ctx, sent } = setup({ config: LIVE_CONFIG, jobRows: [{ ...approved("b@beta.com"), status: "Ready for Review" }] });
+    ctx.sendApproved!();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("works when there is no Jobs_Pipeline tab yet", () => {
+    const { ctx, sent, sheets } = setup({ config: LIVE_CONFIG, rows: [approved("a@acme.com")] });
+    expect(sheets.has("Jobs_Pipeline")).toBe(false);
+    ctx.sendApproved!();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("reads replies in Jobs_Pipeline: an opt-out is recorded there", () => {
+    const t = new FakeThread("jt-1", [
+      { from: "Vikram <v@onesmarter.com>", date: new Date(NOW - 86_400_000), body: "Saw you are hiring." },
+      { from: "Bea <b@beta.com>", date: new Date(NOW - 3_600_000), body: "Please remove me from your list." },
+    ]);
+    const { ctx, jobCell } = setup({
+      config: LIVE_CONFIG, threads: [t],
+      jobRows: [{ company: "Beta", name: "Bea Lee", email: "b@beta.com", status: "Sent", threadId: "jt-1", messageId: "m1", sendState: "SENT" }],
+    });
+    ctx.processReplies!();
+    expect(jobCell(2, "status")).toBe("Opted Out");
   });
 });

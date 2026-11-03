@@ -6,6 +6,7 @@ import { z } from "zod";
 import type { LLMProvider } from "../../lib/llm/provider.js";
 import { logger } from "../../lib/logger.js";
 import { researchAndPoll, pickEmail, seamlessFindRecruiter, type SeamlessOptions } from "../sources/seamless-finder.js";
+import type { JobOutreachResult } from "./job-outreach.js";
 
 /** Fixed settings. The search_jobs tool takes no input; change these numbers here. */
 export const JOB_SEARCH_DEFAULTS = {
@@ -65,6 +66,10 @@ export interface JobSearchOutput {
   searched_at: string;
   /** Google searches actually run. */
   searches: number;
+  /** What happened after the search: gates, drafts, and the Jobs_Pipeline / Jobs_Quarantine rows. */
+  outreach?: JobOutreachResult;
+  /** Set when the search worked but the outreach step failed. export_job_search retries it. */
+  outreach_error?: string;
   window: { from: string; to: string };
   total: number;
   with_email: number;
@@ -165,7 +170,7 @@ export function inWindow(date: string | null | undefined, window: { from: string
 
 /** A live step report. Sent at start, before and after each search, after each email found, and at the end. */
 export interface JobSearchProgress {
-  stage: "starting" | "searching" | "emails" | "done";
+  stage: "starting" | "searching" | "emails" | "syncing" | "verifying" | "drafting" | "exporting" | "done";
   message: string;
   searches_done: number;
   searches_max: number;
@@ -239,6 +244,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       apply(posterCache.get(pk), "seamless_poster", realPoster, h.poster_title?.trim());
     } else if (pk && lookups < settings.maxSeamlessLookups) {
       lookups += 1;
+      report("emails", `Finding an email for ${view.job_title} at ${view.company}: asking Seamless for ${realPoster} (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
       const body = { contacts: [{ contactName: realPoster!, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
       const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url }));
       const found: Found = email ? { email } : undefined;
@@ -250,6 +256,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       apply(recruiterCache.get(ck), "seamless_recruiter");
     } else if (!view.email && lookups < settings.maxSeamlessLookups) {
       lookups += 1;
+      report("emails", `Finding an email for ${view.job_title} at ${view.company}: looking for a recruiter or HR person (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
       const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll);
       const found: Found = r ? { email: r.email, ...(r.name ? { name: r.name } : {}), ...(r.title ? { title: r.title } : {}) } : undefined;
       recruiterCache.set(ck, found);
@@ -303,7 +310,9 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       await findEmail(view, h, url);
       jobs.push(view);
       added += 1;
-      if (view.email) report("emails", `Email found for ${view.company}: ${view.email} (${view.email_source})`);
+      report("emails", view.email
+        ? `Email found for ${view.company}: ${view.email} (${view.email_source})`
+        : `No email for ${view.company} (${view.email_source})`);
     }
     report("searching", `${tag}: found ${plural(added, "new job")}, ${jobs.length} in total`);
   }
@@ -351,8 +360,6 @@ export interface JobSearchRecord {
   jobs_so_far?: JobView[];
   /** Every progress message, oldest first. Kept after DONE. */
   log: string[];
-  /** Filled when the result was written to the Google Sheet's Jobs tab. */
-  sheet?: { tab: string; added: number; already_present: number; without_email: number; error?: string };
 }
 
 const JOBS_DIR = resolve(process.cwd(), "out", "job-searches");
@@ -411,11 +418,9 @@ export async function latestJobSearchId(dir = JOBS_DIR): Promise<string | undefi
  * Returns the RUNNING record and the work promise (the server does not wait for it).
  */
 export async function startJobSearch(
-  run: (onProgress: (p: JobSearchProgress) => void) => Promise<JobSearchOutput>,
+  run: (onProgress: (p: JobSearchProgress) => void, searchId: string) => Promise<JobSearchOutput>,
   dir = JOBS_DIR,
   now: () => Date = () => new Date(),
-  /** Runs after a successful search, e.g. export to the Sheet. Its failure is recorded, never fatal. */
-  afterDone?: (result: JobSearchOutput) => Promise<NonNullable<JobSearchRecord["sheet"]>>,
 ): Promise<{ record: JobSearchRecord; done: Promise<void> }> {
   const started = now().toISOString();
   let record: JobSearchRecord = { search_id: createJobSearchId(), status: "RUNNING", started_at: started, updated_at: started, log: [] };
@@ -444,16 +449,11 @@ export async function startJobSearch(
 
   const done = (async () => {
     try {
-      const result = await run(onProgress);
-      let sheet: JobSearchRecord["sheet"];
-      if (afterDone) {
-        try { sheet = await afterDone(result); }
-        catch (err) { sheet = { tab: "Jobs", added: 0, already_present: 0, without_email: 0, error: (err as Error).message }; }
-      }
+      const result = await run(onProgress, record.search_id);
       finished = true;
       await write(() => {
         const { progress: _p, jobs_so_far: _j, ...rest } = record;
-        return { ...rest, status: "DONE", result, ...(sheet ? { sheet } : {}), updated_at: now().toISOString() };
+        return { ...rest, status: "DONE", result, updated_at: now().toISOString() };
       });
     } catch (err) {
       finished = true;

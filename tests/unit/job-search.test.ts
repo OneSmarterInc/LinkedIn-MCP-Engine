@@ -385,3 +385,23 @@ describe("background job search", () => {
     await expect(loadJobSearchRecord("jobs-00000000-0000-0000-0000-000000000000", dir)).rejects.toThrow(/not found/);
   });
 });
+
+describe("live steps while finding emails", () => {
+  it("says which lookup is running before Seamless answers, and the result after", async () => {
+    const { llm } = fakeLLM({ jobs: [job({ poster_name: "Jane Miller" })] });
+    const s = fakeSeamless({ posterEmail: "jane.miller@acme.com" });
+    const msgs: string[] = [];
+    await searchJobs({ llm, now: NOW, settings: { maxSearches: 1 }, onProgress: (p) => msgs.push(p.message), seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    const asking = msgs.findIndex((m) => m.startsWith("Finding an email for RPG Developer at Acme: asking Seamless for Jane Miller (lookup 1 of"));
+    const found = msgs.findIndex((m) => m.startsWith("Email found for Acme"));
+    expect(asking).toBeGreaterThan(-1);
+    expect(found).toBeGreaterThan(asking);
+  });
+  it("reports a job with no email too", async () => {
+    const { llm } = fakeLLM({ jobs: [job()] });
+    const s = fakeSeamless({ searchHasRow: false });
+    const msgs: string[] = [];
+    await searchJobs({ llm, now: NOW, settings: { maxSearches: 1 }, onProgress: (p) => msgs.push(p.message), seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    expect(msgs).toContain("No email for Acme (not_found)");
+  });
+});

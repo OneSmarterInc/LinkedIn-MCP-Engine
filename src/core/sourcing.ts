@@ -37,5 +37,7 @@ export async function sourceLeads(cfg: CampaignConfig, opts: SourceOptions, deps
       return sourceFromSearch(cfg, opts.limit, deps.search ?? getSearch(), deps.emailFinder ?? getEmailFinder());
     case "apify_or_apollo":
       throw new Error("apify_or_apollo is planned for Phase 8. Use --csv or gemini_xray for now.");
+    case "job_search":
+      throw new Error("job_search leads come from the search_jobs tool, not from a campaign. Use gemini_xray or csv_import.");
   }
 }
