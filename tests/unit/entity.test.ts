@@ -122,8 +122,14 @@ describe("gate 4: rules mode (no model)", () => {
     expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: "newyorklife.com", email_source: "pattern" }))).toBe("ENTITY_MISMATCH");
   });
 
-  it("trusts an unrelated domain when Seamless returned it for this person", async () => {
-    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: "newyorklife.com", email_source: "seamless" }))).toBeNull();
+  it("holds back a Seamless address at a different domain when the company's website is known", async () => {
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: "newyorklife.com", email_source: "seamless" }))).toBe("ENTITY_MISMATCH");
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "x@woolpert.com", company_name: "Infosys", company_domain: "infosys.com", email_source: "seamless" }))).toBe("ENTITY_MISMATCH");
+  });
+
+  it("trusts Seamless only when no company website is on record", async () => {
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: undefined, email_source: "seamless" }))).toBeNull();
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: undefined, email_source: "pattern" }))).toBe("ENTITY_MISMATCH");
   });
 
   it("still rejects a .edu address for a company, even from Seamless", async () => {

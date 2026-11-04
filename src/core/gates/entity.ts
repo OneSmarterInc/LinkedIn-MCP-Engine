@@ -114,8 +114,8 @@ const TRUSTED_SOURCES = new Set(["seamless", "apollo"]);
 
 /**
  * Gate 4 without a model (ENTITY_CHECK=rules). Same code rules as before, then the domain comparison.
- * When the domain and the company do not line up, an email that Seamless or Apollo returned for this
- * person at this company passes; a guessed or scraped address is held back. Location is not checked.
+ * Domain matches the company: pass. Company website unknown: pass only when Seamless or Apollo supplied the
+ * address. Company website known and the email is elsewhere: held back. Location is not checked.
  */
 export function makeRuleEntityCheck(cfg: CampaignConfig) {
   return async (lead: LeadRecord): Promise<FailureReason | null> => {
@@ -127,7 +127,10 @@ export function makeRuleEntityCheck(cfg: CampaignConfig) {
     if (rule) { logger.debug({ lead_id: lead.lead_id, gate: 4, rule }, "entity rule mismatch"); return "ENTITY_MISMATCH"; }
     const verdict = domainMatchesCompany(domain, lead.company_name, lead.company_domain);
     const trusted = TRUSTED_SOURCES.has(lead.email_source ?? "");
-    const ok = verdict === "match" || trusted;
+    // "match" passes. "unknown" (no company website on record) passes only for an address Seamless or Apollo
+    // returned for this person. "mismatch" (the company's website is known and this is a different domain) is
+    // held back whoever supplied the address: that is the wrong-company case this gate exists for.
+    const ok = verdict === "match" || (verdict === "unknown" && trusted);
     logger.debug({ lead_id: lead.lead_id, gate: 4, verdict, email_source: lead.email_source, ok }, "entity rules");
     return ok ? null : "ENTITY_MISMATCH";
   };
