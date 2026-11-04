@@ -7,6 +7,7 @@ import type { LLMProvider } from "../../lib/llm/provider.js";
 import { logger } from "../../lib/logger.js";
 import { researchAndPoll, pickEmail, seamlessFindRecruiter, type SeamlessOptions } from "../sources/seamless-finder.js";
 import type { JobOutreachResult } from "./job-outreach.js";
+import { staffingCheck, type StaffingCheck } from "./staffing.js";
 import { JOBSPY_TERMS, JobSpySetupError, runJobSpy, type JobSpyOptions, type RunCommand } from "./jobspy.js";
 
 /** Fixed settings. The search_jobs tool takes no input; change these numbers here. */
@@ -32,6 +33,8 @@ export const JobHit = z.object({
   url: z.string().describe("LinkedIn job or post URL"),
   poster_name: z.string().nullish().describe("The person who posted the job, if the page shows one"),
   poster_title: z.string().nullish(),
+  /** Longer post text, used only to spot staffing firms (JobSpy fills it). */
+  about: z.string().nullish(),
 });
 export type JobHit = z.infer<typeof JobHit>;
 const JobSearchResult = z.object({ jobs: z.array(JobHit) });
@@ -133,7 +136,7 @@ export function buildJobPrompts(window: { from: string; to: string }, limit: num
   const common = [
     `Today is ${window.to}. Only include posts from ${window.from} to ${window.to}.`,
     `LinkedIn shows age as "3 days ago" or "1 week ago": convert it to a YYYY-MM-DD posted_date using today's date. If you cannot tell the date, use null.`,
-    "Any company, any country.",
+    "Any company, any country, but only companies hiring for their own team: leave out staffing agencies, recruiting firms, and IT consulting or outsourcing companies.",
     "For each give job_title, company_name, company_domain (the company's own website, not linkedin.com), location,",
     "posted_date, a two-sentence description, url (the LinkedIn link you found),",
     "poster_name and poster_title (only if the page shows who posted it).",
@@ -262,6 +265,8 @@ export interface JobSearchDeps {
   seen?: SeenJobs;
   /** Set to find jobs with JobSpy (real listings from Indeed, LinkedIn, ...) instead of Gemini's Google Search. */
   jobspy?: { opts: JobSpyOptions; run?: RunCommand };
+  /** Spots staffing and consulting firms (competitors). Defaults to the built-in list plus SKIP_COMPANIES. */
+  skip?: StaffingCheck;
 }
 
 /** Gemini's answer when the project has no credit left or is over its spending cap. */
@@ -283,6 +288,8 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   const terms = [...JOBSPY_TERMS.slice(termOffset), ...JOBSPY_TERMS.slice(0, termOffset)];
   const searchesMax = Math.min(settings.maxSearches, spy ? terms.length : prompts.length);
   let seenBefore = 0;
+  const skip = deps.skip ?? staffingCheck();
+  let firmsSkipped = 0;
 
   const jobs: JobView[] = [];
   const skipped: JobSearchOutput["skipped"] = [];
@@ -369,7 +376,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     try {
       if (spy) {
         // Ask for extra rows: jobs found by earlier runs are skipped below.
-        const r = await runJobSpy(terms[n]!.term, settings.maxJobs * 2, spy.opts, spy.run);
+        const r = await runJobSpy(terms[n]!.term, settings.maxJobs * 3, spy.opts, spy.run);
         hits = r.hits;
         const blocked = Object.keys(r.boardErrors);
         if (blocked.length) report("searching", `${tag}: ${blocked.join(", ")} did not answer (often a rate limit); kept the other boards' jobs`);
@@ -390,6 +397,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
 
     let added = 0;
     let old = 0;
+    let firms = 0;
     for (const h of hits) {
       if (jobs.length >= settings.maxJobs) break;
       const url = spy ? normalizeBoardUrl(h.url) : normalizeJobUrl(h.url);
@@ -402,6 +410,12 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       if (!inWindow(h.posted_date, window)) { skipped.push({ url, reason: "OUTSIDE_DATE_WINDOW" }); continue; }
 
       const domain = h.company_domain?.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || undefined;
+      const firm = skip.reason({ name: h.company_name, ...(domain ? { domain } : {}), text: `${h.job_title} ${h.about ?? h.description}` });
+      if (firm) {
+        skipped.push({ url, reason: "STAFFING_OR_CONSULTING_FIRM" }); firms += 1; firmsSkipped += 1;
+        report("searching", `Skipped ${h.company_name.trim()}: ${firm}`);
+        continue;
+      }
       const view: JobView = {
         job_title: h.job_title.trim(),
         company: h.company_name.trim(),
@@ -414,16 +428,22 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
         email_source: "seamless_off",
       };
       await findEmail(view, h, url);
+      if (skip.contact(view.contact_title)) {
+        skipped.push({ url, reason: "STAFFING_OR_CONSULTING_FIRM" }); firms += 1; firmsSkipped += 1;
+        report("emails", `Skipped ${view.company}: its contact is a ${view.contact_title}, which only staffing firms have`);
+        continue;
+      }
       jobs.push(view);
       added += 1;
       report("emails", view.email
         ? `Email found for ${view.company}: ${view.email} (${view.email_source})`
         : `No email for ${view.company} (${view.email_source})`);
     }
-    report("searching", `${tag}: found ${plural(added, "new job")}, ${jobs.length} in total` + (old ? ` (${old} found before, skipped)` : ""));
+    report("searching", `${tag}: found ${plural(added, "new job")}, ${jobs.length} in total` +
+      (old || firms ? ` (skipped: ${[old ? `${old} found before` : "", firms ? `${plural(firms, "staffing or consulting firm")}` : ""].filter(Boolean).join(", ")})` : ""));
   }
 
-  logger.info({ searches, kept: jobs.length, lookups, seen_before: seenBefore }, "job search");
+  logger.info({ searches, kept: jobs.length, lookups, seen_before: seenBefore, firms_skipped: firmsSkipped }, "job search");
   const withEmail = jobs.filter((j) => j.email).length;
   report("done", `Done: ${plural(jobs.length, "job")}, ${withEmail} with email, ${plural(searches, "search").replace("searchs", "searches")}, ${plural(lookups, "Seamless lookup")}`);
   return {

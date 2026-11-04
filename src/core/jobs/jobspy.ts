@@ -30,7 +30,7 @@ export const JOBSPY_TERMS: Array<{ label: string; term: string }> = [
   { label: "software engineers", term: "software engineer" },
   { label: "data and AI", term: "data engineer" },
   { label: "IBM i and RPG", term: "RPG IBM i developer" },
-  { label: "SAP and ERP", term: "SAP consultant" },
+  { label: "SAP and ERP", term: "SAP business analyst" },
   { label: "finance and accounting", term: "accountant" },
   { label: "healthcare and nursing", term: "registered nurse" },
   { label: "sales", term: "sales manager" },
@@ -65,8 +65,10 @@ const runCommand: RunCommand = (cmd, args, timeoutMs) =>
   new Promise((done) => {
     let stdout = "";
     let stderr = "";
-    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: { ...process.env, PYTHONIOENCODING: "utf-8" } });
     const timer = setTimeout(() => { child.kill(); stderr += `\nstopped after ${timeoutMs} ms`; }, timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
     child.stdout.on("data", (d) => { stdout += String(d); });
     child.stderr.on("data", (d) => { stderr += String(d); });
     child.on("error", (err) => { clearTimeout(timer); done({ code: null, stdout, stderr, spawnError: err.message }); });
@@ -120,6 +122,7 @@ export function rowToHit(r: JobSpyRow): JobHit | undefined {
     posted_date: r.date_posted ? String(r.date_posted).slice(0, 10) : null,
     description: shortDescription(r.description),
     url: r.job_url.trim(),
+    ...(r.description ? { about: r.description } : {}),
     poster_name: null,
     poster_title: null,
   };

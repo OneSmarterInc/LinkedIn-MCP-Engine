@@ -13,6 +13,9 @@ import sys
 
 
 def main() -> int:
+    # Windows consoles default to cp1252; the engine reads UTF-8.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
     try:
         args = json.loads(sys.argv[1] if len(sys.argv) > 1 else "{}")
     except json.JSONDecodeError as exc:
