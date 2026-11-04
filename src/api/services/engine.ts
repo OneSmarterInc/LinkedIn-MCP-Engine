@@ -46,7 +46,21 @@ async function jobsCampaign(env: NodeJS.ProcessEnv): Promise<CampaignConfig> {
   }
 }
 
+/** True while a job search runs in this process. One at a time: a second search would spend Seamless credits twice and write duplicate rows. */
+let searchBusy = false;
+
 export async function startSearch(deps: EngineDeps): Promise<{ search_id: string; campaign: string }> {
+  if (searchBusy) throw Object.assign(new Error("A job search is already running. Wait for it to finish."), { statusCode: 409 });
+  searchBusy = true;
+  let handedOff = false;
+  try {
+    return await startSearchNow(deps, () => { handedOff = true; }, () => { searchBusy = false; });
+  } finally {
+    if (!handedOff) searchBusy = false;
+  }
+}
+
+async function startSearchNow(deps: EngineDeps, onStarted: () => void, onFinished: () => void): Promise<{ search_id: string; campaign: string }> {
   const env = deps.env ?? process.env;
   const key = env.GEMINI_API_KEY?.trim();
   if (!key) throw Object.assign(new Error("GEMINI_API_KEY is empty in .env."), { statusCode: 400 });
@@ -55,13 +69,19 @@ export async function startSearch(deps: EngineDeps): Promise<{ search_id: string
   const cfg = await jobsCampaign(env);
   const seamlessKey = env.SEAMLESS_API_KEY?.trim();
 
+  // The run starts inside startJobSearch; from then on, the run itself clears the lock when it ends.
   const { record } = await startJobSearch(async (onProgress, searchId) => {
-    const out = await searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
-    const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
-      stage, message, searches_done: out.searches, searches_max: out.searches,
-      jobs_found: out.total, with_email: out.with_email, lookups_used: out.seamless_lookups_used, jobs: out.jobs,
-    });
-    return attachOutreach(out, { cfg, ledger: deps.ledger, runId: searchId, onStep, gates: buildAsyncGates(cfg), llm: getLLM(env), gw: deps.gw() });
+    onStarted();
+    try {
+      const out = await searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
+      const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
+        stage, message, searches_done: out.searches, searches_max: out.searches,
+        jobs_found: out.total, with_email: out.with_email, lookups_used: out.seamless_lookups_used, jobs: out.jobs,
+      });
+      return await attachOutreach(out, { cfg, ledger: deps.ledger, runId: searchId, onStep, gates: buildAsyncGates(cfg), llm: getLLM(env), gw: deps.gw() });
+    } finally {
+      onFinished();
+    }
   });
   return { search_id: record.search_id, campaign: cfg.campaign_name };
 }
