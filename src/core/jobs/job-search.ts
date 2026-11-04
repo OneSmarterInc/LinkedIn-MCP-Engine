@@ -7,6 +7,7 @@ import type { LLMProvider } from "../../lib/llm/provider.js";
 import { logger } from "../../lib/logger.js";
 import { researchAndPoll, pickEmail, seamlessFindRecruiter, type SeamlessOptions } from "../sources/seamless-finder.js";
 import type { JobOutreachResult } from "./job-outreach.js";
+import { JOBSPY_TERMS, JobSpySetupError, runJobSpy, type JobSpyOptions, type RunCommand } from "./jobspy.js";
 
 /** Fixed settings. The search_jobs tool takes no input; change these numbers here. */
 export const JOB_SEARCH_DEFAULTS = {
@@ -161,6 +162,14 @@ export function normalizeJobUrl(raw: string): string | undefined {
   return JOB_URL.test(`${url}/`) ? url.replace(/^http:/i, "https:") : undefined;
 }
 
+/** A job link from any board JobSpy reads. LinkedIn links are cleaned; others keep their query (Indeed's ?jk= is the job). */
+export function normalizeBoardUrl(raw: string): string | undefined {
+  const linkedin = normalizeJobUrl(raw);
+  if (linkedin) return linkedin;
+  const url = raw.trim();
+  return /^https?:\/\/[^\s]+$/i.test(url) ? url.replace(/^http:/i, "https:") : undefined;
+}
+
 /** True when the date is missing or inside the window. A date outside the window drops the job. */
 export function inWindow(date: string | null | undefined, window: { from: string; to: string }): boolean {
   if (!date) return true;
@@ -251,6 +260,8 @@ export interface JobSearchDeps {
   onProgress?: (p: JobSearchProgress) => void;
   /** Jobs from earlier searches. They are skipped before any Seamless lookup, so they cost no credits. */
   seen?: SeenJobs;
+  /** Set to find jobs with JobSpy (real listings from Indeed, LinkedIn, ...) instead of Gemini's Google Search. */
+  jobspy?: { opts: JobSpyOptions; run?: RunCommand };
 }
 
 /** Gemini's answer when the project has no credit left or is over its spending cap. */
@@ -267,7 +278,10 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   const offset = before.runs % JOB_SEARCH_ANGLES.length;
   const angles = [...JOB_SEARCH_ANGLES.slice(offset), ...JOB_SEARCH_ANGLES.slice(0, offset)];
   const prompts = buildJobPrompts(window, settings.maxJobs, angles, before.recent);
-  const searchesMax = Math.min(settings.maxSearches, prompts.length);
+  const spy = deps.jobspy;
+  const termOffset = before.runs % JOBSPY_TERMS.length;
+  const terms = [...JOBSPY_TERMS.slice(termOffset), ...JOBSPY_TERMS.slice(0, termOffset)];
+  const searchesMax = Math.min(settings.maxSearches, spy ? terms.length : prompts.length);
   let seenBefore = 0;
 
   const jobs: JobView[] = [];
@@ -341,19 +355,29 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   };
 
   report("starting", `Starting: up to ${settings.maxJobs} jobs from ${window.from} to ${window.to}, up to ${searchesMax} searches` +
+    (spy ? ` with JobSpy (${spy.opts.sites.join(", ")}, ${spy.opts.location}, last ${spy.opts.hoursOld} hours)` : "") +
     (deps.seamless ? `, up to ${settings.maxSeamlessLookups} Seamless lookups` : ", Seamless off") +
     (before.keys.size ? `, skipping ${plural(before.keys.size, "job")} found by earlier searches` : ""));
 
   for (let n = 0; n < searchesMax && jobs.length < settings.maxJobs; n++) {
     const angle = angles[n] ?? { label: `angle ${n + 1}`, kind: "pages" as const, hint: "" };
-    const tag = `Search ${n + 1} of ${searchesMax} (${angle.label})`;
+    const tag = spy ? `Search ${n + 1} of ${searchesMax} (${terms[n]!.label} on ${spy.opts.sites.join(", ")})` : `Search ${n + 1} of ${searchesMax} (${angle.label})`;
     report("searching", `${tag}...`);
     searches += 1;
 
     let hits: JobHit[] = [];
     try {
-      hits = (await deps.llm.generateJSON(prompts[n]!, JobSearchResult, { grounded: true, system: SYSTEM })).jobs;
+      if (spy) {
+        // Ask for extra rows: jobs found by earlier runs are skipped below.
+        const r = await runJobSpy(terms[n]!.term, settings.maxJobs * 2, spy.opts, spy.run);
+        hits = r.hits;
+        const blocked = Object.keys(r.boardErrors);
+        if (blocked.length) report("searching", `${tag}: ${blocked.join(", ")} did not answer (often a rate limit); kept the other boards' jobs`);
+      } else {
+        hits = (await deps.llm.generateJSON(prompts[n]!, JobSearchResult, { grounded: true, system: SYSTEM })).jobs;
+      }
     } catch (err) {
+      if (err instanceof JobSpySetupError) throw err;
       const msg = (err as Error).message;
       // Out of credits or over the spending cap: every later call fails too, so stop now and say why.
       if (GEMINI_OUT_OF_CREDIT.test(msg)) {
@@ -368,7 +392,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     let old = 0;
     for (const h of hits) {
       if (jobs.length >= settings.maxJobs) break;
-      const url = normalizeJobUrl(h.url);
+      const url = spy ? normalizeBoardUrl(h.url) : normalizeJobUrl(h.url);
       if (!url) { skipped.push({ url: h.url, reason: "NOT_A_LINKEDIN_JOB_URL" }); continue; }
       if (seen.has(url)) { skipped.push({ url, reason: "DUPLICATE" }); continue; }
       seen.add(url);

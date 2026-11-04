@@ -17,6 +17,7 @@ import { geminiOptions } from "../../lib/llm/index.js";
 import {
   JOB_SEARCH_DEFAULTS, latestJobSearchId, loadJobSearchRecord, loadSeenJobs, searchJobs, startJobSearch, type JobSearchRecord,
 } from "../../core/jobs/job-search.js";
+import { jobSpyOptionsFromEnv, useJobSpy } from "../../core/jobs/jobspy.js";
 import { DEFAULT_JOBS_CAMPAIGN, attachOutreach, type JobOutreachDeps } from "../../core/jobs/job-outreach.js";
 import { createRunId, listRuns, loadRunState, saveRunState, type McpRunState } from "../../mcp/run-store.js";
 import { viewRun } from "../../mcp/run-view.js";
@@ -65,7 +66,9 @@ async function startSearchNow(deps: EngineDeps, onStarted: () => void, onFinishe
   const key = env.GEMINI_API_KEY?.trim();
   if (!key) throw Object.assign(new Error("GEMINI_API_KEY is empty in .env."), { statusCode: 400 });
   const llm = new GeminiProvider(geminiOptions(env, key));
-  if (!llm.supportsGrounding) throw Object.assign(new Error("Set GEMINI_GROUNDING=true (needs billing) for job search."), { statusCode: 400 });
+  // With JobSpy finding the jobs, Gemini only checks leads (gate 4) and writes drafts, so Google Search grounding is not needed.
+  const jobspy = useJobSpy(env) ? { opts: jobSpyOptionsFromEnv(env) } : undefined;
+  if (!jobspy && !llm.supportsGrounding) throw Object.assign(new Error("Set GEMINI_GROUNDING=true (needs billing) for job search, or set JOB_SEARCH_SOURCE=jobspy."), { statusCode: 400 });
   const cfg = await jobsCampaign(env);
   const seamlessKey = env.SEAMLESS_API_KEY?.trim();
 
@@ -73,7 +76,7 @@ async function startSearchNow(deps: EngineDeps, onStarted: () => void, onFinishe
   const { record } = await startJobSearch(async (onProgress, searchId) => {
     onStarted();
     try {
-      const out = await searchJobs({ llm, onProgress, seen: await loadSeenJobs(), ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
+      const out = await searchJobs({ llm, onProgress, seen: await loadSeenJobs(), ...(jobspy ? { jobspy } : {}), ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
       const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
         stage, message, searches_done: out.searches, searches_max: out.searches,
         jobs_found: out.total, with_email: out.with_email, lookups_used: out.seamless_lookups_used, jobs: out.jobs,
