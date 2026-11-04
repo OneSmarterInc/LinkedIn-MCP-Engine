@@ -79,8 +79,8 @@ export async function listSearches(limit = 10): Promise<Array<Pick<JobSearchReco
   const out = [];
   for (const f of files) {
     try {
-      const r = JSON.parse(await readFile(resolve(JOBS_DIR, f), "utf8")) as JobSearchRecord & { result?: { total?: number; with_email?: number; outreach?: { drafted?: number } } };
-      out.push({ search_id: r.search_id, status: r.status, started_at: r.started_at, updated_at: r.updated_at, total: r.result?.total, with_email: r.result?.with_email, drafts: r.result?.outreach?.drafted });
+      const r = JSON.parse(await readFile(resolve(JOBS_DIR, f), "utf8")) as JobSearchRecord & { result?: { total?: number; with_email?: number; outreach?: { pipeline_added?: number } } };
+      out.push({ search_id: r.search_id, status: r.status, started_at: r.started_at, updated_at: r.updated_at, total: r.result?.total, with_email: r.result?.with_email, drafts: r.result?.outreach?.pipeline_added });
     } catch { /* skip unreadable */ }
   }
   return out.sort((a, b) => b.started_at.localeCompare(a.started_at)).slice(0, limit);
