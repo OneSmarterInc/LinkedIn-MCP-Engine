@@ -35,6 +35,7 @@ import {
   searchJobs,
   startJobSearch
 } from "../core/jobs/job-search.js";
+import { jobSpyOptionsFromEnv, useJobSpy } from "../core/jobs/jobspy.js";
 import {
   attachOutreach,
   checkJobsCampaign,
@@ -281,14 +282,15 @@ server.registerTool(
       const key = process.env.GEMINI_API_KEY?.trim();
       if (!key) throw new Error("search_jobs needs GEMINI_API_KEY in .env.");
       const llm = new GeminiProvider(geminiOptions(process.env, key));
-      if (!llm.supportsGrounding) {
-        throw new Error("search_jobs needs Google Search in Gemini: turn on billing and set GEMINI_GROUNDING=true.");
+      const jobspy = useJobSpy(process.env) ? { opts: jobSpyOptionsFromEnv(process.env) } : undefined;
+      if (!jobspy && !llm.supportsGrounding) {
+        throw new Error("search_jobs needs Google Search in Gemini: turn on billing and set GEMINI_GROUNDING=true, or set JOB_SEARCH_SOURCE=jobspy.");
       }
       const cfg = await jobsCampaign();
       const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
 
       const { record } = await startJobSearch(async (onProgress, searchId) => {
-        const out = await searchJobs({ llm, onProgress, seen: await loadSeenJobs(), ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
+        const out = await searchJobs({ llm, onProgress, seen: await loadSeenJobs(), ...(jobspy ? { jobspy } : {}), ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
         const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
           stage, message,
           searches_done: out.searches, searches_max: out.searches,
