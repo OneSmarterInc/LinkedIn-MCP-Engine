@@ -101,8 +101,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
 
   // ---- campaigns (the Campaigns tab) ----
   const store = () => sheetCampaignStore(gw());
-  app.get("/api/campaigns", async () => ({ campaigns: await store().list() }));
-  app.get("/api/campaigns/:name", async (req) => store().get(decodeURIComponent((req.params as { name: string }).name)));
+  // Cached for 30 s: the Campaigns page asks for every campaign at once, and Google allows 60 Sheet reads a minute.
+  app.get("/api/campaigns", async () => ({ campaigns: await cached("campaigns", 30_000, () => store().list()) }));
+  app.get("/api/campaigns/:name", async (req) => {
+    const name = decodeURIComponent((req.params as { name: string }).name);
+    return cached(`campaign:${name}`, 30_000, () => store().get(name));
+  });
   const CampaignBody = z.object({
     name: z.string().min(1), mode: Mode, provider: SourcingProvider.default("gemini_xray"),
     titles: z.array(z.string().min(1)).min(1), states: z.array(z.string().min(1)).min(1), keywords: z.array(z.string()).default([]),
@@ -117,7 +121,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       ...(a.persona ? { outreach_persona: a.persona } : {}), ...(a.signal_query ? { signal_query: a.signal_query } : {}),
       calendar_duration_minutes: a.meeting_minutes, daily_send_cap: a.daily_cap, block_current_employer_domain: a.mode === "CANDIDATE",
     });
-    return store().save(cfg, { active: a.active });
+    const r = await store().save(cfg, { active: a.active }); bust(); return r;
   });
   app.patch("/api/campaigns/:name", async (req) => {
     const name = decodeURIComponent((req.params as { name: string }).name);
@@ -131,21 +135,21 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       ...(a.persona !== undefined ? { outreach_persona: a.persona } : {}), ...(a.signal_query !== undefined ? { signal_query: a.signal_query } : {}),
       calendar_duration_minutes: a.meeting_minutes ?? cur.calendar_duration_minutes, daily_send_cap: a.daily_cap ?? cur.daily_send_cap,
     });
-    return store().save(next, { active: a.active });
+    const r = await store().save(next, { active: a.active }); bust(); return r;
   });
   app.post("/api/campaigns/:name/active", async (req) => {
     const b = z.object({ active: z.boolean() }).parse(req.body);
     const name = decodeURIComponent((req.params as { name: string }).name);
-    await store().setActive(name, b.active); return { name, active: b.active };
+    await store().setActive(name, b.active); bust(); return { name, active: b.active };
   });
   app.post("/api/campaigns/validate", async () => ({ campaigns: await store().validateAll() }));
 
   // ---- settings (the Config tab AutoBooker reads) ----
-  app.get("/api/settings", async () => ({ values: await readConfig(gw()), fields: CONFIG_DEFAULTS.map(([key, def, help]) => ({ key, default: def, help })) }));
+  app.get("/api/settings", async () => ({ values: await cached("settings", 30_000, () => readConfig(gw())), fields: CONFIG_DEFAULTS.map(([key, def, help]) => ({ key, default: def, help })) }));
   app.put("/api/settings", async (req) => {
     const patch = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).parse(req.body);
     const asText = Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, typeof v === "boolean" ? (v ? "TRUE" : "FALSE") : String(v)]));
-    return { values: await writeConfig(gw(), asText) };
+    const values = await writeConfig(gw(), asText); bust(); return { values };
   });
 
   return app;

@@ -9,6 +9,7 @@ import { parseSignal, whyText } from "../../src/api/services/sheet-rows.js";
 function fakeSheets(initial: Record<string, string[][]> = {}) {
   const tabs = new Map<string, { id: number; rows: string[][] }>();
   let nextId = 1;
+  const stats = { reads: 0 };
   for (const [t, rows] of Object.entries(initial)) tabs.set(t, { id: nextId++, rows });
   const idx = (letters: string) => [...letters].reduce((n, c) => n * 26 + c.charCodeAt(0) - 64, 0) - 1;
   const parse = (range: string) => {
@@ -21,20 +22,21 @@ function fakeSheets(initial: Record<string, string[][]> = {}) {
     async addTabs(titles) { return titles.map((title) => { const t = { id: nextId++, rows: [] as string[][] }; tabs.set(title, t); return { title, sheetId: t.id }; }); },
     async batchUpdate() {},
     async getValues(range) {
+      stats.reads++;
       const p = parse(range); const rows = tabs.get(p.tab)?.rows ?? [];
       return rows.slice(p.r1, p.r2 === undefined ? undefined : p.r2 + 1).map((r) => r.slice(p.c1, p.c2 === undefined ? p.c1 + 1 : p.c2 + 1)).filter((r) => r.length > 0);
     },
     async writeValues(range, values) { const p = parse(range); const t = tabs.get(p.tab)!; values.forEach((row, i) => { const r = (t.rows[p.r1 + i] ??= []); row.forEach((v, j) => { r[p.c1 + j] = v; }); }); },
     async appendValues(range, values) { tabs.get(parse(range).tab)!.rows.push(...values.map((v) => [...v])); },
   };
-  return { gw, tabs };
+  return { gw, tabs, stats };
 }
 
 const H = [...PIPELINE_HEADERS];
 const row = (o: Partial<Record<(typeof PIPELINE_HEADERS)[number], string>>) => H.map((h) => o[h] ?? "");
 
 describe("API", () => {
-  let app: FastifyInstance; let tabs: Map<string, { rows: string[][] }>;
+  let app: FastifyInstance; let tabs: Map<string, { rows: string[][] }>; let stats: { reads: number };
   beforeAll(async () => {
     const f = fakeSheets({
       Jobs_Pipeline: [H,
@@ -44,7 +46,7 @@ describe("API", () => {
       Pipeline: [H, row({ Company: "NOW CFO", Name: "Amy Farrow", Email: "afarrow@nowcfo.com", Status: "Meeting Booked", Subject: "s", DraftBody: "b" })],
       Jobs_Quarantine: [[...QUARANTINED_HEADERS], ["Miami Valley Care", "mvcare.org", "Dana Kim", "Director of Nursing", "", "Dayton, OH", "1", "MISSING_EMAIL", "Jobs", "jobs-1", "job-1"]],
     });
-    tabs = f.tabs;
+    tabs = f.tabs; stats = f.stats;
     app = await buildApp({ gw: () => f.gw, ledger: openLedger(":memory:"), env: { API_TOKEN: "secret" } });
   });
   afterAll(async () => { await app.close(); });
@@ -117,6 +119,20 @@ describe("API", () => {
     expect(l.campaigns.map((x: { name: string }) => x.name)).toContain("KY CFOs");
     const on = await app.inject({ method: "POST", url: "/api/campaigns/KY%20CFOs/active", headers: auth, payload: { active: true } });
     expect(on.json()).toEqual({ name: "KY CFOs", active: true });
+  });
+
+  it("serves repeat campaign reads from cache, and a change shows at once", async () => {
+    await app.inject({ method: "GET", url: "/api/campaigns", headers: auth });
+    await app.inject({ method: "GET", url: "/api/campaigns/KY%20CFOs", headers: auth });
+    const before = stats.reads;
+    for (let i = 0; i < 5; i++) {
+      await app.inject({ method: "GET", url: "/api/campaigns", headers: auth });
+      await app.inject({ method: "GET", url: "/api/campaigns/KY%20CFOs", headers: auth });
+    }
+    expect(stats.reads).toBe(before);
+    await app.inject({ method: "POST", url: "/api/campaigns/KY%20CFOs/active", headers: auth, payload: { active: false } });
+    const l = (await app.inject({ method: "GET", url: "/api/campaigns", headers: auth })).json();
+    expect(l.campaigns.find((x: { name: string }) => x.name === "KY CFOs").active).toBe(false);
   });
 });
 
