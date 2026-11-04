@@ -1,0 +1,50 @@
+LinkedIn-MCP-Engine - requirements
+==================================
+(Node.js project: code dependencies are in package.json and installed by "npm install".
+ This file lists everything else that must be in place before the application runs.)
+
+SOFTWARE
+--------
+Node.js        22 or newer          check: node -v
+npm            10 or newer          check: npm -v   (comes with Node)
+Git            any                  check: git --version
+Browser        Chrome / Edge / Firefox, current version
+
+REPOSITORIES
+------------
+https://github.com/OneSmarterInc/LinkedIn-MCP-Engine-Backend    engine, CLI, MCP server, HTTP API, Apps Script
+https://github.com/OneSmarterInc/LinkedIn-MCP-Engine-Frontend   React console (talks only to the backend)
+
+ACCOUNTS AND KEYS  (backend\.env, copy from .env.example)
+---------------------------------------------------------
+GEMINI_API_KEY        Google AI Studio                     drafting emails, LinkedIn post search
+GEMINI_GROUNDING=true same project, billing enabled        required for job search
+SEAMLESS_API_KEY      Seamless.AI -> API                   work-email lookup, 1 credit per contact
+GOOGLE_SA_JSON_PATH   Google Cloud -> IAM -> Service Accounts -> Keys (JSON); save as secrets\google-sa.json
+GOOGLE_SHEET_ID       id from the Google Sheet URL
+JOBS_CAMPAIGN         name of a row in the Campaigns tab (default: Jobs)
+API_TOKEN             any long random string; locks the console (optional on a laptop)
+
+Share the Google Sheet with the service-account email (client_email in the JSON) as Editor.
+
+GOOGLE SIDE (one-time)
+----------------------
+1. One Google Sheet. Tabs are created by the engine on first use.
+2. Apps Script: Sheet -> Extensions -> Apps Script; paste apps_script\AutoBooker.gs and appsscript.json;
+   run setup once; accept Gmail and Calendar permissions. That Gmail account is the sender.
+
+NETWORK
+-------
+Outbound HTTPS: generativelanguage.googleapis.com, sheets.googleapis.com, api.seamless.ai
+Local ports:    API 127.0.0.1:8787, dev console localhost:5173
+
+RUNTIME FOLDERS (created automatically, not committed)
+------------------------------------------------------
+backend\secrets\        keys
+backend\data\ledger.db  contact history
+backend\out\            run records
+
+INSTALL AND CHECK
+-----------------
+cd backend   ; npm install ; npm run doctor ; npm run api
+cd frontend  ; npm install ; npm run dev
