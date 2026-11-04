@@ -70,6 +70,84 @@ export interface EntityCheckOptions {
   minConfidence?: number;
 }
 
+// ---------------------------------------------------------------------------
+// Rules: does the email domain belong to the company? No model, no cost, no quota.
+// ---------------------------------------------------------------------------
+
+const TWO_LEVEL_TLDS = new Set(["co", "com", "org", "net", "ac", "gov", "edu"]);
+
+/** "www.mail.Acme.co.uk" -> "acme.co.uk"; "sub.acme.com" -> "acme.com". */
+export function registrableDomain(host: string): string {
+  const parts = host.toLowerCase().replace(/^www\./, "").split(".").filter(Boolean);
+  if (parts.length <= 2) return parts.join(".");
+  const keep = TWO_LEVEL_TLDS.has(parts[parts.length - 2]!) && parts[parts.length - 1]!.length === 2 ? 3 : 2;
+  return parts.slice(-keep).join(".");
+}
+
+const NAME_STOPWORDS = new Set(["inc", "llc", "ltd", "plc", "corp", "corporation", "company", "co", "the", "group", "holdings", "and", "of", "international", "global", "services", "solutions"]);
+
+function nameTokens(companyName: string): string[] {
+  return companyName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9\s]/g, " ").split(/\s+/).filter((t) => t && !NAME_STOPWORDS.has(t));
+}
+
+/**
+ * Compares an email domain with the company. Three answers:
+ *   "match"     the domain is the company's website domain, or its main word is the company's name
+ *   "mismatch"  the company's website domain is known and this is a different one
+ *   "unknown"   no website domain on record and the words do not line up
+ */
+export function domainMatchesCompany(emailDomain: string, companyName: string, companyDomain?: string): "match" | "mismatch" | "unknown" {
+  const email = registrableDomain(emailDomain);
+  if (companyDomain && registrableDomain(companyDomain) === email) return "match";
+  const label = email.split(".")[0] ?? "";
+  const tokens = nameTokens(companyName);
+  const compact = tokens.join("");
+  if (label.length >= 4 && compact.length >= 4 && (compact.includes(label) || label.includes(compact))) return "match";
+  if (tokens.some((t) => t.length >= 4 && label.includes(t))) return "match";
+  const acronym = tokens.map((t) => t[0]).join("");
+  if (acronym.length >= 3 && label === acronym) return "match";
+  return companyDomain ? "mismatch" : "unknown";
+}
+
+/** Sources that looked the person up at that company, rather than guessing or scraping an address. */
+const TRUSTED_SOURCES = new Set(["seamless", "apollo"]);
+
+/**
+ * Gate 4 without a model (ENTITY_CHECK=rules). Same code rules as before, then the domain comparison.
+ * When the domain and the company do not line up, an email that Seamless or Apollo returned for this
+ * person at this company passes; a guessed or scraped address is held back. Location is not checked.
+ */
+export function makeRuleEntityCheck(cfg: CampaignConfig) {
+  return async (lead: LeadRecord): Promise<FailureReason | null> => {
+    const { local, domain } = emailParts(lead.email!);
+    if (cfg.mode === "CANDIDATE" && cfg.blocked_consumer_domains.includes(domain)) {
+      return emailMatchesName(local, lead.first_name, lead.last_name) ? null : "ENTITY_MISMATCH";
+    }
+    const rule = institutionalMismatch(lead.company_name, domain);
+    if (rule) { logger.debug({ lead_id: lead.lead_id, gate: 4, rule }, "entity rule mismatch"); return "ENTITY_MISMATCH"; }
+    const verdict = domainMatchesCompany(domain, lead.company_name, lead.company_domain);
+    const trusted = TRUSTED_SOURCES.has(lead.email_source ?? "");
+    const ok = verdict === "match" || trusted;
+    logger.debug({ lead_id: lead.lead_id, gate: 4, verdict, email_source: lead.email_source, ok }, "entity rules");
+    return ok ? null : "ENTITY_MISMATCH";
+  };
+}
+
+/**
+ * Gate 4 hybrid (ENTITY_CHECK=hybrid): rules decide the clear cases; the model is asked only when the
+ * domain and the company do not line up. Cuts model calls to the hard cases.
+ */
+export function makeHybridEntityCheck(llm: LLMProvider, cfg: CampaignConfig, opts: EntityCheckOptions = {}) {
+  const model = makeEntityCheck(llm, cfg, opts);
+  return async (lead: LeadRecord): Promise<FailureReason | null> => {
+    const { domain } = emailParts(lead.email!);
+    if (cfg.mode === "CANDIDATE" && cfg.blocked_consumer_domains.includes(domain)) return model(lead);
+    if (institutionalMismatch(lead.company_name, domain)) return "ENTITY_MISMATCH";
+    if (domainMatchesCompany(domain, lead.company_name, lead.company_domain) === "match") return null;
+    return model(lead);
+  };
+}
+
 /**
  * Gate 4: entity and geography cross-check.
  * Fails closed: if the model errors, the lead is held back with GATE_ERROR.

@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { emailMatchesName, institutionalMismatch, makeEntityCheck } from "../../src/core/gates/entity.js";
+import { domainMatchesCompany, emailMatchesName, institutionalMismatch, makeEntityCheck, makeHybridEntityCheck, makeRuleEntityCheck, registrableDomain } from "../../src/core/gates/entity.js";
+import { getEntityMode } from "../../src/core/gates/index.js";
 import { candidateCfg, corporateCfg, fakeLLM, makeLead } from "../helpers.js";
 
 const match = { same_organization: true, location_consistent: true, confidence: 0.9, reason: "match" };
@@ -92,5 +93,65 @@ describe("gate 4: code rules before the model", () => {
     ["Acme Manufacturing", "acme.com", false],
   ])("%s @ %s -> mismatch %s", (company, domain, expected) => {
     expect(institutionalMismatch(company, domain) !== null).toBe(expected);
+  });
+});
+
+describe("gate 4: rules mode (no model)", () => {
+  it("registrable domain strips subdomains and keeps co.uk style suffixes", () => {
+    expect(registrableDomain("www.mail.Acme.com")).toBe("acme.com");
+    expect(registrableDomain("hr.acme.co.uk")).toBe("acme.co.uk");
+  });
+
+  it("matches on the company website domain, the company name, or an acronym", () => {
+    expect(domainMatchesCompany("ohiohealth.com", "OhioHealth", undefined)).toBe("match");
+    expect(domainMatchesCompany("mail.acme.com", "Acme Manufacturing", "www.acme.com")).toBe("match");
+    expect(domainMatchesCompany("jpmchase.com", "JPMorgan Chase & Co.", "jpmorganchase.com")).toBe("match");
+    expect(domainMatchesCompany("teb.com.tr", "Türk Ekonomi Bankası", undefined)).toBe("match");
+  });
+
+  it("calls a different known domain a mismatch, and an unknown one unknown", () => {
+    expect(domainMatchesCompany("pthomecare.com", "New York Life", "newyorklife.com")).toBe("mismatch");
+    expect(domainMatchesCompany("pthomecare.com", "New York Life", undefined)).toBe("unknown");
+  });
+
+  it("passes a matching domain without any model", async () => {
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@acme.com", company_domain: "acme.com" }))).toBeNull();
+  });
+
+  it("holds back a guessed address at an unrelated domain", async () => {
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: "newyorklife.com", email_source: "pattern" }))).toBe("ENTITY_MISMATCH");
+  });
+
+  it("trusts an unrelated domain when Seamless returned it for this person", async () => {
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: "newyorklife.com", email_source: "seamless" }))).toBeNull();
+  });
+
+  it("still rejects a .edu address for a company, even from Seamless", async () => {
+    expect(await makeRuleEntityCheck(corporateCfg)(makeLead({ email: "jane@osu.edu", company_name: "Acme Manufacturing", email_source: "seamless" }))).toBe("ENTITY_MISMATCH");
+  });
+
+  it("still requires the person's name on a candidate's gmail address", async () => {
+    expect(await makeRuleEntityCheck(candidateCfg)(makeLead({ email: "someone.else@gmail.com" }))).toBe("ENTITY_MISMATCH");
+    expect(await makeRuleEntityCheck(candidateCfg)(makeLead({ email: "jane.miller@gmail.com" }))).toBeNull();
+  });
+});
+
+describe("gate 4: hybrid mode", () => {
+  it("passes a matching domain without calling the model, and asks the model otherwise", async () => {
+    const { llm, prompts } = fakeLLM({ same_organization: false, location_consistent: true, confidence: 0.9, reason: "other company" });
+    const check = makeHybridEntityCheck(llm, corporateCfg);
+    expect(await check(makeLead({ email: "jane@acme.com" }))).toBeNull();
+    expect(prompts).toHaveLength(0);
+    expect(await check(makeLead({ email: "jane@pthomecare.com", company_name: "New York Life", company_domain: "newyorklife.com" }))).toBe("ENTITY_MISMATCH");
+    expect(prompts).toHaveLength(1);
+  });
+});
+
+describe("gate 4: ENTITY_CHECK setting", () => {
+  it("defaults to rules, accepts hybrid and gemini, rejects nonsense", async () => {
+    expect(getEntityMode({})).toBe("rules");
+    expect(getEntityMode({ ENTITY_CHECK: "hybrid" })).toBe("hybrid");
+    expect(getEntityMode({ ENTITY_CHECK: "gemini" })).toBe("llm");
+    expect(() => getEntityMode({ ENTITY_CHECK: "maybe" })).toThrow(/ENTITY_CHECK/);
   });
 });

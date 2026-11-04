@@ -3,10 +3,19 @@ import { getLLM } from "../../lib/llm/index.js";
 import type { LLMProvider } from "../../lib/llm/provider.js";
 import { logger } from "../../lib/logger.js";
 import type { AsyncGates } from "../verifier.js";
-import { makeEntityCheck } from "./entity.js";
+import { makeEntityCheck, makeHybridEntityCheck, makeRuleEntityCheck } from "./entity.js";
 import { devSkipVerifier, makeMailboxCheck, zeroBounceVerifier, type MailboxVerifier } from "./mailbox.js";
 
-export { makeEntityCheck, EntityVerdict, emailMatchesName } from "./entity.js";
+export { makeEntityCheck, makeRuleEntityCheck, makeHybridEntityCheck, domainMatchesCompany, registrableDomain, EntityVerdict, emailMatchesName } from "./entity.js";
+
+/** How Gate 4 decides. rules: no model (default). hybrid: model only for unclear domains. gemini|llm: model for every lead. */
+export function getEntityMode(env: NodeJS.ProcessEnv = process.env): "rules" | "hybrid" | "llm" {
+  const v = (env.ENTITY_CHECK ?? "rules").toLowerCase();
+  if (v === "rules") return "rules";
+  if (v === "hybrid") return "hybrid";
+  if (v === "llm" || v === "gemini" || v === "ollama" || v === "model") return "llm";
+  throw new Error(`Unknown ENTITY_CHECK "${env.ENTITY_CHECK}". Use rules, hybrid or gemini.`);
+}
 export { makeMailboxCheck, zeroBounceVerifier, devSkipVerifier } from "./mailbox.js";
 export type { MailboxVerifier, MxResolver } from "./mailbox.js";
 
@@ -35,9 +44,11 @@ export function buildAsyncGates(
   llm: LLMProvider = getLLM(env),
 ): AsyncGates & { llm: LLMProvider } {
   const minConfidence = Number(env.ENTITY_MIN_CONFIDENCE ?? 0.7);
+  const mode = getEntityMode(env);
+  const entityCheck = mode === "rules" ? makeRuleEntityCheck(cfg) : mode === "hybrid" ? makeHybridEntityCheck(llm, cfg, { minConfidence }) : makeEntityCheck(llm, cfg, { minConfidence });
   return {
     llm,
-    entityCheck: makeEntityCheck(llm, cfg, { minConfidence }),
+    entityCheck,
     mailboxCheck: makeMailboxCheck({ verifier: getMailboxVerifier(env) }),
   };
 }
