@@ -8,6 +8,7 @@ import { logger } from "../../lib/logger.js";
 import { researchAndPoll, pickEmail, seamlessFindRecruiter, type SeamlessOptions } from "../sources/seamless-finder.js";
 import type { JobOutreachResult } from "./job-outreach.js";
 import { staffingCheck, type StaffingCheck } from "./staffing.js";
+import { cleanPersonName } from "../names.js";
 import { JOBSPY_TERMS, JobSpySetupError, runJobSpy, type JobSpyOptions, type RunCommand } from "./jobspy.js";
 
 /** Fixed settings. The search_jobs tool takes no input; change these numbers here. */
@@ -328,7 +329,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       view.email_source = source;
       const name = found.name ?? fallbackName;
       const title = found.title ?? fallbackTitle;
-      if (name) view.contact_name = name;
+      if (name) view.contact_name = cleanPersonName(name, found.email);
       if (title) view.contact_title = title;
     };
 

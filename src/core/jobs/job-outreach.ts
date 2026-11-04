@@ -7,6 +7,7 @@ import { exportToSheet, JOB_TABS, recordExported, type SheetsGateway } from "../
 import { syncOptOuts } from "../optout-sync.js";
 import type { RunReport } from "../pipeline.js";
 import { splitFullName, stableId } from "../sources/types.js";
+import { cleanPersonName } from "../names.js";
 import { verifyBatch, type AsyncGates } from "../verifier.js";
 import type { JobSearchOutput, JobView } from "./job-search.js";
 
@@ -21,7 +22,8 @@ export const DEFAULT_JOBS_CAMPAIGN = "Jobs";
 
 /** One lead per job post. A job with no contact email still becomes a lead, so it shows in Jobs_Quarantine. */
 export function jobToLead(j: JobView): LeadRecord {
-  const { first, last } = splitFullName(j.contact_name ?? "");
+  // Cleaned here too, so jobs saved by older runs get the same greeting.
+  const { first, last } = splitFullName(cleanPersonName(j.contact_name ?? "", j.email ?? undefined));
   return {
     lead_id: stableId("job", j.url),
     first_name: first,
