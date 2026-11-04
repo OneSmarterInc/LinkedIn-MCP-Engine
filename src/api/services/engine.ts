@@ -15,7 +15,7 @@ import { getSearch } from "../../lib/search/index.js";
 import { GeminiProvider } from "../../lib/llm/gemini.js";
 import { geminiOptions } from "../../lib/llm/index.js";
 import {
-  JOB_SEARCH_DEFAULTS, latestJobSearchId, loadJobSearchRecord, searchJobs, startJobSearch, type JobSearchRecord,
+  JOB_SEARCH_DEFAULTS, latestJobSearchId, loadJobSearchRecord, loadSeenJobs, searchJobs, startJobSearch, type JobSearchRecord,
 } from "../../core/jobs/job-search.js";
 import { DEFAULT_JOBS_CAMPAIGN, attachOutreach, type JobOutreachDeps } from "../../core/jobs/job-outreach.js";
 import { createRunId, listRuns, loadRunState, saveRunState, type McpRunState } from "../../mcp/run-store.js";
@@ -73,7 +73,7 @@ async function startSearchNow(deps: EngineDeps, onStarted: () => void, onFinishe
   const { record } = await startJobSearch(async (onProgress, searchId) => {
     onStarted();
     try {
-      const out = await searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
+      const out = await searchJobs({ llm, onProgress, seen: await loadSeenJobs(), ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
       const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
         stage, message, searches_done: out.searches, searches_max: out.searches,
         jobs_found: out.total, with_email: out.with_email, lookups_used: out.seamless_lookups_used, jobs: out.jobs,

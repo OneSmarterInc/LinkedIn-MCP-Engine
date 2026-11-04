@@ -126,6 +126,15 @@ describe("runJobOutreach", () => {
     expect(again.pipeline_added).toBe(0);
   });
 
+  it("lists jobs held back only because a check crashed, so a later search can find them again", async () => {
+    const { gw } = fakeSheets();
+    const { llm } = fakeLLM(goodDraft);
+    const crash: AsyncGates = { entityCheck: async () => "GATE_ERROR", mailboxCheck: async () => null };
+    const r = await runJobOutreach(output([job()]), { cfg, ledger, gates: crash, llm, gw, runId: "r1" });
+    expect(r.quarantined_by_reason).toEqual({ GATE_ERROR: 1 });
+    expect(r.retry_urls).toEqual(["https://www.linkedin.com/jobs/view/111"]);
+  });
+
   it("someone who opted out in Jobs_Pipeline is blocked at Gate 2", async () => {
     const optedOut = PIPELINE_HEADERS.map(() => "");
     optedOut[PIPELINE_HEADERS.indexOf("Email")] = "jane.miller@acme.com";

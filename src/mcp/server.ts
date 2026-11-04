@@ -30,6 +30,7 @@ import {
   JOB_SEARCH_DEFAULTS,
   latestJobSearchId,
   loadJobSearchRecord,
+  loadSeenJobs,
   saveJobSearchRecord,
   searchJobs,
   startJobSearch
@@ -287,7 +288,7 @@ server.registerTool(
       const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
 
       const { record } = await startJobSearch(async (onProgress, searchId) => {
-        const out = await searchJobs({ llm, onProgress, ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
+        const out = await searchJobs({ llm, onProgress, seen: await loadSeenJobs(), ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
         const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
           stage, message,
           searches_done: out.searches, searches_max: out.searches,

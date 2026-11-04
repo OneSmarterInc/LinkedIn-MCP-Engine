@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   buildJobPrompts, inWindow, samePlace, jobWindow, normalizeJobUrl, saveJobSearch, searchJobs, type JobHit,
-  latestJobSearchId, loadJobSearchRecord, startJobSearch, type JobSearchProgress,
+  latestJobSearchId, loadJobSearchRecord, startJobSearch, type JobSearchProgress, jobKey, loadSeenJobs, jobsToRemember,
 } from "../../src/core/jobs/job-search.js";
 import { firstSearchResultId, seamlessFindRecruiter } from "../../src/core/sources/seamless-finder.js";
 import type { LLMProvider } from "../../src/lib/llm/provider.js";
@@ -403,5 +403,77 @@ describe("live steps while finding emails", () => {
     const msgs: string[] = [];
     await searchJobs({ llm, now: NOW, settings: { maxSearches: 1 }, onProgress: (p) => msgs.push(p.message), seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
     expect(msgs).toContain("No email for Acme (not_found)");
+  });
+});
+
+describe("each run brings new jobs", () => {
+  const seenWith = (jobs: Array<{ company: string; job_title: string; url: string }>, runs = 1) => ({
+    urls: new Set(jobs.map((j) => j.url)), keys: new Set(jobs.map((j) => jobKey(j.company, j.job_title))), runs,
+    recent: jobs.map((j) => `${j.company}: ${j.job_title}`),
+  });
+
+  it("skips a job an earlier search found, by URL or by company and title, before asking Seamless", async () => {
+    const { llm } = fakeLLM({ jobs: [
+      job({ url: "https://www.linkedin.com/jobs/view/111" }),                                                   // same URL as before
+      job({ url: "https://www.linkedin.com/jobs/view/999", job_title: "RPG developer!" }),                       // same role, new URL
+      job({ url: "https://www.linkedin.com/jobs/view/222", company_name: "Bolt", company_domain: "bolt.com" }), // new
+    ] });
+    const sm = fakeSeamless({ recruiterEmail: "rita@bolt.com" });
+    const seen = seenWith([{ company: "Acme", job_title: "RPG Developer", url: "https://www.linkedin.com/jobs/view/111" }]);
+    const out = await searchJobs({ llm, now: NOW, seen, seamless: { apiKey: "k", fetchFn: sm.fetchFn, poll: fast } });
+    expect(out.jobs.map((j) => j.company)).toEqual(["Bolt"]);
+    expect(out.skipped.filter((s) => s.reason === "FOUND_BY_EARLIER_SEARCH")).toHaveLength(2);
+    expect(sm.calls.filter((c) => c === "search")).toHaveLength(1); // one lookup, for Bolt only
+  });
+
+  it("names earlier finds in the prompt and starts on a different angle each run", async () => {
+    const run = async (runs: number) => {
+      const { llm, prompts } = fakeLLM({ jobs: [] });
+      await searchJobs({ llm, now: NOW, settings: { maxSearches: 1 }, seen: seenWith([{ company: "Acme", job_title: "RPG Developer", url: "https://www.linkedin.com/jobs/view/111" }], runs) });
+      return prompts[0]!;
+    };
+    const first = await run(0);
+    const second = await run(1);
+    expect(first).toContain("Leave them out");
+    expect(first).toContain("Acme: RPG Developer");
+    expect(first).toContain("site:linkedin.com/jobs/view"); // angle 1: job pages
+    expect(second).toContain("site:linkedin.com/posts");    // angle 2: hiring posts
+  });
+
+  it("reads earlier finds from saved searches, newest first", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-seen-"));
+    const { writeFile } = await import("node:fs/promises");
+    const v = (company: string, url: string) => ({ job_title: "Nurse", company, location: "", posted_date_unconfirmed: null, description: "", url, email: "a@b.com", email_source: "seamless_recruiter" });
+    const outreach = { contacts: 1, quarantined_by_reason: {}, retry_urls: [] };
+    const rec = (id: string, at: string, url: string, company: string) => JSON.stringify({ search_id: id, status: "DONE", started_at: at, updated_at: "", log: [], result: { jobs: [v(company, url)], outreach } });
+    await writeFile(join(dir, "jobs-11111111-1111-1111-1111-111111111111.json"), rec("jobs-11111111-1111-1111-1111-111111111111", "2026-11-02T10:00:00Z", "https://www.linkedin.com/jobs/view/1", "Care Co"));
+    await writeFile(join(dir, "jobs-22222222-2222-2222-2222-222222222222.json"), rec("jobs-22222222-2222-2222-2222-222222222222", "2026-11-03T10:00:00Z", "https://www.linkedin.com/jobs/view/2", "Med Inc"));
+    const seen = await loadSeenJobs(dir);
+    expect(seen.runs).toBe(2);
+    expect([...seen.urls].sort()).toEqual(["https://www.linkedin.com/jobs/view/1", "https://www.linkedin.com/jobs/view/2"]);
+    expect(seen.recent[0]).toBe("Med Inc: Nurse");
+    expect((await loadSeenJobs(join(dir, "missing"))).runs).toBe(0);
+  });
+
+  it("lets a job come back when its search failed, its email was not looked up, or a check crashed", () => {
+    const v = (url: string, email_source = "seamless_recruiter") => ({ job_title: "Nurse", company: "C", location: "", posted_date_unconfirmed: null, description: "", url, email: "a@b.com", email_source }) as never;
+    const jobs = [v("u-drafted"), v("u-crashed"), v("u-limit", "lookup_limit")];
+    expect(jobsToRemember({ status: "FAILED", jobs_so_far: jobs })).toEqual([]);                        // never reached the gates
+    expect(jobsToRemember({ result: { jobs, outreach_error: "Sheet down" } as never })).toEqual([]);     // outreach failed
+    const done = jobsToRemember({ result: { jobs, outreach: { contacts: 3, quarantined_by_reason: { GATE_ERROR: 1 }, retry_urls: ["u-crashed"] } } as never });
+    expect(done.map((j) => j.url)).toEqual(["u-drafted"]);
+    // An older record with no retry list where every contact crashed a check: all can come back.
+    expect(jobsToRemember({ result: { jobs, outreach: { contacts: 3, quarantined_by_reason: { GATE_ERROR: 3 } } } as never })).toEqual([]);
+  });
+
+  it("stops at once with a clear error when Gemini is out of credits", async () => {
+    let calls = 0;
+    const llm = {
+      name: "fake", supportsGrounding: true,
+      async generateJSON() { calls++; throw new Error("gemini: quota exhausted (429). Your project has exceeded its monthly spending cap."); },
+      async generateText() { return ""; },
+    } as unknown as LLMProvider;
+    await expect(searchJobs({ llm, now: NOW })).rejects.toThrow(/out of credits or over its monthly spending cap/);
+    expect(calls).toBe(1);
   });
 });

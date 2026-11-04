@@ -85,11 +85,16 @@ export interface JobOutreachResult {
   quarantined_added: number;
   ledger_recorded: number;
   opt_outs_synced: number;
+  /** Job URLs held back for a reason that can clear later (a check crashed). A later search may find them again. */
+  retry_urls?: string[];
 }
 
 function tally<T>(items: T[], key: (t: T) => string): Record<string, number> {
   return items.reduce<Record<string, number>>((acc, i) => { acc[key(i)] = (acc[key(i)] ?? 0) + 1; return acc; }, {});
 }
+
+/** Held back only because something failed for the moment (a gate crashed, for example Gemini out of credits). */
+export const RETRYABLE = new Set(["GATE_ERROR"]);
 
 const n = (k: number, w: string) => `${k} ${w}${k === 1 ? "" : "s"}`;
 
@@ -157,6 +162,10 @@ export async function runJobOutreach(out: JobSearchOutput, deps: JobOutreachDeps
     quarantined_added: res.quarantined_added,
     ledger_recorded: recorded,
     opt_outs_synced: sync.added,
+    retry_urls: verification.quarantined
+      .filter((q) => RETRYABLE.has(q.result.failure_reason ?? ""))
+      .map((q) => q.lead.hiring_for?.url)
+      .filter((u): u is string => Boolean(u)),
   };
 }
 

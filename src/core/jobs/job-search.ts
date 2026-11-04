@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { z } from "zod";
 
@@ -128,7 +128,7 @@ export const JOB_SEARCH_ANGLES: JobSearchAngle[] = [
  * One prompt per angle. Natural-language instructions work better with Gemini's search than raw Google
  * operators like after:, so the date window is spelled out instead.
  */
-export function buildJobPrompts(window: { from: string; to: string }, limit: number, angles: JobSearchAngle[] = JOB_SEARCH_ANGLES): string[] {
+export function buildJobPrompts(window: { from: string; to: string }, limit: number, angles: JobSearchAngle[] = JOB_SEARCH_ANGLES, avoid: string[] = []): string[] {
   const common = [
     `Today is ${window.to}. Only include posts from ${window.from} to ${window.to}.`,
     `LinkedIn shows age as "3 days ago" or "1 week ago": convert it to a YYYY-MM-DD posted_date using today's date. If you cannot tell the date, use null.`,
@@ -136,6 +136,7 @@ export function buildJobPrompts(window: { from: string; to: string }, limit: num
     "For each give job_title, company_name, company_domain (the company's own website, not linkedin.com), location,",
     "posted_date, a two-sentence description, url (the LinkedIn link you found),",
     "poster_name and poster_title (only if the page shows who posted it).",
+    ...(avoid.length ? [`Earlier searches already found these jobs. Leave them out and find different ones: ${avoid.join("; ")}.`] : []),
   ];
   return angles.map((a) =>
     a.kind === "pages"
@@ -181,6 +182,66 @@ export interface JobSearchProgress {
   jobs: JobView[];
 }
 
+/** Jobs that earlier searches already found. A new search skips them, so each run brings new roles. */
+export interface SeenJobs {
+  urls: Set<string>;
+  /** company|title, normalized: the same role can come back under a second URL. */
+  keys: Set<string>;
+  /** How many earlier searches there are. Used to start each run on a different search angle. */
+  runs: number;
+  /** "Company: Title" for the most recent finds, named in the prompt so Gemini looks past them. */
+  recent: string[];
+}
+
+const squash = (v: string) => v.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+/** The same role at the same company, however the title is punctuated. */
+export function jobKey(company: string, title: string): string {
+  return `${squash(company)}|${squash(title)}`;
+}
+
+export function emptySeenJobs(): SeenJobs {
+  return { urls: new Set(), keys: new Set(), runs: 0, recent: [] };
+}
+
+/**
+ * The jobs from one saved search that later searches should skip. A job is skipped when this search dealt with it:
+ * drafted, or held back for a lasting reason. A search that failed or stopped before the gates, a job whose email
+ * was never looked up, and a job held back only because a check crashed can all be found again.
+ */
+export function jobsToRemember(r: Partial<JobSearchRecord> & Partial<JobSearchOutput>): JobView[] {
+  const out = r.result ?? (r.jobs ? (r as JobSearchOutput) : undefined);
+  if (!out?.outreach) return [];
+  const o = out.outreach;
+  // Older records have no retry list. If every contact crashed a check, treat them all as retryable.
+  const allCrashed = !o.retry_urls && o.contacts > 0 && (o.quarantined_by_reason?.GATE_ERROR ?? 0) === o.contacts;
+  const retry = new Set(o.retry_urls ?? []);
+  return out.jobs.filter((j) => !allCrashed && !retry.has(j.url) && j.email_source !== "lookup_limit");
+}
+
+/** Reads every saved search in out/job-searches (finished, failed or stopped) and collects the jobs they found. */
+export async function loadSeenJobs(dir = resolve(process.cwd(), "out", "job-searches"), recentMax = 40): Promise<SeenJobs> {
+  const seen = emptySeenJobs();
+  let files: string[];
+  try { files = (await readdir(dir)).filter((f) => f.startsWith("jobs-") && f.endsWith(".json")); } catch { return seen; }
+  const found: Array<{ at: string; jobs: JobView[] }> = [];
+  for (const f of files) {
+    try {
+      const r = JSON.parse(await readFile(resolve(dir, f), "utf8")) as Partial<JobSearchRecord> & Partial<JobSearchOutput>;
+      found.push({ at: r.started_at ?? r.searched_at ?? "", jobs: jobsToRemember(r) });
+    } catch { /* skip unreadable */ }
+  }
+  seen.runs = found.length;
+  found.sort((a, b) => b.at.localeCompare(a.at));
+  for (const { jobs } of found) {
+    for (const j of jobs) {
+      if (j.url) seen.urls.add(j.url);
+      seen.keys.add(jobKey(j.company, j.job_title));
+      if (seen.recent.length < recentMax) seen.recent.push(`${j.company}: ${j.job_title}`);
+    }
+  }
+  return seen;
+}
+
 export interface JobSearchDeps {
   llm: LLMProvider;
   /** Leave out to skip Seamless (emails come only from the posts). */
@@ -188,7 +249,12 @@ export interface JobSearchDeps {
   now?: Date;
   settings?: Partial<typeof JOB_SEARCH_DEFAULTS>;
   onProgress?: (p: JobSearchProgress) => void;
+  /** Jobs from earlier searches. They are skipped before any Seamless lookup, so they cost no credits. */
+  seen?: SeenJobs;
 }
+
+/** Gemini's answer when the project has no credit left or is over its spending cap. */
+export const GEMINI_OUT_OF_CREDIT = /quota exhausted|spending cap|exceeded your current quota/i;
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
@@ -196,8 +262,13 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   const settings = { ...JOB_SEARCH_DEFAULTS, ...deps.settings };
   const now = deps.now ?? new Date();
   const window = jobWindow(now, settings.daysBack);
-  const prompts = buildJobPrompts(window, settings.maxJobs);
+  const before = deps.seen ?? emptySeenJobs();
+  // Each run starts on a different angle, so the same first searches do not fill every run with the same jobs.
+  const offset = before.runs % JOB_SEARCH_ANGLES.length;
+  const angles = [...JOB_SEARCH_ANGLES.slice(offset), ...JOB_SEARCH_ANGLES.slice(0, offset)];
+  const prompts = buildJobPrompts(window, settings.maxJobs, angles, before.recent);
   const searchesMax = Math.min(settings.maxSearches, prompts.length);
+  let seenBefore = 0;
 
   const jobs: JobView[] = [];
   const skipped: JobSearchOutput["skipped"] = [];
@@ -270,10 +341,11 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   };
 
   report("starting", `Starting: up to ${settings.maxJobs} jobs from ${window.from} to ${window.to}, up to ${searchesMax} searches` +
-    (deps.seamless ? `, up to ${settings.maxSeamlessLookups} Seamless lookups` : ", Seamless off"));
+    (deps.seamless ? `, up to ${settings.maxSeamlessLookups} Seamless lookups` : ", Seamless off") +
+    (before.keys.size ? `, skipping ${plural(before.keys.size, "job")} found by earlier searches` : ""));
 
   for (let n = 0; n < searchesMax && jobs.length < settings.maxJobs; n++) {
-    const angle = JOB_SEARCH_ANGLES[n] ?? { label: `angle ${n + 1}`, kind: "pages" as const, hint: "" };
+    const angle = angles[n] ?? { label: `angle ${n + 1}`, kind: "pages" as const, hint: "" };
     const tag = `Search ${n + 1} of ${searchesMax} (${angle.label})`;
     report("searching", `${tag}...`);
     searches += 1;
@@ -282,17 +354,27 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     try {
       hits = (await deps.llm.generateJSON(prompts[n]!, JobSearchResult, { grounded: true, system: SYSTEM })).jobs;
     } catch (err) {
+      const msg = (err as Error).message;
+      // Out of credits or over the spending cap: every later call fails too, so stop now and say why.
+      if (GEMINI_OUT_OF_CREDIT.test(msg)) {
+        throw new Error("Gemini stopped answering: the Gemini project is out of credits or over its monthly spending cap. " +
+          "Add credits or raise the cap at https://ai.studio/spend, then start the search again.");
+      }
       // One failed search should not lose the others' jobs.
-      logger.warn({ search: n + 1, err: (err as Error).message }, "job search query failed");
+      logger.warn({ search: n + 1, err: msg }, "job search query failed");
     }
 
     let added = 0;
+    let old = 0;
     for (const h of hits) {
       if (jobs.length >= settings.maxJobs) break;
       const url = normalizeJobUrl(h.url);
       if (!url) { skipped.push({ url: h.url, reason: "NOT_A_LINKEDIN_JOB_URL" }); continue; }
       if (seen.has(url)) { skipped.push({ url, reason: "DUPLICATE" }); continue; }
       seen.add(url);
+      if (before.urls.has(url) || before.keys.has(jobKey(h.company_name, h.job_title))) {
+        skipped.push({ url, reason: "FOUND_BY_EARLIER_SEARCH" }); old += 1; seenBefore += 1; continue;
+      }
       if (!inWindow(h.posted_date, window)) { skipped.push({ url, reason: "OUTSIDE_DATE_WINDOW" }); continue; }
 
       const domain = h.company_domain?.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "") || undefined;
@@ -314,10 +396,10 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
         ? `Email found for ${view.company}: ${view.email} (${view.email_source})`
         : `No email for ${view.company} (${view.email_source})`);
     }
-    report("searching", `${tag}: found ${plural(added, "new job")}, ${jobs.length} in total`);
+    report("searching", `${tag}: found ${plural(added, "new job")}, ${jobs.length} in total` + (old ? ` (${old} found before, skipped)` : ""));
   }
 
-  logger.info({ searches, kept: jobs.length, lookups }, "job search");
+  logger.info({ searches, kept: jobs.length, lookups, seen_before: seenBefore }, "job search");
   const withEmail = jobs.filter((j) => j.email).length;
   report("done", `Done: ${plural(jobs.length, "job")}, ${withEmail} with email, ${plural(searches, "search").replace("searchs", "searches")}, ${plural(lookups, "Seamless lookup")}`);
   return {
@@ -378,8 +460,20 @@ export async function saveJobSearchRecord(rec: JobSearchRecord, dir = JOBS_DIR):
   await mkdir(dir, { recursive: true });
   const target = recordPath(rec.search_id, dir);
   const tmp = `${target}.${randomUUID()}.tmp`;
-  await writeFile(tmp, JSON.stringify(rec, null, 2), "utf8");
-  await rename(tmp, target);
+  const text = JSON.stringify(rec, null, 2);
+  await writeFile(tmp, text, "utf8");
+  // On Windows the rename fails (EPERM/EBUSY) while another program has the file open, for example the API
+  // reading it for the Runs page. Try a few times, then write the file directly so the record never gets stuck.
+  for (let attempt = 1; ; attempt++) {
+    try { await rename(tmp, target); return; } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code ?? "";
+      if (!["EPERM", "EBUSY", "EACCES"].includes(code)) throw err;
+      if (attempt < 5) { await new Promise((r) => setTimeout(r, 40 * attempt)); continue; }
+      await writeFile(target, text, "utf8");
+      await unlink(tmp).catch(() => {});
+      return;
+    }
+  }
 }
 
 export async function loadJobSearchRecord(id: string, dir = JOBS_DIR): Promise<JobSearchRecord> {
