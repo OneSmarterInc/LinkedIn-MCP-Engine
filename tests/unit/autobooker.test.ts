@@ -88,12 +88,17 @@ const LIVE_CONFIG: Record<string, string> = {
 };
 
 // ---------------------------------------------------------------- fake Gmail / Calendar
-interface FakeMsg { from: string; date: Date; body: string }
+interface FakeMsg { from: string; date: Date; body: string; headers?: Record<string, string> }
 class FakeThread {
   replies: string[] = [];
   constructor(public id: string, public msgs: FakeMsg[]) {}
   getId() { return this.id; }
-  getMessages() { return this.msgs.map((m) => ({ getFrom: () => m.from, getDate: () => m.date, getPlainBody: () => m.body })); }
+  getMessages() {
+    return this.msgs.map((m) => ({
+      getFrom: () => m.from, getDate: () => m.date, getPlainBody: () => m.body,
+      getHeader: (name: string) => m.headers?.[name] ?? m.headers?.[name.toLowerCase()] ?? "",
+    }));
+  }
   reply(text: string) { this.replies.push(text); }
 }
 
@@ -212,8 +217,34 @@ describe("reply reading (pure functions)", () => {
     "I am out of the office and will be back Monday at 9am.",
     "Automatic reply: on leave until Tuesday, returning 9am.",
   ])("does not book on: %s", (t) => expect(classify(t)).toBe("NEEDS_HUMAN"));
-  it.each(["Tuesday at 2pm?", "Does Tuesday at 2pm work for you?", "Sure, Tuesday at 2pm works."])(
-    "still books a plain proposal: %s", (t) => expect(classify(t)).toBe("TIME_PROPOSED"));
+  it.each(["Tuesday at 2pm?", "Does Tuesday at 2pm work for you?", "Sure, Tuesday at 2pm works.", "Would Tuesday 2pm work?",
+    "Can we do Tuesday at 2pm?", "Are you free Tuesday at 2pm?", "How about Tuesday at 2pm?", "Tuesday, Nov 3 at 2pm?"])(
+    "still books a plain proposal, also when phrased as an offer question: %s", (t) => expect(classify(t)).toBe("TIME_PROPOSED"));
+
+  // A1 remainder: a question ABOUT the time is not a yes.
+  const verdict = (t: string) => ctx.classifyReply_!(t, { notes: "" }, { TimeZone: "America/New_York" }) as { kind: string; note?: string };
+  it.each(["Did you mean Tuesday at 2pm?", "Is Tuesday 2pm the only option?", "Is Tuesday at 2pm Eastern?", "Is it Tuesday at 2pm?", "Who else joins Tuesday at 2pm?"])(
+    "a question about the time goes to a person: %s", (t) => expect(verdict(t)).toEqual({ kind: "NEEDS_HUMAN", note: "asked a question" }));
+
+  // A zone the person names wins over the guessed one (row has no tz hint, so the guess would be Eastern).
+  it("honours a zone named in the reply", () => {
+    const when = (t: string) => (verdict(t) as { when?: Date }).when?.toISOString();
+    expect(when("Tuesday at 2pm Pacific works.")).toBe("2026-11-03T22:00:00.000Z");
+    expect(when("Tuesday at 2pm CT works.")).toBe("2026-11-03T20:00:00.000Z");
+    expect(when("Tuesday at 2pm works.")).toBe("2026-11-03T19:00:00.000Z");
+  });
+
+  it("reads machine headers: Auto-Submitted, Precedence, X-Autoreply, and no-reply senders", () => {
+    const msg = (headers: Record<string, string>, from = "Jane <jane@acme.com>") => ({ getFrom: () => from, getHeader: (n: string) => headers[n] ?? "" });
+    const auto = ctx.isAutomatedMessage_! as (m: unknown) => boolean;
+    expect(auto(msg({ "Auto-Submitted": "auto-replied" }))).toBe(true);
+    expect(auto(msg({ Precedence: "bulk" }))).toBe(true);
+    expect(auto(msg({ "X-Autoreply": "yes" }))).toBe(true);
+    expect(auto(msg({}, "Helpdesk <no-reply@acme.com>"))).toBe(true);
+    expect(auto(msg({ "Auto-Submitted": "no" }))).toBe(false);
+    expect(auto(msg({}))).toBe(false);
+    expect(auto({ getFrom: () => "Jane <jane@acme.com>" })).toBe(false); // no getHeader at all
+  });
 });
 
 describe("time parsing", () => {
@@ -348,12 +379,27 @@ describe("processReplies", () => {
   const sentRow = (threadId: string, extra: Row = {}): Row => ({
     company: "Acme", name: "Jane Miller", email: "jane@acme.com", status: "Sent", threadId, messageId: "m1", sendState: "SENT", ...extra,
   });
-  const run = (reply: string, opts: { config?: Record<string, string>; busy?: { s: Date; e: Date }[]; row?: Row } = {}) => {
-    const thread = new FakeThread("t1", [ours, fromLead(reply)]);
+  const run = (reply: string, opts: { config?: Record<string, string>; busy?: { s: Date; e: Date }[]; row?: Row; headers?: Record<string, string> } = {}) => {
+    const thread = new FakeThread("t1", [ours, { ...fromLead(reply), ...(opts.headers ? { headers: opts.headers } : {}) }]);
     const t = setup({ config: opts.config ?? LIVE_CONFIG, rows: [sentRow("t1", opts.row)], threads: [thread], busy: opts.busy });
     t.ctx.processReplies!();
     return { ...t, thread };
   };
+
+  it("an auto-reply marked only in its headers goes to a person, even when its text looks like a time", () => {
+    const t = run("We received your message (ticket #4521). Expect a reply by Tuesday at 2pm.", { headers: { "Auto-Submitted": "auto-replied" } });
+    expect(t.events).toHaveLength(0);
+    expect(t.thread.replies).toHaveLength(0);
+    expect(t.cell(2, "sendState")).toBe("NEEDS_HUMAN");
+    expect(t.cell(2, "notes")).toContain("automatic reply (by its mail headers)");
+  });
+
+  it("a question about the time goes to a person with a clear note", () => {
+    const t = run("Is Tuesday at 2pm Eastern or Central?");
+    expect(t.events).toHaveLength(0);
+    expect(t.cell(2, "sendState")).toBe("NEEDS_HUMAN");
+    expect(t.cell(2, "notes")).toContain("asked a question about the time");
+  });
 
   it("books a proposed time: invite goes to the lead, confirmation is sent", () => {
     const t = run("Tuesday at 2pm works.\n\nOn Mon, Nov 2, 2026 at 9:00 AM Vikram wrote:\n> reply with the word unsubscribe");

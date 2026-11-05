@@ -26,6 +26,10 @@ function runTests() {
   check("times requested", classifyReply_("What times do you have open this week?", row, cfg).kind, "TIMES_REQUESTED");
   check("default needs human", classifyReply_("Can you tell me more about pricing?", row, cfg).kind, "NEEDS_HUMAN");
   check("day without time -> human", classifyReply_("Thursday could work.", row, cfg).kind, "NEEDS_HUMAN");
+  check("offer question books", classifyReply_("Does Tuesday at 2pm work for you?", row, cfg).kind, "TIME_PROPOSED");
+  check("other question -> human", classifyReply_("Did you mean Tuesday at 2pm?", row, cfg).note, "asked a question");
+  check("header auto-reply", isAutomatedMessage_({ getFrom: function () { return "a@b.com"; }, getHeader: function (n) { return n === "Auto-Submitted" ? "auto-replied" : ""; } }), true);
+  check("zone in text", zoneInText_("Tuesday at 2pm Pacific works"), "America/Los_Angeles");
 
   // Time zone: "Tuesday at 2pm" on Monday Nov 2 2026 is Tue Nov 3 14:00 Eastern = 19:00Z (EST, after DST ends Nov 1).
   var t = parseProposedTime_("tuesday at 2pm", monday, "America/New_York");

@@ -33,7 +33,8 @@ function processReplies() {
       if (!reply) continue;
 
       var fresh = stripQuotedText_(reply.getPlainBody());
-      var verdict = classifyReply_(fresh, r, cfg);
+      // Mail systems mark machine-sent mail in its headers. That signal beats any word list, so it is checked first.
+      var verdict = isAutomatedMessage_(reply) ? { kind: "NEEDS_HUMAN", note: "automatic reply" } : classifyReply_(fresh, r, cfg);
       var replyAt = reply.getDate();
 
       if (cfg.dryRun) {
@@ -85,7 +86,7 @@ function processReplies() {
             break;
 
           default: // NEEDS_HUMAN
-            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: appendNote_(r.notes, (verdict.note === "declined" ? "said not interested (not opted out): " : "reply needs a person: ") + fresh.slice(0, 200)) });
+            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: appendNote_(r.notes, needsHumanPrefix_(verdict.note) + fresh.slice(0, 200)) });
         }
       } catch (e) {
         updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: appendNote_(r.notes, "automation failed, needs a person: " + String(e.message || e)) });
@@ -183,16 +184,67 @@ function distinctDays_(text) {
   return n;
 }
 
+/** Notes prefix for a reply that goes to a person, by why it went there. */
+function needsHumanPrefix_(note) {
+  if (note === "declined") return "said not interested (not opted out): ";
+  if (note === "automatic reply") return "automatic reply (by its mail headers), not a decision: ";
+  if (note === "asked a question") return "asked a question about the time, not a yes: ";
+  return "reply needs a person: ";
+}
+
+/**
+ * True when the message's headers say a machine sent it (vacation notice, ticket system, mailing list).
+ * Headers are set by the sending mail system, so this catches auto-replies that use no English trigger words.
+ * Tolerates a message object without getHeader (older runtimes, tests): then only the sender address is checked.
+ */
+function isAutomatedMessage_(msg) {
+  var from = "";
+  try { from = String(msg.getFrom() || ""); } catch (e) { /* ignore */ }
+  if (/\b(no-?reply|do-?not-?reply|mailer-daemon|postmaster)\b/i.test(from)) return true;
+  if (typeof msg.getHeader !== "function") return false;
+  var h = function (name) { try { return String(msg.getHeader(name) || "").trim().toLowerCase(); } catch (e) { return ""; } };
+  var auto = h("Auto-Submitted");
+  if (auto && auto !== "no") return true;                          // auto-generated, auto-replied, auto-notified
+  if (/^(auto[_-]?reply|bulk|junk|list)$/.test(h("Precedence"))) return true;
+  if (h("X-Autoreply") || h("X-Autorespond") || h("X-Auto-Response-Suppress")) return true;
+  return false;
+}
+
+/**
+ * A question that holds a time is booked only when it is a plain offer ("Tuesday at 2pm?", "Does Tuesday 2pm work
+ * for you?"): the booking confirmation is the answer to that question. Any other question about the time
+ * ("Did you mean Tuesday 2pm?", "Is that Eastern?", "Is Tuesday 2pm the only option?") goes to a person.
+ */
+var OFFER_QUESTION_RE = /^\s*(?:(?:does|would|could|can|will|is|are|shall|maybe|perhaps|say)\b[^?]*\b(?:work|works|suit|suits|ok|okay|fine|good|possible|free|open|available|convenient|for you|with you|meet|talk|chat|call|connect|do|book|schedule)\b[^?]*|(?:how|what) about\b[^?]*|[^a-z?]*(?:next |this )?(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z.]*,? )?(?:(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z.]* \d{1,2}(?:st|nd|rd|th)?,? |\d{1,2}\/\d{1,2},? |tomorrow,? )?(?:at )?\d[\d:apm. ]*(?:[a-z]{2,3}|eastern|central|mountain|pacific)?\s*)\?\s*$/i;
+
+function isOfferQuestion_(sentence) {
+  return OFFER_QUESTION_RE.test(String(sentence).trim().replace(/\s+/g, " "));
+}
+
+/** A time zone named in the reply ("2pm Pacific", "2 pm CT"), as an IANA zone; else null. */
+function zoneInText_(text) {
+  var t = String(text).toLowerCase().replace(/\s+/g, " ");
+  // Full names anywhere; two/three-letter forms only right after a clock time ("2pm ct", "2:30 pm PST").
+  var abbr = (t.match(/\d\s*(?:am|pm|a\.m\.|p\.m\.)?\s*\b([ecmp][sd]?t)\b/) || [])[1] || "";
+  var k = /\beastern\b/.test(t) || abbr[0] === "e" ? "America/New_York"
+        : /\bcentral\b/.test(t) || abbr[0] === "c" ? "America/Chicago"
+        : /\bmountain\b/.test(t) || abbr[0] === "m" ? "America/Denver"
+        : /\bpacific\b/.test(t) || abbr[0] === "p" ? "America/Los_Angeles" : null;
+  return k;
+}
+
 function classifyReply_(fresh, row, cfg) {
   if (!fresh) return { kind: "NEEDS_HUMAN" };
   if (AUTO_REPLY_RE.test(fresh)) return { kind: "NEEDS_HUMAN" }; // an autoresponder is not a decision
   if (OPT_OUT_RE.test(fresh)) return { kind: "OPT_OUT" };
   if (DECLINE_RE.test(fresh)) return { kind: "NEEDS_HUMAN", note: "declined" };
-  var when = parseProposedTime_(fresh, new Date(), leadZone_(row, cfg));
+  // A zone the person names wins over the zone we guessed for them.
+  var when = parseProposedTime_(fresh, new Date(), zoneInText_(fresh) || leadZone_(row, cfg));
   if (when) {
     var sentence = sentenceWithTime_(fresh);
     if (REFUSAL_RE.test(sentence)) return { kind: "NEEDS_HUMAN" };   // "Tuesday 2pm doesn't work"
     if (distinctDays_(fresh) > 1) return { kind: "NEEDS_HUMAN" };     // "Tuesday 2pm or Thursday?" is a choice, not a time
+    if (/\?\s*$/.test(sentence.trim()) && !isOfferQuestion_(sentence)) return { kind: "NEEDS_HUMAN", note: "asked a question" };
     return { kind: "TIME_PROPOSED", when: when };
   }
   if (TIMES_RE.test(fresh)) return { kind: "TIMES_REQUESTED" };
