@@ -115,7 +115,7 @@ function sendApproved() {
       var body = r.body.trim() + "\n\n" + signature_(cfg);
 
       if (cfg.dryRun) {
-        updateRow_(sheet, r, { notes: stamp_("[DRY RUN] would send: " + r.subject) });
+        updateRow_(sheet, r, { notes: appendNote_(r.notes, "[DRY RUN] would send: " + r.subject) });
         log_("dry-send", r.email, r.subject);
         sentNow++;
         continue;
@@ -139,7 +139,7 @@ function sendApproved() {
         log_("sent", r.email, r.subject);
         sentNow++;
       } catch (e) {
-        updateRow_(sheet, r, { sendState: STATE.sendFailed, notes: stamp_("send failed: " + e.message) });
+        updateRow_(sheet, r, { sendState: STATE.sendFailed, notes: appendNote_(r.notes, "send failed: " + e.message) });
         log_("send-failed", r.email, String(e.message));
       }
       SpreadsheetApp.flush();
@@ -172,7 +172,7 @@ function processReplies() {
       // this address again (it syncs Bounced rows into the ledger before every run). Sends nothing, so dry run too.
       var bounce = bounceIn_(thread, r.lastReplyAt);
       if (bounce) {
-        updateRow_(sheet, r, { status: STATUS.bounced, lastReplyAt: bounce.getDate(), sendState: STATE.bounced, notes: stamp_("bounced: the address does not accept mail") });
+        updateRow_(sheet, r, { status: STATUS.bounced, lastReplyAt: bounce.getDate(), sendState: STATE.bounced, notes: appendNote_(r.notes, "bounced: the address does not accept mail") });
         log_("bounced", r.email, "delivery failure in the thread");
         SpreadsheetApp.flush();
         continue;
@@ -185,38 +185,60 @@ function processReplies() {
       var verdict = classifyReply_(fresh, r, cfg);
       var replyAt = reply.getDate();
 
-      log_("reply", r.email, verdict.kind + " | " + fresh.slice(0, 120).replace(/\s+/g, " "));
-
       if (cfg.dryRun) {
-        updateRow_(sheet, r, {
-          lastReplyAt: replyAt,
-          notes: stamp_("[DRY RUN] reply classified " + verdict.kind + (verdict.when ? " for " + verdict.when.toISOString() : "")),
-        });
+        // Dry run: look, note, but do not count the reply as handled (lastReplyAt stays), so a real "unsubscribe"
+        // or a proposed time received during dry run is still acted on once sending is live. The one exception is
+        // an opt-out, which is applied now: it sends nothing and must never be missed.
+        var dryText = "[DRY RUN] reply classified " + verdict.kind + (verdict.when ? " for " + verdict.when.toISOString() : "");
+        if (verdict.kind === "OPT_OUT") {
+          updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, sendState: STATE.optedOut, notes: appendNote_(r.notes, "opted out (seen in dry run)") });
+          log_("reply", r.email, "OPT_OUT | " + fresh.slice(0, 120).replace(/\s+/g, " "));
+        } else if (String(r.notes || "").indexOf(dryText) === -1) {
+          updateRow_(sheet, r, { notes: appendNote_(r.notes, dryText) });
+          log_("reply", r.email, verdict.kind + " (dry run, not handled) | " + fresh.slice(0, 120).replace(/\s+/g, " "));
+        }
         continue;
       }
 
-      switch (verdict.kind) {
-        case "OPT_OUT":
-          updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, sendState: STATE.optedOut, notes: stamp_("opted out") });
-          break;
+      log_("reply", r.email, verdict.kind + " | " + fresh.slice(0, 120).replace(/\s+/g, " "));
 
-        case "TIMES_REQUESTED":
-          offerTimes_(thread, r, cfg, "Happy to. ");
-          updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: stamp_("offered 3 times") });
-          break;
+      // One row's failure (Calendar quota, Gmail error) must not stop the others, and must leave the row with a
+      // person, not half-done. BOOKED is written before the confirmation email so a Gmail failure after the
+      // invite cannot make the next cycle "find" our own event and apologise for a clash.
+      try {
+        switch (verdict.kind) {
+          case "OPT_OUT":
+            updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, sendState: STATE.optedOut, notes: appendNote_(r.notes, "opted out") });
+            break;
 
-        case "TIME_PROPOSED":
-          var outcome = tryBook_(thread, r, cfg, verdict.when);
-          if (outcome.booked) {
-            updateRow_(sheet, r, { status: STATUS.meetingBooked, lastReplyAt: replyAt, sendState: STATE.booked, notes: stamp_("booked " + outcome.label) });
-          } else {
-            offerTimes_(thread, r, cfg, outcome.reason + " ");
-            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: stamp_(outcome.reason) });
-          }
-          break;
+          case "TIMES_REQUESTED":
+            offerTimes_(thread, r, cfg, "Happy to. ");
+            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: appendNote_(r.notes, "offered 3 times") });
+            break;
 
-        default: // NEEDS_HUMAN
-          updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: stamp_((verdict.note === "declined" ? "said not interested (not opted out): " : "reply needs a person: ") + fresh.slice(0, 200)) });
+          case "TIME_PROPOSED":
+            var outcome = tryBook_(thread, r, cfg, verdict.when, function (label) {
+              updateRow_(sheet, r, { status: STATUS.meetingBooked, lastReplyAt: replyAt, sendState: STATE.booked, notes: appendNote_(r.notes, "booked " + label) });
+              r.notes = appendNote_(r.notes, "booked " + label);
+              SpreadsheetApp.flush();
+            });
+            if (outcome.booked) {
+              if (outcome.confirmationFailed) {
+                updateRow_(sheet, r, { notes: appendNote_(r.notes, "booked, but the confirmation email failed: " + outcome.confirmationFailed + ". The invite was sent; reply by hand if needed.") });
+                log_("booked-no-confirmation", r.email, outcome.confirmationFailed);
+              }
+            } else {
+              offerTimes_(thread, r, cfg, outcome.reason + " ");
+              updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: appendNote_(r.notes, outcome.reason) });
+            }
+            break;
+
+          default: // NEEDS_HUMAN
+            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: appendNote_(r.notes, (verdict.note === "declined" ? "said not interested (not opted out): " : "reply needs a person: ") + fresh.slice(0, 200)) });
+        }
+      } catch (e) {
+        updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: appendNote_(r.notes, "automation failed, needs a person: " + String(e.message || e)) });
+        log_("reply-error", r.email, String(e.message || e));
       }
       SpreadsheetApp.flush();
     }
@@ -374,7 +396,7 @@ function findDay_(s, now, tz) {
     var forms = [DAYS[i] + "\\b", DAYS[i].slice(0, 3) + "\\."].concat(DAY_ALIASES[i]);
     var re = new RegExp("\\b(" + forms.join("|") + ")");
     if (re.test(s)) {
-      var todayDow = dateInZone_(today.y, today.m, today.d, 12, 0, tz).getDay();
+      var todayDow = weekdayOf_(today);
       var ahead = (i - todayDow + 7) % 7;
       if (ahead === 0) ahead = 7;
       return addDays_(today, ahead);
@@ -417,6 +439,11 @@ function dateInZone_(y, m, d, h, mi, tz) {
   return new Date(guess);
 }
 
+/** Weekday (0 = Sunday) of a calendar date, independent of the time zone the script happens to run in. */
+function weekdayOf_(p) {
+  return new Date(Date.UTC(p.y, p.m - 1, p.d)).getUTCDay();
+}
+
 function addDays_(p, n) {
   var d = new Date(Date.UTC(p.y, p.m - 1, p.d + n));
   return { y: d.getUTCFullYear(), m: d.getUTCMonth() + 1, d: d.getUTCDate() };
@@ -444,15 +471,27 @@ function zoneLabel_(tz) {
 // Calendar
 // ---------------------------------------------------------------------------
 
-function tryBook_(thread, row, cfg, when) {
+/** "9 AM to 5 PM Eastern": the office hours in words, for a reply that declines a time. */
+function officeHoursText_(cfg) {
+  var startH = Number(cfg.WorkStartHour) || 9, endH = Number(cfg.WorkEndHour) || 17;
+  var h12 = function (h) { return (h % 12 === 0 ? 12 : h % 12) + (h < 12 ? " AM" : " PM"); };
+  return h12(startH) + " to " + h12(endH) + " " + zoneLabel_(cfg.TimeZone);
+}
+
+/**
+ * Books the proposed time or says why not. Working hours and weekdays are judged in the office zone
+ * (cfg.TimeZone); the lead's zone is used only to word the confirmation. `onBooked` is called right after the
+ * calendar event exists and before the confirmation email, so the row says BOOKED even if Gmail then fails.
+ */
+function tryBook_(thread, row, cfg, when, onBooked) {
   var mins = Number(cfg.MeetingMinutes) || 15;
   var end = new Date(when.getTime() + mins * 60000);
-  var tz = leadZone_(row, cfg);
-  var local = partsInZone_(when, tz);
+  var leadTz = leadZone_(row, cfg);
+  var office = partsInZone_(when, cfg.TimeZone);
   var startH = Number(cfg.WorkStartHour) || 9, endH = Number(cfg.WorkEndHour) || 17;
 
-  if (local.h < startH || local.h >= endH) return { booked: false, reason: "That time is outside my working hours." };
-  var dow = dateInZone_(local.y, local.m, local.d, 12, 0, tz).getDay();
+  if (office.h < startH || office.h >= endH) return { booked: false, reason: "That time is outside my working hours (" + officeHoursText_(cfg) + ")." };
+  var dow = weekdayOf_(office);
   if (dow === 0 || dow === 6) return { booked: false, reason: "I am not in the office that day." };
 
   var cal = CalendarApp.getDefaultCalendar();
@@ -468,16 +507,23 @@ function tryBook_(thread, row, cfg, when) {
     description: "Booked from an email reply. Thread: " + thread.getId(),
   });
 
-  var label = Utilities.formatDate(when, tz, "EEEE, MMM d 'at' h:mm a") + " " + zoneLabel_(tz);
-  thread.reply(
-    "Hi " + firstName_(row.name) + ",\n\nBooked for " + label + ". A calendar invite is on its way. Talk then.\n\n" + signature_(cfg),
-    mailOpts_(cfg)
-  );
+  var label = Utilities.formatDate(when, leadTz, "EEEE, MMM d 'at' h:mm a") + " " + zoneLabel_(leadTz);
+  if (onBooked) onBooked(label); // the Sheet says BOOKED before any further Gmail call
+
+  try {
+    thread.reply(
+      "Hi " + firstName_(row.name) + ",\n\nBooked for " + label + ". A calendar invite is on its way. Talk then.\n\n" + signature_(cfg),
+      mailOpts_(cfg)
+    );
+  } catch (e) {
+    return { booked: true, label: label, confirmationFailed: String(e.message || e) };
+  }
   return { booked: true, label: label };
 }
 
-/** Three open slots on three different working days, next 7 days, in the lead's zone. */
-function freeSlots_(cfg, tz, count) {
+/** Three open slots on three different working days, next 7 days, inside the office hours (cfg.TimeZone). */
+function freeSlots_(cfg, count) {
+  var tz = cfg.TimeZone;
   var mins = Number(cfg.MeetingMinutes) || 15;
   var startH = Number(cfg.WorkStartHour) || 9, endH = Number(cfg.WorkEndHour) || 17;
   var now = new Date();
@@ -490,7 +536,7 @@ function freeSlots_(cfg, tz, count) {
 
   for (var dOff = 0; dOff <= 7 && out.length < count; dOff++) {
     var p = addDays_(today, dOff);
-    var dow = dateInZone_(p.y, p.m, p.d, 12, 0, tz).getDay();
+    var dow = weekdayOf_(p);
     if (dow === 0 || dow === 6) continue;
     // Vary the hour across days so the offer does not read as three 9 AMs.
     var preferred = [10, 14, 11, 15, 9, 13, 16].filter(function (h) { return h >= startH && h + mins / 60 <= endH; });
@@ -506,8 +552,8 @@ function freeSlots_(cfg, tz, count) {
 }
 
 function offerTimes_(thread, row, cfg, lead) {
-  var tz = leadZone_(row, cfg);
-  var slots = freeSlots_(cfg, tz, 3);
+  var tz = leadZone_(row, cfg); // slots are picked in office hours; they are written in the lead's zone
+  var slots = freeSlots_(cfg, 3);
   var text;
   if (slots.length === 0) {
     text = lead + "My calendar is full this week. Could you send two or three times that suit you next week?";
@@ -648,6 +694,28 @@ function countSentToday_(rows, tz) {
 
 function mailOpts_(cfg) { return cfg.SenderName ? { name: cfg.SenderName } : {}; }
 function firstName_(full) { return String(full || "").trim().split(/\s+/)[0] || "there"; }
+/**
+ * Notes is a log, not a label. Each new entry is added as a new line with a timestamp; nothing a person wrote
+ * (such as "tz:America/Chicago" or "state:IL") is lost. The same message is not added twice in a row, so a
+ * dry run that looks at the same row every 15 minutes writes one line, not a hundred. Oldest lines go first
+ * when the cell passes 1,500 characters, hint lines excepted.
+ */
+var NOTES_MAX = 1500;
+function appendNote_(existing, msg) {
+  var lines = String(existing || "").split("\n").filter(function (l) { return l.trim() !== ""; });
+  var last = lines.length ? lines[lines.length - 1].replace(/^\S+ \S+ /, "") : "";
+  if (last === msg) return lines.join("\n");
+  lines.push(stamp_(msg));
+  var isHint = function (l) { return /\b(tz|state):\S+/.test(l); };
+  while (lines.join("\n").length > NOTES_MAX) {
+    var idx = -1;
+    for (var i = 0; i < lines.length - 1; i++) { if (!isHint(lines[i])) { idx = i; break; } }
+    if (idx === -1) break;
+    lines.splice(idx, 1);
+  }
+  return lines.join("\n");
+}
+
 function stamp_(msg) { return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm") + " " + msg; }
 
 function withLock_(fn) {

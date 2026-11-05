@@ -38,7 +38,7 @@ Share the Google Sheet with the service-account email (client_email in the JSON)
 GOOGLE SIDE (one-time)
 ----------------------
 1. One Google Sheet. Tabs are created by the engine on first use.
-2. Apps Script: Sheet -> Extensions -> Apps Script; paste apps_script\AutoBooker.gs and appsscript.json;
+2. Apps Script: Sheet -> Extensions -> Apps Script; run "npm run gs:bundle" and paste apps_script\dist\AutoBooker.gs (or use clasp, see docs/APPS_SCRIPT.md) and appsscript.json;
    run setup once; accept Gmail and Calendar permissions. That Gmail account is the sender.
 
 NETWORK

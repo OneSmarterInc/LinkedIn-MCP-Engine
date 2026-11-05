@@ -1,9 +1,9 @@
-# Phase 5: Sender and booker (`apps_script/AutoBooker.gs`)
+# Phase 5: Sender and booker (`apps_script/*.gs`, see docs/APPS_SCRIPT.md)
 
 The script lives inside the Google Sheet. Keep this repo copy and the Sheet copy identical.
 
 ## Install
-1. Open the Sheet, then **Extensions > Apps Script**. Replace the code with `apps_script/AutoBooker.gs`.
+1. Open the Sheet, then **Extensions > Apps Script**. Replace the code with the bundle from `npm run gs:bundle` (`apps_script/dist/AutoBooker.gs`), or push with clasp (docs/APPS_SCRIPT.md).
 2. Fill in the four `CHANGE ME` values in `CONFIG` (name, title, company, postal address). The script refuses to send until you do.
 3. **Project Settings > Script Properties**: add `GEMINI_API_KEY`. Check the **time zone** in Project Settings too, because business hours and proposed times use it.
 4. Run `setupTriggers` once (creates two 10-minute triggers). Approve the permissions prompt.

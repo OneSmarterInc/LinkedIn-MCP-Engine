@@ -51,7 +51,7 @@ export interface QuarantineRow {
 }
 
 /**
- * AutoBooker (apps_script/AutoBooker.gs) adds these five columns after the engine's ten. They are read here so the
+ * AutoBooker (apps_script/*.gs (AutoBooker)) adds these five columns after the engine's ten. They are read here so the
  * console can show a failed send, and cleared when a person retries one. Positions match COL in AutoBooker.gs.
  */
 export const AUTOBOOKER_HEADERS = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"] as const;

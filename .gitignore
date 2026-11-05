@@ -5,3 +5,6 @@ data/
 coverage/
 out/
 secrets/
+# bundled copy of the Apps Script, built by npm run gs:bundle
+apps_script/dist/
+apps_script/.clasp.json

@@ -113,7 +113,7 @@ What emails are blocked, how a draft is shaped, what a valid campaign is. Users 
 - `src/config/load.ts` — `loadCampaign(ref)` picks file or Sheet by the reference
 - `src/main.ts` — `campaign …` commands and `run-active`
 - `src/mcp/server.ts` — five campaign tools
-- `apps_script/AutoBooker.gs` — `ensureCampaignsTab()` (dropdowns, checkboxes, example row) and `onEdit` stamp
+- `apps_script/*.gs (AutoBooker)` — `ensureCampaignsTab()` (dropdowns, checkboxes, example row) and `onEdit` stamp
 - `tests/unit/campaign-store.test.ts` — 15 tests
 
 ## Jobs tab (job search results)

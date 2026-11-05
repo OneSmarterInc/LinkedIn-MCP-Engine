@@ -3,7 +3,7 @@ import type { SheetsGateway } from "../../core/exporter.js";
 /**
  * The "Config" tab is AutoBooker's settings (sender, signature, daily cap, working hours, DryRun).
  * The UI's Automation page reads and writes the same cells, so the Sheet and the UI never disagree.
- * Keys and defaults mirror CONFIG_KEYS in apps_script/AutoBooker.gs.
+ * Keys and defaults mirror CONFIG_KEYS in apps_script/00_Config.gs (AutoBooker).
  */
 export const CONFIG_TAB = "Config";
 

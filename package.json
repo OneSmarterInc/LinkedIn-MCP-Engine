@@ -16,7 +16,9 @@
     "typecheck": "tsc --noEmit",
     "mcp": "tsx src/mcp/server.ts",
     "test:contract": "vitest run --config vitest.contract.config.ts",
-    "api": "tsx src/api/server.ts"
+    "api": "tsx src/api/server.ts",
+    "gs:bundle": "tsx scripts/bundle-apps-script.ts",
+    "gs:push": "npm run gs:bundle && clasp push"
   },
   "keywords": [],
   "author": "",

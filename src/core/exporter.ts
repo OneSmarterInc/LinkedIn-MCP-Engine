@@ -8,7 +8,7 @@ import type { RunReport } from "./pipeline.js";
 import type { Quarantined } from "./verifier.js";
 
 // ---------------------------------------------------------------------------
-// Layout. The Pipeline columns and their ORDER must match apps_script/AutoBooker.gs.
+// Layout. The Pipeline columns and their ORDER must match apps_script/*.gs (AutoBooker).
 // ---------------------------------------------------------------------------
 
 /** The three tabs one flow writes to. Leads use TAB; job posts use JOB_TABS, with the same columns. */
@@ -43,7 +43,7 @@ export const STATUS = {
   replied: "Replied",
   meetingBooked: "Meeting Booked",
   optedOut: "Opted Out",
-  // Written by apps_script/AutoBooker.gs. Listed here so the dropdown accepts them.
+  // Written by apps_script/*.gs (AutoBooker). Listed here so the dropdown accepts them.
   sending: "Sending",
   sendError: "Send Error",
   bounced: "Bounced",

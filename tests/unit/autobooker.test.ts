@@ -1,18 +1,20 @@
 /**
- * Tests for apps_script/AutoBooker.gs.
+ * Tests for apps_script/*.gs (AutoBooker).
  * The script runs inside a Node vm with fakes for the Google services it uses
  * (SpreadsheetApp, GmailApp, CalendarApp, LockService, Utilities, Session, ScriptApp).
  * The clock is frozen at Monday 2 Nov 2026, 09:00 Eastern.
  */
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import vm from "node:vm";
 import { PIPELINE_HEADERS } from "../../src/core/exporter.js";
 import { DO_NOT_CONTACT_STATUSES } from "../../src/core/optout-sync.js";
 
 const NOW = Date.UTC(2026, 10, 2, 14, 0); // Mon 2 Nov 2026 09:00 America/New_York
-const SCRIPT = readFileSync(join(process.cwd(), "apps_script/AutoBooker.gs"), "utf8");
+// The script is several .gs files; Apps Script loads them in name order, so the tests join them the same way.
+const SCRIPT = readdirSync(join(process.cwd(), "apps_script")).filter((f) => f.endsWith(".gs")).sort()
+  .map((f) => readFileSync(join(process.cwd(), "apps_script", f), "utf8")).join("\n");
 
 // ---------------------------------------------------------------- Utilities.formatDate
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -95,7 +97,7 @@ class FakeThread {
   reply(text: string) { this.replies.push(text); }
 }
 
-function setup(opts: { rows?: Row[]; jobRows?: Row[]; config?: Record<string, string>; busy?: { s: Date; e: Date }[]; threads?: FakeThread[]; lockFree?: boolean; sendThrows?: boolean } = {}) {
+function setup(opts: { rows?: Row[]; jobRows?: Row[]; config?: Record<string, string>; busy?: { s: Date; e: Date }[]; threads?: FakeThread[]; lockFree?: boolean; sendThrows?: boolean; calendarThrows?: boolean } = {}) {
   const sheets = new Map<string, FakeSheet>();
   const pipeline = new FakeSheet("Pipeline");
   sheets.set("Pipeline", pipeline);
@@ -158,7 +160,7 @@ function setup(opts: { rows?: Row[]; jobRows?: Row[]; config?: Record<string, st
         getEvents: (s: Date, e: Date) => (opts.busy ?? [])
           .filter((b) => s.getTime() < b.e.getTime() && e.getTime() > b.s.getTime())
           .map((b) => ({ getStartTime: () => b.s, getEndTime: () => b.e })),
-        createEvent: (title: string, start: Date, end: Date, o: Record<string, unknown>) => { events.push({ title, start, end, opts: o }); },
+        createEvent: (title: string, start: Date, end: Date, o: Record<string, unknown>) => { if (opts.calendarThrows) throw new Error("Calendar quota exceeded"); events.push({ title, start, end, opts: o }); },
       }),
     },
     LockService: { getScriptLock: () => ({ tryLock: () => opts.lockFree !== false, releaseLock: () => {} }) },
@@ -473,6 +475,101 @@ describe("processReplies", () => {
     expect(t.thread.replies).toHaveLength(0);
     expect(t.cell(2, "status")).toBe("Sent");
     expect(String(t.cell(2, "notes"))).toContain("[DRY RUN] reply classified TIME_PROPOSED");
+  });
+});
+
+describe("processReplies: notes, time zones, failures, dry run (B4-B7)", () => {
+  const ours = { from: "Vikram Sethi <v@onesmarter.com>", date: new Date(NOW - 86_400_000), body: "Hi Jane, ..." };
+  const fromLead = (body: string, minutesAgo = 30) => ({ from: "Jane Miller <jane@acme.com>", date: new Date(NOW - minutesAgo * 60_000), body });
+  const sentRow = (extra: Row = {}): Row => ({ company: "Acme", name: "Jane Miller", email: "jane@acme.com", status: "Sent", threadId: "t1", messageId: "m1", sendState: "SENT", ...extra });
+  const run = (reply: string, o: { config?: Record<string, string>; row?: Row; busy?: { s: Date; e: Date }[]; calendarThrows?: boolean; replyThrows?: boolean } = {}) => {
+    const thread = new FakeThread("t1", [ours, fromLead(reply)]);
+    if (o.replyThrows) thread.reply = () => { throw new Error("Gmail: reply failed"); };
+    const t = setup({ config: o.config ?? LIVE_CONFIG, rows: [sentRow(o.row)], threads: [thread], busy: o.busy, calendarThrows: o.calendarThrows });
+    t.ctx.processReplies!();
+    return { ...t, thread };
+  };
+
+  // B4
+  it("keeps a tz hint in Notes through an offer and a booking, and adds lines instead of replacing", () => {
+    const t = run("What times do you have?", { row: { notes: "tz:America/Chicago" } });
+    const notes = String(t.cell(2, "notes"));
+    expect(notes.split("\n")[0]).toBe("tz:America/Chicago");
+    expect(notes).toContain("offered 3 times");
+    expect(t.thread.replies[0]).toContain("Central"); // the hint still steers the wording
+  });
+
+  it("does not add the same note twice in a row", () => {
+    const t = run("Call me whenever.", { config: { ...LIVE_CONFIG, DryRun: "TRUE" } });
+    const once = String(t.cell(2, "notes"));
+    t.ctx.processReplies!();
+    t.ctx.processReplies!();
+    expect(String(t.cell(2, "notes"))).toBe(once);
+    expect(once.match(/DRY RUN/g)).toHaveLength(1);
+  });
+
+  // B5
+  it("judges working hours in the office zone: a Pacific 4pm is 7pm Eastern and is declined with the hours named", () => {
+    const t = run("Tuesday at 4pm works for me.", { row: { notes: "tz:America/Los_Angeles" } });
+    expect(t.events).toHaveLength(0);
+    expect(t.thread.replies[0]).toContain("outside my working hours (9 AM to 5 PM Eastern)");
+    expect(t.cell(2, "sendState")).toBe("TIMES_OFFERED");
+  });
+
+  it("books a Pacific 8am (11am Eastern) and words the confirmation in the lead's zone", () => {
+    const t = run("Tuesday at 8am works for me.", { row: { notes: "tz:America/Los_Angeles" } });
+    expect(t.events).toHaveLength(1);
+    expect(t.events[0]!.start.toISOString()).toBe("2026-11-03T16:00:00.000Z"); // 08:00 PST = 11:00 EST
+    expect(t.thread.replies[0]).toContain("Booked for Tuesday, Nov 3 at 8:00 AM Pacific");
+    expect(t.cell(2, "status")).toBe("Meeting Booked");
+  });
+
+  it("offers slots that fall inside office hours even for a Pacific lead", () => {
+    const t = run("What times do you have?", { row: { notes: "tz:America/Los_Angeles" } });
+    const text = t.thread.replies[0]!;
+    expect(text).toContain("Pacific");
+    // every offered hour, read in Pacific, is 6am-1pm, which is 9am-4pm Eastern
+    const hours = [...text.matchAll(/at (\d+):00 (AM|PM)/g)].map((m) => (Number(m[1]) % 12) + (m[2] === "PM" ? 12 : 0));
+    expect(hours.length).toBeGreaterThan(0);
+    for (const h of hours) { expect(h).toBeGreaterThanOrEqual(6); expect(h).toBeLessThanOrEqual(13); }
+  });
+
+  // B6
+  it("writes BOOKED before the confirmation email, so a Gmail failure after the invite leaves a booked row", () => {
+    const t = run("Tuesday at 2pm works.", { replyThrows: true });
+    expect(t.events).toHaveLength(1);
+    expect(t.cell(2, "status")).toBe("Meeting Booked");
+    expect(t.cell(2, "sendState")).toBe("BOOKED");
+    expect(String(t.cell(2, "notes"))).toContain("confirmation email failed");
+  });
+
+  it("a Calendar error hands the row to a person and does not stop the other rows", () => {
+    const thread1 = new FakeThread("t1", [ours, fromLead("Tuesday at 2pm works.")]);
+    const thread2 = new FakeThread("t2", [ours, { from: "Bob <bob@acme.com>", date: new Date(NOW - 20 * 60_000), body: "Please remove me from your list." }]);
+    const t = setup({ config: LIVE_CONFIG, calendarThrows: true, threads: [thread1, thread2], rows: [sentRow(), sentRow({ name: "Bob", email: "bob@acme.com", threadId: "t2" })] });
+    t.ctx.processReplies!();
+    expect(t.cell(2, "sendState")).toBe("NEEDS_HUMAN");
+    expect(String(t.cell(2, "notes"))).toContain("automation failed, needs a person: Calendar quota exceeded");
+    expect(t.cell(3, "status")).toBe("Opted Out"); // the second row was still processed
+  });
+
+  // B7
+  it("dry run leaves a reply unhandled (lastReplyAt empty) so it is acted on after go-live", () => {
+    const t = run("Tuesday at 2pm works.", { config: { ...LIVE_CONFIG, DryRun: "TRUE" } });
+    expect(t.events).toHaveLength(0);
+    expect(t.cell(2, "lastReplyAt")).toBe("");
+    expect(String(t.cell(2, "notes"))).toContain("[DRY RUN] reply classified TIME_PROPOSED");
+    // flip to live, same thread: now it books
+    t.sheets.get("Config")!.cells.forEach((row) => { if (row && row[1] === "DryRun") row[2] = "FALSE"; });
+    t.ctx.processReplies!();
+    expect(t.events).toHaveLength(1);
+    expect(t.cell(2, "status")).toBe("Meeting Booked");
+  });
+
+  it("dry run still applies an opt-out, because that sends nothing and must never be missed", () => {
+    const t = run("unsubscribe", { config: { ...LIVE_CONFIG, DryRun: "TRUE" } });
+    expect(t.cell(2, "status")).toBe("Opted Out");
+    expect(t.thread.replies).toHaveLength(0);
   });
 });
 

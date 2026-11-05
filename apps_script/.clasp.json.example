@@ -1,0 +1,5 @@
+{
+  "scriptId": "PASTE_THE_SCRIPT_ID_HERE",
+  "rootDir": ".",
+  "filePushOrder": ["00_Config.gs", "10_Setup.gs", "20_Send.gs", "30_Replies.gs", "40_Time.gs", "50_Calendar.gs", "60_Sheet.gs", "90_Tests.gs"]
+}
