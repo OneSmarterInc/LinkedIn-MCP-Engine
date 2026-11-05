@@ -68,6 +68,9 @@ describe("API", () => {
     expect(Number.isNaN(Date.parse(maria.drafted_at))).toBe(false);
     const other = r.rows.find((x: { email: string }) => x.email === "sam@aweinteractive.com");
     expect(other.drafted_at).toBeUndefined();
+    // A row coming back from an action keeps its draft time too, so the queue does not lose its run grouping.
+    const one = (await app.inject({ method: "GET", url: "/api/pipeline/m.lopez@buckeyelogistics.com", headers: auth })).json();
+    expect(one.campaign).toBe("Jobs");
   });
 
   it("lists rows from both tabs with the hiring signal parsed", async () => {

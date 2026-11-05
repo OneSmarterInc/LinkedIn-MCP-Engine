@@ -111,6 +111,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     return { rows: q.status ? rows.filter((r) => r.status === q.status) : rows };
   });
   // The Sheet has no draft time; the ledger records when each address was written to a pipeline tab.
+  // Applied to every response that carries a row, so a row that comes back from approve, reject, reopen or an edit
+  // keeps its draft time and the Review queue keeps it in the right run.
   const withDraftTimes = (rows: PipelineRow[]): PipelineRow[] => rows.map((r) => {
     const seen = deps.ledger.contactedAt?.(r.email);
     return seen ? { ...r, drafted_at: seen.at, campaign: seen.campaign } : r;
@@ -120,14 +122,15 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.get("/api/pipeline/left-out", async () => ({ rows: await quarantine() }));
   // Counts come from the same cached reads as the rows, so this endpoint adds no Sheet calls.
   app.get("/api/pipeline/summary", async () => { const [rows, q] = await Promise.all([allRows(), quarantine()]); return summary(gw(), { rows, quarantine: q }); });
-  app.get("/api/pipeline/:email", async (req) => findByEmail(gw(), (req.params as { email: string }).email));
+  const oneRow = (r: PipelineRow) => withDraftTimes([r])[0]!;
+  app.get("/api/pipeline/:email", async (req) => oneRow(await findByEmail(gw(), (req.params as { email: string }).email)));
 
-  app.post("/api/pipeline/:email/approve", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.approved); bust(); return r; });
-  app.post("/api/pipeline/:email/reject", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.rejected); bust(); return r; });
-  app.post("/api/pipeline/:email/reopen", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.ready); bust(); return r; });
+  app.post("/api/pipeline/:email/approve", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.approved); bust(); return oneRow(r); });
+  app.post("/api/pipeline/:email/reject", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.rejected); bust(); return oneRow(r); });
+  app.post("/api/pipeline/:email/reopen", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.ready); bust(); return oneRow(r); });
   app.patch("/api/pipeline/:email/draft", async (req) => {
     const body = z.object({ subject: z.string().max(200).optional(), body: z.string().max(5000).optional() }).parse(req.body);
-    const r = await updateDraft(gw(), (req.params as { email: string }).email, body); bust(); return r;
+    const r = await updateDraft(gw(), (req.params as { email: string }).email, body); bust(); return oneRow(r);
   });
 
   // ---- job search ----
