@@ -26,6 +26,34 @@ export interface AppDeps {
 
 type HttpError = Error & { statusCode?: number };
 
+export const SERVER_ERROR = "Something failed on the server. The detail is in the backend terminal (or log).";
+const GOOGLE_HINTS: Record<number, string> = {
+  401: "Google rejected the service-account key (401). Check GOOGLE_SERVICE_ACCOUNT_JSON in .env.",
+  403: "Google refused access to the Sheet (403). Share the Sheet with the service-account email (Editor) and try again.",
+  404: "Google could not find the Sheet (404). Check GOOGLE_SHEET_ID in .env.",
+  429: "Google's Sheets quota was hit (429). Wait a minute and try again.",
+};
+
+/** One plain sentence from a Zod error: the field name, then what is wrong with it. */
+export function zodMessage(err: z.ZodError): string {
+  const issue = err.issues[0];
+  if (!issue) return "The request body is not valid.";
+  const field = issue.path.map(String).join(".") || "body";
+  let what = issue.message;
+  if (issue.code === "too_small" && "minimum" in issue) {
+    what = issue.origin === "array" ? `needs at least ${issue.minimum} entr${issue.minimum === 1 ? "y" : "ies"}`
+      : issue.origin === "string" ? (issue.minimum === 1 ? "must not be empty" : `must be at least ${issue.minimum} characters`)
+      : `must be at least ${issue.minimum}`;
+  } else if (issue.code === "too_big" && "maximum" in issue) {
+    what = `must be at most ${issue.maximum}`;
+  } else if (issue.code === "invalid_type") {
+    what = `must be ${issue.expected === "number" ? "a number" : issue.expected === "boolean" ? "true or false" : issue.expected === "array" ? "a list" : `a ${issue.expected}`}`;
+  } else if (issue.code === "invalid_value" && "values" in issue) {
+    what = `must be one of: ${(issue.values as unknown[]).join(", ")}`;
+  }
+  return `${field}: ${what}`;
+}
+
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const env = deps.env ?? process.env;
   const app = Fastify({ logger: false });
@@ -40,9 +68,20 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   // ---- errors in plain words ----
-  app.setErrorHandler((err: HttpError & { validation?: unknown }, _req, reply) => {
-    const code = err.statusCode && err.statusCode >= 400 ? err.statusCode : err.validation ? 400 : 500;
-    reply.code(code).send({ error: err.message });
+  // 400: the request body was wrong (Zod or Fastify validation) -> name the field in plain words.
+  // 4xx/409 thrown by our own code (statusCode set) -> pass the message through.
+  // Google refused or could not find the Sheet -> 502 with a hint, no internals.
+  // Anything else -> 500 with a fixed sentence; the full error goes to the server log only.
+  app.setErrorHandler((err: HttpError & { validation?: unknown; code?: unknown; response?: { status?: number } }, req, reply) => {
+    if (err instanceof z.ZodError) return reply.code(400).send({ error: zodMessage(err) });
+    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.message });
+    if (err.validation) return reply.code(400).send({ error: err.message });
+    const upstream = Number(err.response?.status ?? err.code);
+    const google = GOOGLE_HINTS[upstream];
+    if (google) return reply.code(502).send({ error: google });
+    app.log.error({ err, url: req.url }, "unhandled API error");
+    console.error(`[api] ${req.method} ${req.url} failed:`, err);
+    return reply.code(500).send({ error: SERVER_ERROR });
   });
 
   const gw = () => deps.gw();

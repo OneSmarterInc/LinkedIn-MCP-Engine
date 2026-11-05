@@ -41,11 +41,11 @@ export interface EngineDeps {
 
 async function jobsCampaign(env: NodeJS.ProcessEnv): Promise<CampaignConfig> {
   const ref = env.JOBS_CAMPAIGN?.trim() || DEFAULT_JOBS_CAMPAIGN;
-  if (!env.GOOGLE_SHEET_ID?.trim()) throw new Error("GOOGLE_SHEET_ID must be set in .env for job outreach.");
+  if (!env.GOOGLE_SHEET_ID?.trim()) throw Object.assign(new Error("GOOGLE_SHEET_ID must be set in .env for job outreach."), { statusCode: 400 });
   try {
     return await loadCampaign(ref);
   } catch (error) {
-    throw new Error(`Job outreach needs a campaign named "${ref}" in the Campaigns tab (offer, sender company, persona). ${(error as Error).message}`);
+    throw Object.assign(new Error(`Job outreach needs a campaign named "${ref}" in the Campaigns tab (offer, sender company, persona). ${(error as Error).message}`), { statusCode: 400 });
   }
 }
 

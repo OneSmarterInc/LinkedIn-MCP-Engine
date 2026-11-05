@@ -106,7 +106,7 @@ export async function readPipeline(gw: SheetsGateway, tabs: PipelineTab[] = PIPE
     const rows = await gw.getValues(`${tab}!A1:${LAST_P}`);
     const headers = (rows[0] ?? []).map((h) => h.trim());
     if (headers.slice(0, PIPELINE_HEADERS.length).join("|") !== PIPELINE_HEADERS.join("|")) {
-      throw new Error(`The "${tab}" tab does not have the expected columns (${PIPELINE_HEADERS.join(", ")}).`);
+      throw Object.assign(new Error(`The "${tab}" tab does not have the expected columns (${PIPELINE_HEADERS.join(", ")}).`), { statusCode: 409 });
     }
     // AutoBooker's columns are found by header name, so a tab it has not touched yet (no K-O) still loads.
     const abIndex = (h: (typeof AUTOBOOKER_HEADERS)[number]) => headers.indexOf(h, PIPELINE_HEADERS.length);

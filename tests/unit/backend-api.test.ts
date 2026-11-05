@@ -1,9 +1,9 @@
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import type { SheetsGateway, SheetTabInfo } from "../../src/core/exporter.js";
 import { PIPELINE_HEADERS, QUARANTINED_HEADERS } from "../../src/core/exporter.js";
 import { openLedger } from "../../src/core/db.js";
-import { buildApp } from "../../src/api/app.js";
+import { buildApp, SERVER_ERROR } from "../../src/api/app.js";
 import { parseSignal, whyText } from "../../src/api/services/sheet-rows.js";
 
 function fakeSheets(initial: Record<string, string[][]> = {}) {
@@ -204,5 +204,62 @@ describe("API: a failed send is visible and can be retried (AutoBooker columns K
     expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/reject" })).statusCode).toBe(200);
     expect(sheetRow[H.indexOf("Status")]).toBe("Rejected");
     expect(sheetRow[H15.indexOf("SendState")]).toBe("");
+  });
+});
+
+describe("API: errors come back in plain words (B13)", () => {
+  const auth = { authorization: "Bearer secret" };
+  const headers = [...PIPELINE_HEADERS];
+
+  it("a wrong request body is 400 and names the field; never 500 with raw Zod JSON", async () => {
+    const f = fakeSheets({ Jobs_Pipeline: [headers] });
+    const app = await buildApp({ gw: () => f.gw, ledger: openLedger(":memory:"), env: { API_TOKEN: "secret" } });
+    const base = { name: "X", mode: "CORPORATE", titles: ["CFO"], states: ["Ohio"], offer: "a 15-minute call about claims review", sender_company: "One Smarter" };
+    const noTitles = await app.inject({ method: "POST", url: "/api/campaigns", headers: auth, payload: { ...base, titles: [] } });
+    expect(noTitles.statusCode).toBe(400);
+    expect(noTitles.json().error).toBe("titles: needs at least 1 entry");
+    const capText = await app.inject({ method: "POST", url: "/api/campaigns", headers: auth, payload: { ...base, daily_cap: "abc" } });
+    expect(capText.statusCode).toBe(400);
+    expect(capText.json().error).toBe("daily_cap: must be a number");
+    const badProvider = await app.inject({ method: "POST", url: "/api/campaigns", headers: auth, payload: { ...base, provider: "linkedin" } });
+    expect(badProvider.statusCode).toBe(400);
+    expect(badProvider.json().error).toMatch(/^provider: must be one of: gemini_xray/);
+    const shortOffer = await app.inject({ method: "POST", url: "/api/campaigns", headers: auth, payload: { ...base, offer: "hi" } });
+    expect(shortOffer.json().error).toBe("offer: must be at least 10 characters");
+    await app.close();
+  });
+
+  it("our own 4xx messages pass through unchanged (409 from a status that cannot move)", async () => {
+    const f = fakeSheets({ Jobs_Pipeline: [headers, row({ Company: "A", Email: "a@a.com", Status: "Sent", Subject: "s", DraftBody: "b" })] });
+    const app = await buildApp({ gw: () => f.gw, ledger: openLedger(":memory:"), env: { API_TOKEN: "secret" } });
+    const r = await app.inject({ method: "POST", url: "/api/pipeline/a@a.com/approve", headers: auth });
+    expect(r.statusCode).toBe(409);
+    expect(r.json().error).toMatch(/Cannot move "Sent" to "Approved"/);
+    await app.close();
+  });
+
+  it("an unexpected failure is 500 with a fixed sentence; internals stay in the log", async () => {
+    const f = fakeSheets({ Jobs_Pipeline: [headers] });
+    const secret = "svc-account@proj.iam.gserviceaccount.com at /home/user/secrets/key.json";
+    const gw = { ...f.gw, getValues: async () => { throw new Error(`boom: ${secret}`); } };
+    const app = await buildApp({ gw: () => gw, ledger: openLedger(":memory:"), env: { API_TOKEN: "secret" } });
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    const r = await app.inject({ method: "GET", url: "/api/pipeline", headers: auth });
+    expect(r.statusCode).toBe(500);
+    expect(r.json().error).toBe(SERVER_ERROR);
+    expect(r.body).not.toContain("gserviceaccount");
+    expect(quiet).toHaveBeenCalled();
+    quiet.mockRestore();
+    await app.close();
+  });
+
+  it("a Google refusal is 502 with a hint, not the raw Google error", async () => {
+    const f = fakeSheets({ Jobs_Pipeline: [headers] });
+    const gw = { ...f.gw, getValues: async () => { throw Object.assign(new Error("The caller does not have permission"), { code: 403, response: { status: 403 } }); } };
+    const app = await buildApp({ gw: () => gw, ledger: openLedger(":memory:"), env: { API_TOKEN: "secret" } });
+    const r = await app.inject({ method: "GET", url: "/api/pipeline", headers: auth });
+    expect(r.statusCode).toBe(502);
+    expect(r.json().error).toMatch(/Share the Sheet with the service-account email/);
+    await app.close();
   });
 });
