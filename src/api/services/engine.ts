@@ -21,6 +21,7 @@ import { jobSpyOptionsFromEnv, useJobSpy } from "../../core/jobs/jobspy.js";
 import { DEFAULT_JOBS_CAMPAIGN, attachOutreach, type JobOutreachDeps } from "../../core/jobs/job-outreach.js";
 import { createRunId, listRuns, loadRunState, saveRunState, type McpRunState } from "../../mcp/run-store.js";
 import { viewRun } from "../../mcp/run-view.js";
+import { acquireLock, lockDir } from "../../core/locks.js";
 
 /**
  * The engine, as the API sees it. Every function here calls the same src/core code the MCP server and the CLI use.
@@ -47,17 +48,18 @@ async function jobsCampaign(env: NodeJS.ProcessEnv): Promise<CampaignConfig> {
   }
 }
 
-/** True while a job search runs in this process. One at a time: a second search would spend Seamless credits twice and write duplicate rows. */
-let searchBusy = false;
-
+/**
+ * One job search at a time, across the API, the MCP server and the CLI (a file lock in out/locks; see core/locks.ts).
+ * A second search would spend Seamless credits twice and write duplicate rows. The lock is released when the
+ * background search ends, or at once when the start itself fails.
+ */
 export async function startSearch(deps: EngineDeps): Promise<{ search_id: string; campaign: string }> {
-  if (searchBusy) throw Object.assign(new Error("A job search is already running. Wait for it to finish."), { statusCode: 409 });
-  searchBusy = true;
+  const release = await acquireLock("job-search", { dir: lockDir(deps.env ?? process.env), label: "api" });
   let handedOff = false;
   try {
-    return await startSearchNow(deps, () => { handedOff = true; }, () => { searchBusy = false; });
+    return await startSearchNow(deps, () => { handedOff = true; }, () => { void release(); });
   } finally {
-    if (!handedOff) searchBusy = false;
+    if (!handedOff) await release();
   }
 }
 
@@ -117,7 +119,22 @@ export const searchDefaults = JOB_SEARCH_DEFAULTS;
 
 type Status = McpRunState["status"];
 
+/**
+ * One campaign run at a time (file lock "campaign-run"), for the same reason as job search: a double click or a
+ * retry must not source, verify and draft the same people twice. The lock is held until the background work ends.
+ */
 export async function startRun(deps: EngineDeps, campaign: string, limit = 10, doExport = true): Promise<{ run_id: string; campaign: string }> {
+  const env = deps.env ?? process.env;
+  const release = await acquireLock("campaign-run", { dir: lockDir(env), label: "api" });
+  try {
+    return await startRunNow(deps, campaign, limit, doExport, release);
+  } catch (err) {
+    await release();
+    throw err;
+  }
+}
+
+async function startRunNow(deps: EngineDeps, campaign: string, limit: number, doExport: boolean, release: () => Promise<void>): Promise<{ run_id: string; campaign: string }> {
   const env = deps.env ?? process.env;
   const cfg = await loadCampaign(campaign);
   const runId = createRunId();
@@ -156,6 +173,8 @@ export async function startRun(deps: EngineDeps, campaign: string, limit = 10, d
       await set("EXPORTED", { drafts, exported_at: new Date().toISOString() } as Partial<McpRunState>);
     } catch (err) {
       try { await set("FAILED", { error: (err as Error).message } as Partial<McpRunState>); } catch { /* nothing more to do */ }
+    } finally {
+      await release();
     }
   })();
 

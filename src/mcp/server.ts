@@ -35,6 +35,7 @@ import {
   searchJobs,
   startJobSearch
 } from "../core/jobs/job-search.js";
+import { acquireLock, lockDir } from "../core/locks.js";
 import { jobSpyOptionsFromEnv, useJobSpy } from "../core/jobs/jobspy.js";
 import {
   attachOutreach,
@@ -289,7 +290,19 @@ server.registerTool(
       const cfg = await jobsCampaign();
       const seamlessKey = process.env.SEAMLESS_API_KEY?.trim();
 
+      // Same file lock as the API: one job search at a time across Claude Desktop, the console and the CLI.
+      const release = await acquireLock("job-search", { dir: lockDir(), label: "claude-desktop" });
+      let handedOff = false;
       const { record } = await startJobSearch(async (onProgress, searchId) => {
+        handedOff = true;
+        try {
+          return await runSearchJobs(onProgress, searchId);
+        } finally {
+          await release();
+        }
+      }).finally(() => { if (!handedOff) void release(); });
+
+      async function runSearchJobs(onProgress: Parameters<Parameters<typeof startJobSearch>[0]>[0], searchId: string) {
         const out = await searchJobs({ llm, onProgress, seen: await loadSeenJobs(), ...(jobspy ? { jobspy } : {}), ...(seamlessKey ? { seamless: { apiKey: seamlessKey } } : {}) });
         const onStep: JobOutreachDeps["onStep"] = (stage, message) => onProgress({
           stage, message,
@@ -298,7 +311,7 @@ server.registerTool(
           jobs: out.jobs
         });
         return attachOutreach(out, outreachDeps(cfg, searchId, onStep));
-      });
+      }
 
       return success({
         search_id: record.search_id,

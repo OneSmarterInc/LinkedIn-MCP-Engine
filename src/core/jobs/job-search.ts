@@ -223,7 +223,13 @@ export function emptySeenJobs(): SeenJobs {
  */
 export function jobsToRemember(r: Partial<JobSearchRecord> & Partial<JobSearchOutput>): JobView[] {
   const out = r.result ?? (r.jobs ? (r as JobSearchOutput) : undefined);
-  if (!out?.outreach) return [];
+  if (!out?.outreach) {
+    // A search that failed, or whose Sheet step failed, still paid Seamless for its lookups. Remember the dead ends
+    // (asked, nothing found) so the next search does not pay for them again. Jobs whose email WAS found are not
+    // remembered: they were never drafted, so the next search may find them again and finish the work (one credit).
+    const partial = out?.jobs ?? r.jobs_so_far ?? [];
+    return partial.filter((j) => j.email_source === "not_found");
+  }
   const o = out.outreach;
   // Older records have no retry list. If every contact crashed a check, treat them all as retryable.
   const allCrashed = !o.retry_urls && o.contacts > 0 && (o.quarantined_by_reason?.GATE_ERROR ?? 0) === o.contacts;

@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 // Only the parts startSearch touches before it hands work to the background.
 let finishRun: (() => void) | undefined;
 vi.mock("../../src/lib/llm/gemini.js", () => ({ GeminiProvider: class { supportsGrounding = true; } }));
-vi.mock("../../src/config/load.js", () => ({ loadCampaign: async () => ({ campaign_name: "Jobs" }) }));
+vi.mock("../../src/config/load.js", () => ({ loadCampaign: async (name: string) => { if (name === "nope") throw new Error("No campaign named nope"); return { campaign_name: "Jobs", sourcing_provider: "csv_import" }; } }));
 vi.mock("../../src/core/jobs/job-search.js", async (orig) => ({
   ...(await orig<typeof import("../../src/core/jobs/job-search.js")>()),
   startJobSearch: async (run: (p: () => void, id: string) => Promise<unknown>) => {
@@ -12,13 +12,34 @@ vi.mock("../../src/core/jobs/job-search.js", async (orig) => ({
   },
   searchJobs: () => new Promise((resolve) => { finishRun = () => resolve({ jobs: [], total: 0 }); }),
 }));
+// Campaign runs: keep the run record in memory and let the test decide when sourcing ends.
+let finishSource: (() => void) | undefined;
+const runStore = new Map<string, Record<string, unknown>>();
+vi.mock("../../src/mcp/run-store.js", async (orig) => ({
+  ...(await orig<typeof import("../../src/mcp/run-store.js")>()),
+  saveRunState: async (st: { run_id: string }) => { runStore.set(st.run_id, st); },
+  loadRunState: async (id: string) => runStore.get(id),
+}));
+vi.mock("../../src/core/sourcing.js", () => ({
+  sourceLeads: () => new Promise((resolve) => { finishSource = () => resolve({ provider: "csv", leads: [], skipped: [] }); }),
+}));
+vi.mock("../../src/lib/llm/index.js", () => ({ getLLM: () => ({ name: "fake" }), geminiOptions: () => ({}) }));
+vi.mock("../../src/core/gates/index.js", () => ({ buildAsyncGates: () => ({}) }));
+vi.mock("../../src/core/verifier.js", () => ({ verifyBatch: async () => ({ passed: [], quarantined: [] }) }));
+vi.mock("../../src/core/enricher.js", () => ({ draftAll: async () => [] }));
+vi.mock("../../src/core/exporter.js", async (orig) => ({ ...(await orig<typeof import("../../src/core/exporter.js")>()), exportToSheet: async () => ({ exported: 0 }), recordExported: () => {} }));
 vi.mock("../../src/core/jobs/job-outreach.js", async (orig) => ({
   ...(await orig<typeof import("../../src/core/jobs/job-outreach.js")>()),
   attachOutreach: async (out: unknown) => out,
 }));
 
-const { startSearch } = await import("../../src/api/services/engine.js");
-const env = { GEMINI_API_KEY: "k", GOOGLE_SHEET_ID: "s" } as NodeJS.ProcessEnv;
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+const { startSearch, startRun } = await import("../../src/api/services/engine.js");
+const { acquireLock, LockHeldError } = await import("../../src/core/locks.js");
+const LOCK_DIR = await mkdtemp(join(tmpdir(), "locks-"));
+const env = { GEMINI_API_KEY: "k", GOOGLE_SHEET_ID: "s", LOCK_DIR } as NodeJS.ProcessEnv;
 const deps = { gw: () => ({}) as never, ledger: {} as never, env };
 
 /** Ends the running search once it has reached the search step (it first reads earlier searches from disk). */
@@ -49,5 +70,69 @@ describe("startSearch: one job search at a time", () => {
     await expect(startSearch({ ...deps, env: { GOOGLE_SHEET_ID: "s" } as NodeJS.ProcessEnv })).rejects.toMatchObject({ statusCode: 400 });
     await expect(startSearch(deps)).resolves.toMatchObject({ search_id: "jobs-test" });
     await endRun();
+  });
+});
+
+describe("file lock (shared by the API, the MCP server and the CLI)", () => {
+  it("one winner; the loser gets a 409 with who holds it; release frees it", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lock-"));
+    const release = await acquireLock("campaign-run", { dir, label: "api" });
+    const held = await acquireLock("campaign-run", { dir, label: "claude-desktop" }).catch((e) => e);
+    expect(held).toBeInstanceOf(LockHeldError);
+    expect((held as Error & { statusCode: number }).statusCode).toBe(409);
+    expect((held as Error).message).toMatch(/campaign run is already running .*by api/);
+    await release();
+    await release(); // twice is harmless
+    const again = await acquireLock("campaign-run", { dir });
+    await again();
+  });
+
+  it("takes over a lock left behind by a crashed process (dead pid or older than 30 minutes)", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lock-"));
+    const { hostname } = await import("node:os");
+    await writeFile(join(dir, "job-search.lock"), JSON.stringify({ pid: 999999, host: hostname(), started_at: new Date().toISOString() }));
+    const release = await acquireLock("job-search", { dir });            // dead pid
+    expect(JSON.parse(await readFile(join(dir, "job-search.lock"), "utf8")).pid).toBe(process.pid);
+    await release();
+    await writeFile(join(dir, "job-search.lock"), JSON.stringify({ pid: process.pid, host: hostname(), started_at: new Date(Date.now() - 31 * 60_000).toISOString() }));
+    const release2 = await acquireLock("job-search", { dir });           // alive pid, but stale
+    await release2();
+    await writeFile(join(dir, "job-search.lock"), JSON.stringify({ pid: process.pid, host: hostname(), started_at: new Date().toISOString() }));
+    await expect(acquireLock("job-search", { dir })).rejects.toBeInstanceOf(LockHeldError); // alive and fresh: held
+  });
+
+  it("a search lock and a run lock do not block each other", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "lock-"));
+    const a = await acquireLock("job-search", { dir });
+    const b = await acquireLock("campaign-run", { dir });
+    await a(); await b();
+  });
+});
+
+describe("startRun: one campaign run at a time", () => {
+  async function endSource() {
+    for (let i = 0; i < 200 && !finishSource; i++) await new Promise((r) => setTimeout(r, 5));
+    const f = finishSource; finishSource = undefined; f?.();
+    await new Promise((r) => setTimeout(r, 30));
+  }
+
+  it("refuses a second run with 409 while the first runs, then allows one; a search may run alongside", async () => {
+    const first = await startRun(deps, "Jobs", 5, false);
+    expect(first.run_id).toMatch(/^mcp-/);
+    await expect(startRun(deps, "Jobs", 5, false)).rejects.toMatchObject({ statusCode: 409 });
+    await expect(startSearch(deps)).resolves.toMatchObject({ search_id: "jobs-test" }); // different lock
+    await endRun();
+    await endSource();
+    expect((runStore.get(first.run_id) as { status: string }).status).toBe("DRAFTED");
+    const second = await startRun(deps, "Jobs", 5, false);
+    expect(second.run_id).not.toBe(first.run_id);
+    await endSource();
+  });
+
+  it("releases the lock when the start itself fails", async () => {
+    await expect(startRun(deps, "nope", 5, false)).rejects.toThrow();
+    const ok = await startRun(deps, "Jobs", 5, false);
+    expect(ok.run_id).toMatch(/^mcp-/);
+    await endSource();
   });
 });

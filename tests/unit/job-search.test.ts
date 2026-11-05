@@ -457,11 +457,13 @@ describe("each run brings new jobs", () => {
 
   it("lets a job come back when its search failed, its email was not looked up, or a check crashed", () => {
     const v = (url: string, email_source = "seamless_recruiter") => ({ job_title: "Nurse", company: "C", location: "", posted_date_unconfirmed: null, description: "", url, email: "a@b.com", email_source }) as never;
-    const jobs = [v("u-drafted"), v("u-crashed"), v("u-limit", "lookup_limit")];
-    expect(jobsToRemember({ status: "FAILED", jobs_so_far: jobs })).toEqual([]);                        // never reached the gates
-    expect(jobsToRemember({ result: { jobs, outreach_error: "Sheet down" } as never })).toEqual([]);     // outreach failed
+    const jobs = [v("u-drafted"), v("u-crashed"), v("u-limit", "lookup_limit"), v("u-deadend", "not_found")];
+    // A failed search: jobs with an email come back (never drafted), but a dead-end lookup is remembered so it is not paid for twice.
+    expect(jobsToRemember({ status: "FAILED", jobs_so_far: jobs }).map((j) => j.url)).toEqual(["u-deadend"]);
+    expect(jobsToRemember({ result: { jobs, outreach_error: "Sheet down" } as never }).map((j) => j.url)).toEqual(["u-deadend"]);
+    expect(jobsToRemember({ status: "FAILED" })).toEqual([]);                                             // nothing found before it failed
     const done = jobsToRemember({ result: { jobs, outreach: { contacts: 3, quarantined_by_reason: { GATE_ERROR: 1 }, retry_urls: ["u-crashed"] } } as never });
-    expect(done.map((j) => j.url)).toEqual(["u-drafted"]);
+    expect(done.map((j) => j.url)).toEqual(["u-drafted", "u-deadend"]);
     // An older record with no retry list where every contact crashed a check: all can come back.
     expect(jobsToRemember({ result: { jobs, outreach: { contacts: 3, quarantined_by_reason: { GATE_ERROR: 3 } } } as never })).toEqual([]);
   });
