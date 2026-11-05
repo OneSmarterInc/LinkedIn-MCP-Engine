@@ -138,6 +138,10 @@ export async function runJobSpy(term: string, resultsWanted: number, opts: JobSp
     results_wanted: resultsWanted, country_indeed: opts.countryIndeed, proxies: opts.proxies,
   };
   const res = await run(opts.python, [opts.script, JSON.stringify(input)], opts.timeoutMs);
+  // Windows: with no Python installed, "python" is a Microsoft Store shortcut that prints a hint and exits 9009.
+  if (!res.spawnError && (res.code === 9009 || /Microsoft Store|was not found; run without arguments/i.test(res.stderr))) {
+    throw new JobSpySetupError(`Python is not installed ("${opts.python}" opens the Microsoft Store). Install Python 3.10+ from python.org, then run "pip install -U python-jobspy", or set JOBSPY_PYTHON in .env.`);
+  }
   if (res.spawnError) {
     throw new JobSpySetupError(`Could not start Python ("${opts.python}"): ${res.spawnError}. Install Python 3.10+ and run "pip install -U python-jobspy", or set JOBSPY_PYTHON in .env.`);
   }

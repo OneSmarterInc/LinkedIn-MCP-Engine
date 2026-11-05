@@ -77,6 +77,12 @@ describe("JobSpy", () => {
     expect(out.jobs[0]!.email_source).toBe("seamless_off");
   });
 
+  it("treats the Windows Store python shortcut (exit 9009) as Python missing", async () => {
+    const store: RunCommand = async () => ({ code: 9009, stdout: "", stderr: "Python was not found; run without arguments to install from the Microsoft Store" });
+    await expect(runJobSpy("java", 20, opts, store)).rejects.toBeInstanceOf(JobSpySetupError);
+    await expect(searchJobs({ llm: noGemini, jobspy: { opts, run: store } })).rejects.toThrow(/Microsoft Store/);
+  });
+
   it("stops the run at once when Python is missing", async () => {
     const run: RunCommand = async () => ({ code: null, stdout: "", stderr: "", spawnError: "spawn python ENOENT" });
     await expect(searchJobs({ llm: noGemini, jobspy: { opts, run } })).rejects.toThrow(/Python/);
@@ -85,7 +91,7 @@ describe("JobSpy", () => {
   it("starts each run on a different search term", async () => {
     const first: string[] = [];
     const run: RunCommand = async (_c, args) => { first.push(JSON.parse(args[1]!).search_term); return { code: 0, stdout: '{"jobs":[]}', stderr: "" }; };
-    await searchJobs({ llm: noGemini, settings: { maxSearches: 1 }, jobspy: { opts, run }, seen: { urls: new Set(), keys: new Set(), runs: 1, recent: [] } });
+    await searchJobs({ llm: noGemini, settings: { maxSearches: 1 }, jobspy: { opts, run }, seen: { urls: new Set(), keys: new Set(), runs: 1, recent: [], noEmailCompanies: new Set() } });
     expect(first).toEqual(["data engineer"]);
   });
 });

@@ -46,7 +46,7 @@ const deps = { gw: () => ({}) as never, ledger: {} as never, env };
 async function endRun() {
   for (let i = 0; i < 200 && !finishRun; i++) await new Promise((r) => setTimeout(r, 5));
   const f = finishRun; finishRun = undefined; f?.();
-  await new Promise((r) => setTimeout(r, 10));
+  await new Promise((r) => setTimeout(r, 200));
 }
 
 describe("startSearch: one job search at a time", () => {
