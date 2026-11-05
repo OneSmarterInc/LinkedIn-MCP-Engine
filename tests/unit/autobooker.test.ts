@@ -198,6 +198,18 @@ describe("reply reading (pure functions)", () => {
     "times requested: %s", (t) => expect(classify(t)).toBe("TIMES_REQUESTED"));
   it.each(["Can you tell me more about pricing?", "Thursday could work.", "", "We sat down and discussed it."])(
     "needs a person: %j", (t) => expect(classify(t)).toBe("NEEDS_HUMAN"));
+
+  // A time inside a refusal, a choice between days, or an autoresponder must never book a meeting.
+  it.each([
+    "Tuesday at 2pm doesn't work for me, can you do Thursday?",
+    "Tuesday 2pm is not going to work, I am travelling.",
+    "I can't do Tuesday at 2pm.",
+    "Tuesday at 2pm or Wednesday at 10am, whichever suits you.",
+    "I am out of the office and will be back Monday at 9am.",
+    "Automatic reply: on leave until Tuesday, returning 9am.",
+  ])("does not book on: %s", (t) => expect(classify(t)).toBe("NEEDS_HUMAN"));
+  it.each(["Tuesday at 2pm?", "Does Tuesday at 2pm work for you?", "Sure, Tuesday at 2pm works."])(
+    "still books a plain proposal: %s", (t) => expect(classify(t)).toBe("TIME_PROPOSED"));
 });
 
 describe("time parsing", () => {
@@ -274,6 +286,27 @@ describe("sendApproved", () => {
     t.ctx.sendApproved!();
     expect(t.sent.map((s) => s.to)).toEqual(["a@acme.com"]);
     expect(t.cell(4, "status")).toBe("Approved");
+  });
+
+  it("a daily cap of 0 pauses sending; an empty cap means 20", () => {
+    const t = setup({ config: { ...LIVE_CONFIG, DailySendCap: "0" }, rows: [approved("a@acme.com")] });
+    t.ctx.sendApproved!();
+    expect(t.sent).toHaveLength(0);
+    expect(t.cell(2, "status")).toBe("Approved");
+    expect(t.ctx.parseCap_!("")).toBe(20);
+    expect(t.ctx.parseCap_!("abc")).toBe(20);
+    expect(t.ctx.parseCap_!("5")).toBe(5);
+  });
+
+  it("writes to the row that holds the email even after a row above it was deleted mid-run", () => {
+    const t = setup({ config: LIVE_CONFIG, rows: [approved("gone@acme.com"), approved("a@acme.com"), approved("b@acme.com")] });
+    // Someone deletes row 2 (gone@acme.com) while the run is between reading and writing.
+    t.pipeline.cells.splice(2, 1);
+    t.ctx.sendApproved!();
+    expect(t.sent.map((s) => s.to)).toEqual(["a@acme.com", "b@acme.com"]);
+    expect(t.cell(2, "email")).toBe("a@acme.com"); expect(t.cell(2, "status")).toBe("Sent");
+    expect(t.cell(3, "email")).toBe("b@acme.com"); expect(t.cell(3, "status")).toBe("Sent");
+    expect(t.cell(4, "status")).toBe("");
   });
 
   it("dry run sends nothing and leaves a note", () => {

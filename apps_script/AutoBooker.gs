@@ -93,7 +93,7 @@ function sendApproved() {
     // Pipeline first, then Jobs_Pipeline. The daily cap covers both, since they share one Gmail account.
     var tabs = pipelines_().map(function (sheet) { return { sheet: sheet, rows: readRows_(sheet) }; });
     var sentToday = tabs.reduce(function (n, t) { return n + countSentToday_(t.rows, cfg.TimeZone); }, 0);
-    var cap = Number(cfg.DailySendCap) || 20;
+    var cap = parseCap_(cfg.DailySendCap);
     var sentNow = 0;
     var capHit = false;
 
@@ -115,21 +115,21 @@ function sendApproved() {
       var body = r.body.trim() + "\n\n" + signature_(cfg);
 
       if (cfg.dryRun) {
-        setCell_(sheet, r.rowNo, COL.notes, stamp_("[DRY RUN] would send: " + r.subject));
+        updateRow_(sheet, r, { notes: stamp_("[DRY RUN] would send: " + r.subject) });
         log_("dry-send", r.email, r.subject);
         sentNow++;
         continue;
       }
 
       // Mark first, send second. If the script dies between the two, the row is never resent.
-      setCell_(sheet, r.rowNo, COL.sendState, STATE.sending);
+      if (!updateRow_(sheet, r, { sendState: STATE.sending })) continue; // row deleted by hand: do not send
       SpreadsheetApp.flush();
 
       try {
         var draft = GmailApp.createDraft(r.email, r.subject, body, mailOpts_(cfg));
         var msg = draft.send();
         var now = new Date();
-        setCells_(sheet, r.rowNo, {
+        updateRow_(sheet, r, {
           status: STATUS.sent,
           threadId: msg.getThread().getId(),
           messageId: msg.getId(),
@@ -139,7 +139,7 @@ function sendApproved() {
         log_("sent", r.email, r.subject);
         sentNow++;
       } catch (e) {
-        setCells_(sheet, r.rowNo, { sendState: STATE.sendFailed, notes: stamp_("send failed: " + e.message) });
+        updateRow_(sheet, r, { sendState: STATE.sendFailed, notes: stamp_("send failed: " + e.message) });
         log_("send-failed", r.email, String(e.message));
       }
       SpreadsheetApp.flush();
@@ -178,7 +178,7 @@ function processReplies() {
       log_("reply", r.email, verdict.kind + " | " + fresh.slice(0, 120).replace(/\s+/g, " "));
 
       if (cfg.dryRun) {
-        setCells_(sheet, r.rowNo, {
+        updateRow_(sheet, r, {
           lastReplyAt: replyAt,
           notes: stamp_("[DRY RUN] reply classified " + verdict.kind + (verdict.when ? " for " + verdict.when.toISOString() : "")),
         });
@@ -187,26 +187,26 @@ function processReplies() {
 
       switch (verdict.kind) {
         case "OPT_OUT":
-          setCells_(sheet, r.rowNo, { status: STATUS.optedOut, lastReplyAt: replyAt, sendState: STATE.optedOut, notes: stamp_("opted out") });
+          updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, sendState: STATE.optedOut, notes: stamp_("opted out") });
           break;
 
         case "TIMES_REQUESTED":
           offerTimes_(thread, r, cfg, "Happy to. ");
-          setCells_(sheet, r.rowNo, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: stamp_("offered 3 times") });
+          updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: stamp_("offered 3 times") });
           break;
 
         case "TIME_PROPOSED":
           var outcome = tryBook_(thread, r, cfg, verdict.when);
           if (outcome.booked) {
-            setCells_(sheet, r.rowNo, { status: STATUS.meetingBooked, lastReplyAt: replyAt, sendState: STATE.booked, notes: stamp_("booked " + outcome.label) });
+            updateRow_(sheet, r, { status: STATUS.meetingBooked, lastReplyAt: replyAt, sendState: STATE.booked, notes: stamp_("booked " + outcome.label) });
           } else {
             offerTimes_(thread, r, cfg, outcome.reason + " ");
-            setCells_(sheet, r.rowNo, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: stamp_(outcome.reason) });
+            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: stamp_(outcome.reason) });
           }
           break;
 
         default: // NEEDS_HUMAN
-          setCells_(sheet, r.rowNo, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: stamp_("reply needs a person: " + fresh.slice(0, 200)) });
+          updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: stamp_("reply needs a person: " + fresh.slice(0, 200)) });
       }
       SpreadsheetApp.flush();
     }
@@ -260,11 +260,40 @@ var OPT_OUT_RE = /\b(unsubscribe|opt[\s-]?out|remove me|take me off|stop (emaili
 var TIMES_RE = /\b(what times?|which times?|when (are|would|will) you|when works|your availability|times? (that )?works?|send (me )?(some|a few|your) (times|slots|options)|open slots?|available (times|slots)|availability)\b/i;
 
 /** Order matters. Default is NEEDS_HUMAN, never OPT_OUT: a wrong opt-out is permanent. */
+var AUTO_REPLY_RE = /\b(out of (the )?office|out[- ]of[- ]office|on (annual |parental |sick |medical )?leave|on vacation|on pto|away from (my |the )?(desk|office|email)|limited access to (my )?email|auto(matic|mated|-)?\s?(reply|response)|automatic reply|this is an automated|will (respond|reply|return) (when|on|after) i return|back in the office)\b/i;
+var REFUSAL_RE = /\b(doesn'?t|does not|don'?t|do not|won'?t|will not|can'?t|cannot|can not|isn'?t|is not|not (going to )?work|no good|instead|rather|unless|except|busy|unavailable|conflict|reschedule|another (day|time)|different (day|time))\b/i;
+
+/** The sentence that holds the clock time, so "Tuesday 2pm doesn't work, Thursday?" is judged on its own words. */
+function sentenceWithTime_(text) {
+  var parts = String(text).split(/(?<=[.!?\n])\s+|\n+/);
+  for (var i = 0; i < parts.length; i++) {
+    if (findClock_(parts[i].toLowerCase().replace(/\s+/g, " "))) return parts[i];
+  }
+  return text;
+}
+
+/** How many different weekdays the text names. Two or more means the person is offering a choice. */
+function distinctDays_(text) {
+  var t = String(text).toLowerCase();
+  var n = 0;
+  for (var i = 0; i < DAYS.length; i++) {
+    var hit = new RegExp("\\b" + DAYS[i].slice(0, 3) + "(" + DAYS[i].slice(3) + ")?\\b").test(t);
+    if (hit) n++;
+  }
+  return n;
+}
+
 function classifyReply_(fresh, row, cfg) {
   if (!fresh) return { kind: "NEEDS_HUMAN" };
+  if (AUTO_REPLY_RE.test(fresh)) return { kind: "NEEDS_HUMAN" }; // an autoresponder is not a decision
   if (OPT_OUT_RE.test(fresh)) return { kind: "OPT_OUT" };
   var when = parseProposedTime_(fresh, new Date(), leadZone_(row, cfg));
-  if (when) return { kind: "TIME_PROPOSED", when: when };
+  if (when) {
+    var sentence = sentenceWithTime_(fresh);
+    if (REFUSAL_RE.test(sentence)) return { kind: "NEEDS_HUMAN" };   // "Tuesday 2pm doesn't work"
+    if (distinctDays_(fresh) > 1) return { kind: "NEEDS_HUMAN" };     // "Tuesday 2pm or Thursday?" is a choice, not a time
+    return { kind: "TIME_PROPOSED", when: when };
+  }
   if (TIMES_RE.test(fresh)) return { kind: "TIMES_REQUESTED" };
   return { kind: "NEEDS_HUMAN" };
 }
@@ -539,11 +568,47 @@ function readRows_(sheet) {
 }
 
 function setCell_(sheet, rowNo, col, value) { sheet.getRange(rowNo, col).setValue(value); }
+
+/**
+ * Rows are read once per run, but a person can insert or delete rows while the run is going.
+ * Before every write, confirm the email is still at r.rowNo; if not, find it by email (column E).
+ * Returns the row number, or null when the row is gone (then nothing is written and a log line says so).
+ */
+function locateRow_(sheet, r) {
+  var at = String(sheet.getRange(r.rowNo, COL.email).getValues()[0][0] || "").trim().toLowerCase();
+  if (at === r.email) return r.rowNo;
+  var last = sheet.getLastRow();
+  if (last >= 2) {
+    var emails = sheet.getRange(2, COL.email, last - 1, 1).getValues();
+    for (var i = 0; i < emails.length; i++) {
+      if (String(emails[i][0] || "").trim().toLowerCase() === r.email) { r.rowNo = i + 2; return r.rowNo; }
+    }
+  }
+  log_("row-moved", r.email, "Row for " + r.email + " is no longer in " + sheet.getName() + "; nothing written.");
+  return null;
+}
+
+/** setCells_ by email: re-locates the row first. Returns false when the row is gone. */
+function updateRow_(sheet, r, patch) {
+  var n = locateRow_(sheet, r);
+  if (n === null) return false;
+  setCells_(sheet, n, patch);
+  return true;
+}
 function setCells_(sheet, rowNo, patch) {
   Object.keys(patch).forEach(function (k) {
     if (!COL[k]) throw new Error("Unknown column " + k);
     sheet.getRange(rowNo, COL[k]).setValue(patch[k]);
   });
+}
+
+/** "" or junk -> 20. "0" -> 0 (sending paused). Never turns a real number into the default. */
+function parseCap_(raw) {
+  var t = String(raw === undefined || raw === null ? "" : raw).trim();
+  if (t === "") return 20;
+  var n = Number(t);
+  if (isNaN(n)) return 20;
+  return Math.max(0, Math.floor(n));
 }
 
 function countSentToday_(rows, tz) {
