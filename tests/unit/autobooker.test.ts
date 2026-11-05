@@ -192,8 +192,10 @@ describe("reply reading (pure functions)", () => {
   it("cuts phone signatures", () => expect(strip("Yes please.\nSent from my iPhone")).toBe("Yes please."));
 
   it("a friendly reply that quotes our opt-out line is NOT an opt-out", () => expect(classify(strip(quoted))).toBe("TIME_PROPOSED"));
-  it.each(["Please remove me from your list.", "unsubscribe", "Stop emailing me", "Not interested, thanks.", "Do not contact me again"])(
+  it.each(["Please remove me from your list.", "unsubscribe", "Stop emailing me", "Do not contact me again"])(
     "opt-out: %s", (t) => expect(classify(t)).toBe("OPT_OUT"));
+  it.each(["Not interested, thanks.", "No thanks, we are all set."])(
+    "a decline goes to a person, not to opt-outs: %s", (t) => expect(classify(t)).toBe("NEEDS_HUMAN"));
   it.each(["What times do you have open this week?", "Send me a few options", "What's your availability?"])(
     "times requested: %s", (t) => expect(classify(t)).toBe("TIMES_REQUESTED"));
   it.each(["Can you tell me more about pricing?", "Thursday could work.", "", "We sat down and discussed it."])(
@@ -371,6 +373,39 @@ describe("processReplies", () => {
     expect(t.events).toHaveLength(0);
   });
 
+  it("\"not interested\" goes to a person and is not an opt-out", () => {
+    const t = run("Thanks, but we are not interested at this time.");
+    expect(t.cell(2, "status")).toBe("Replied");
+    expect(t.cell(2, "sendState")).toBe("NEEDS_HUMAN");
+    expect(String(t.cell(2, "notes"))).toContain("said not interested");
+    expect(t.thread.replies).toHaveLength(0);
+  });
+
+  it("still treats unsubscribe as an opt-out", () => {
+    expect(run("Please unsubscribe me.").cell(2, "status")).toBe("Opted Out");
+  });
+
+  it("marks the row Bounced when a delivery failure comes back in the thread, even in dry run", () => {
+    const bounce = { from: "Mail Delivery Subsystem <mailer-daemon@googlemail.com>", date: new Date(NOW - 10 * 60_000), body: "Address not found. Your message wasn't delivered to jane@acme.com because the address couldn't be found." };
+    for (const config of [LIVE_CONFIG, { ...LIVE_CONFIG, DryRun: "TRUE" }]) {
+      const thread = new FakeThread("t1", [ours, bounce]);
+      const t = setup({ config, rows: [sentRow("t1")], threads: [thread] });
+      t.ctx.processReplies!();
+      expect(t.cell(2, "status")).toBe("Bounced");
+      expect(t.cell(2, "sendState")).toBe("BOUNCED");
+      expect(DO_NOT_CONTACT_STATUSES[String(t.cell(2, "status")).toLowerCase()]).toBe("BOUNCED");
+      expect(thread.replies).toHaveLength(0);
+    }
+  });
+
+  it("a mailer-daemon message that is not a failure is not a bounce", () => {
+    const notice = { from: "mailer-daemon@googlemail.com", date: new Date(NOW - 10 * 60_000), body: "Delay: we are still trying to deliver your message." };
+    const thread = new FakeThread("t1", [ours, notice]);
+    const t = setup({ config: LIVE_CONFIG, rows: [sentRow("t1")], threads: [thread] });
+    t.ctx.processReplies!();
+    expect(t.cell(2, "status")).toBe("Sent");
+  });
+
   it("offers 3 free slots on different working days when asked for times", () => {
     const t = run("What times do you have this week?");
     expect(t.cell(2, "status")).toBe("Replied");
@@ -442,11 +477,11 @@ describe("processReplies", () => {
 });
 
 describe("compatibility with the exporter", () => {
-  it("uses the same 8 Status values as the exporter's dropdown", () => {
+  it("uses Status values from the exporter's dropdown", () => {
     const { ctx } = setup();
     const statuses = vm.runInContext("STATUS", ctx as vm.Context) as Record<string, string>;
     expect(Object.values(statuses).sort()).toEqual(
-      ["Approved", "Meeting Booked", "Needs Rewrite", "Opted Out", "Ready for Review", "Rejected", "Replied", "Sent"],
+      ["Approved", "Bounced", "Meeting Booked", "Needs Rewrite", "Opted Out", "Ready for Review", "Rejected", "Replied", "Sent"],
     );
   });
 

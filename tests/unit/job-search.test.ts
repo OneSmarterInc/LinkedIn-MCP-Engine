@@ -184,13 +184,43 @@ describe("searchJobs", () => {
     expect(s.calls).toEqual(["research:poster", "search", "research:recruiter"]);
   });
 
-  it("lists the job with not_found when Seamless has nothing", async () => {
+  it("drops a job when Seamless has no one there, and records it so later runs skip the company", async () => {
     const { llm } = fakeLLM({ jobs: [job()] }, true);
     const s = fakeSeamless({ searchHasRow: false });
     const out = await searchJobs({ llm, now: NOW, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
-    expect(out.jobs[0]).toMatchObject({ email: null, email_source: "not_found" });
-    expect(out.total).toBe(1);
-    expect(out.with_email).toBe(0);
+    expect(out.jobs).toEqual([]);
+    expect(out.no_email).toEqual([{ company: "Acme", company_domain: "acme.com", job_title: "RPG Developer", url: "https://www.linkedin.com/jobs/view/111" }]);
+    expect(out.skipped).toContainEqual({ url: "https://www.linkedin.com/jobs/view/111", reason: "NO_EMAIL" });
+  });
+
+  it("keeps only jobs with an email, and keeps looking for them", async () => {
+    const { llm } = fakeLLM({ jobs: [
+      job({ url: "https://www.linkedin.com/jobs/view/1", company_name: "Nobody", company_domain: "nobody.com" }),
+      job({ url: "https://www.linkedin.com/jobs/view/2", company_name: "Bolt", company_domain: "bolt.com" }),
+    ] }, true);
+    const fetchFn = (async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      const reply = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status });
+      if (u.endsWith("/search/contacts")) {
+        const domain = JSON.stringify(JSON.parse(String(init?.body)));
+        return reply(domain.includes("nobody.com") ? { data: [] } : { data: [{ searchResultId: "sr-1" }] });
+      }
+      if (u.endsWith("/contacts/research")) return reply({ success: true, requestIds: ["r"] }, 202);
+      return reply({ success: true, data: [{ requestId: "r", status: "done", contact: { email: "rita@bolt.com", firstName: "Rita", lastName: "R", title: "HR" } }] });
+    }) as unknown as typeof fetch;
+    const out = await searchJobs({ llm, now: NOW, seamless: { apiKey: "k", fetchFn, poll: fast } });
+    expect(out.jobs.map((j) => j.company)).toEqual(["Bolt"]);
+    expect(out.with_email).toBe(1);
+  });
+
+  it("skips a company where Seamless found no one in an earlier run, without a lookup", async () => {
+    const { llm } = fakeLLM({ jobs: [job()] }, true);
+    const s = fakeSeamless({ recruiterEmail: "rita@acme.com" });
+    const seen = { urls: new Set<string>(), keys: new Set<string>(), runs: 0, recent: [], noEmailCompanies: new Set(["acme.com"]) };
+    const out = await searchJobs({ llm, now: NOW, seen, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    expect(out.jobs).toEqual([]);
+    expect(s.calls).toEqual([]);
+    expect(out.skipped).toContainEqual({ url: "https://www.linkedin.com/jobs/view/111", reason: "NO_EMAIL_IN_EARLIER_RUN" });
   });
 
   it("looks a company up once and reuses the answer for its other openings (no extra credits)", async () => {
@@ -209,7 +239,8 @@ describe("searchJobs", () => {
     const { llm } = fakeLLM({ jobs }, true);
     const s = fakeSeamless({ searchHasRow: false });
     const out = await searchJobs({ llm, now: NOW, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
-    expect(out.jobs.map((j) => j.email_source)).toEqual(["not_found", "not_found"]);
+    expect(out.jobs).toEqual([]);
+    expect(out.no_email).toHaveLength(2);
     expect(out.seamless_lookups_used).toBe(1);
   });
 
@@ -220,7 +251,8 @@ describe("searchJobs", () => {
     const out = await searchJobs({
       llm, now: NOW, settings: { maxSeamlessLookups: 2 }, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast },
     });
-    expect(out.jobs.map((j) => j.email_source)).toEqual(["seamless_recruiter", "seamless_recruiter", "lookup_limit"]);
+    expect(out.jobs.map((j) => j.email_source)).toEqual(["seamless_recruiter", "seamless_recruiter"]);
+    expect(out.skipped).toContainEqual({ url: "https://www.linkedin.com/jobs/view/3", reason: "LOOKUP_LIMIT" });
     expect(out.seamless_lookups_used).toBe(2);
   });
 
@@ -402,14 +434,14 @@ describe("live steps while finding emails", () => {
     const s = fakeSeamless({ searchHasRow: false });
     const msgs: string[] = [];
     await searchJobs({ llm, now: NOW, settings: { maxSearches: 1 }, onProgress: (p) => msgs.push(p.message), seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
-    expect(msgs).toContain("No email for Acme (not_found)");
+    expect(msgs).toContain("No email for Acme: skipped, looking for other jobs");
   });
 });
 
 describe("each run brings new jobs", () => {
   const seenWith = (jobs: Array<{ company: string; job_title: string; url: string }>, runs = 1) => ({
     urls: new Set(jobs.map((j) => j.url)), keys: new Set(jobs.map((j) => jobKey(j.company, j.job_title))), runs,
-    recent: jobs.map((j) => `${j.company}: ${j.job_title}`),
+    recent: jobs.map((j) => `${j.company}: ${j.job_title}`), noEmailCompanies: new Set<string>(),
   });
 
   it("skips a job an earlier search found, by URL or by company and title, before asking Seamless", async () => {
@@ -453,6 +485,36 @@ describe("each run brings new jobs", () => {
     expect([...seen.urls].sort()).toEqual(["https://www.linkedin.com/jobs/view/1", "https://www.linkedin.com/jobs/view/2"]);
     expect(seen.recent[0]).toBe("Med Inc: Nurse");
     expect((await loadSeenJobs(join(dir, "missing"))).runs).toBe(0);
+  });
+
+  it("reuses a recruiter that an earlier (even failed) search paid for, at no cost", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-known-"));
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(dir, "jobs-44444444-4444-4444-4444-444444444444.json"), JSON.stringify({
+      search_id: "jobs-44444444-4444-4444-4444-444444444444", status: "FAILED", started_at: "2026-11-03T10:00:00Z", updated_at: "", log: [],
+      jobs_so_far: [{ job_title: "Nurse", company: "Acme", company_domain: "acme.com", location: "", posted_date_unconfirmed: null, description: "",
+        url: "https://www.linkedin.com/jobs/view/7", email: "rita@acme.com", email_source: "seamless_recruiter", contact_name: "Rita R", contact_title: "HR" }],
+    }));
+    const seen = await loadSeenJobs(dir);
+    expect(seen.knownContacts?.get("acme.com")?.email).toBe("rita@acme.com");
+    const { llm } = fakeLLM({ jobs: [job()] }, true);
+    const s = fakeSeamless({ recruiterEmail: "someone@acme.com" });
+    const out = await searchJobs({ llm, now: NOW, seen, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    expect(out.jobs[0]).toMatchObject({ email: "rita@acme.com", contact_name: "Rita R" });
+    expect(out.seamless_lookups_used).toBe(0);
+    expect(s.calls).toEqual([]);
+  });
+
+  it("remembers companies with no email from earlier runs", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "jobs-noemail-"));
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(join(dir, "jobs-33333333-3333-3333-3333-333333333333.json"), JSON.stringify({
+      search_id: "jobs-33333333-3333-3333-3333-333333333333", status: "DONE", started_at: "2026-11-03T10:00:00Z", updated_at: "", log: [],
+      result: { jobs: [], no_email: [{ company: "Tiny Shop", job_title: "Clerk", url: "https://www.indeed.com/viewjob?jk=9" }] },
+    }));
+    const seen = await loadSeenJobs(dir);
+    expect(seen.noEmailCompanies.has("tinyshop")).toBe(true);
+    expect(seen.urls.has("https://www.indeed.com/viewjob?jk=9")).toBe(true);
   });
 
   it("lets a job come back when its search failed, its email was not looked up, or a check crashed", () => {

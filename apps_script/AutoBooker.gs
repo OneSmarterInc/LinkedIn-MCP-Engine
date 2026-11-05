@@ -29,12 +29,12 @@ var LAST_COL = COL.notes;
 var STATUS = {
   ready: "Ready for Review", needsRewrite: "Needs Rewrite", approved: "Approved",
   rejected: "Rejected", sent: "Sent", replied: "Replied",
-  meetingBooked: "Meeting Booked", optedOut: "Opted Out",
+  meetingBooked: "Meeting Booked", optedOut: "Opted Out", bounced: "Bounced",
 };
 
 var STATE = {
   sending: "SENDING", sent: "SENT", timesOffered: "TIMES_OFFERED",
-  needsHuman: "NEEDS_HUMAN", booked: "BOOKED", optedOut: "OPTED_OUT", sendFailed: "SEND_FAILED",
+  needsHuman: "NEEDS_HUMAN", booked: "BOOKED", optedOut: "OPTED_OUT", sendFailed: "SEND_FAILED", bounced: "BOUNCED",
 };
 
 var CONFIG_KEYS = [
@@ -168,6 +168,16 @@ function processReplies() {
       try { thread = GmailApp.getThreadById(r.threadId); } catch (e) { continue; }
       if (!thread) continue;
 
+      // A delivery failure comes back in the same thread. Mark the row Bounced so the engine never writes to
+      // this address again (it syncs Bounced rows into the ledger before every run). Sends nothing, so dry run too.
+      var bounce = bounceIn_(thread, r.lastReplyAt);
+      if (bounce) {
+        updateRow_(sheet, r, { status: STATUS.bounced, lastReplyAt: bounce.getDate(), sendState: STATE.bounced, notes: stamp_("bounced: the address does not accept mail") });
+        log_("bounced", r.email, "delivery failure in the thread");
+        SpreadsheetApp.flush();
+        continue;
+      }
+
       var reply = newestReplyFromLead_(thread, r.email, r.lastReplyAt);
       if (!reply) continue;
 
@@ -206,7 +216,7 @@ function processReplies() {
           break;
 
         default: // NEEDS_HUMAN
-          updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: stamp_("reply needs a person: " + fresh.slice(0, 200)) });
+          updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: stamp_((verdict.note === "declined" ? "said not interested (not opted out): " : "reply needs a person: ") + fresh.slice(0, 200)) });
       }
       SpreadsheetApp.flush();
     }
@@ -219,6 +229,21 @@ function processReplies() {
 // ---------------------------------------------------------------------------
 
 /** The newest message in the thread sent by the lead after the last one we handled. */
+var BOUNCE_FROM_RE = /mailer-daemon|postmaster|mail delivery (subsystem|system)/i;
+var BOUNCE_BODY_RE = /(address not found|wasn'?t delivered|could not be delivered|delivery (has )?failed|undeliverable|does ?n[o']t exist|user unknown|no such user|mailbox (is )?(unavailable|not found)|recipient address rejected)/i;
+
+/** The newest delivery-failure notice in the thread after the last message we handled, or null. */
+function bounceIn_(thread, lastHandled) {
+  var msgs = thread.getMessages();
+  var floor = lastHandled instanceof Date ? lastHandled.getTime() : 0;
+  for (var i = msgs.length - 1; i >= 0; i--) {
+    var m = msgs[i];
+    if (m.getDate().getTime() <= floor) break;
+    if (BOUNCE_FROM_RE.test(m.getFrom()) && BOUNCE_BODY_RE.test(m.getPlainBody())) return m;
+  }
+  return null;
+}
+
 function newestReplyFromLead_(thread, leadEmail, lastHandled) {
   var msgs = thread.getMessages();
   var want = leadEmail.toLowerCase();
@@ -256,7 +281,9 @@ function stripQuotedText_(text) {
   return kept.join("\n").trim();
 }
 
-var OPT_OUT_RE = /\b(unsubscribe|opt[\s-]?out|remove me|take me off|stop (emailing|contacting|messaging|sending)|do not (email|contact) me( again)?|don'?t (email|contact) me( again)?|not interested|no thank(s| you))\b/i;
+var OPT_OUT_RE = /\b(unsubscribe|opt[\s-]?out|remove me|take me off|stop (emailing|contacting|messaging|sending)|do not (email|contact) me( again)?|don'?t (email|contact) me( again)?)\b/i;
+// "Not interested" is an answer to this email, not a request to never hear from us: a person decides.
+var DECLINE_RE = /\b(not interested|no thank(s| you)|not (a )?(fit|priority)|not (looking|hiring) (right )?now|we('re| are) (all )?set|pass on this)\b/i;
 var TIMES_RE = /\b(what times?|which times?|when (are|would|will) you|when works|your availability|times? (that )?works?|send (me )?(some|a few|your) (times|slots|options)|open slots?|available (times|slots)|availability)\b/i;
 
 /** Order matters. Default is NEEDS_HUMAN, never OPT_OUT: a wrong opt-out is permanent. */
@@ -287,6 +314,7 @@ function classifyReply_(fresh, row, cfg) {
   if (!fresh) return { kind: "NEEDS_HUMAN" };
   if (AUTO_REPLY_RE.test(fresh)) return { kind: "NEEDS_HUMAN" }; // an autoresponder is not a decision
   if (OPT_OUT_RE.test(fresh)) return { kind: "OPT_OUT" };
+  if (DECLINE_RE.test(fresh)) return { kind: "NEEDS_HUMAN", note: "declined" };
   var when = parseProposedTime_(fresh, new Date(), leadZone_(row, cfg));
   if (when) {
     var sentence = sentenceWithTime_(fresh);

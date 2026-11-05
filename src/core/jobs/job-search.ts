@@ -81,6 +81,8 @@ export interface JobSearchOutput {
   seamless_lookups_used: number;
   jobs: JobView[];
   skipped: Array<{ url: string; reason: string }>;
+  /** Jobs dropped because Seamless had no one at the company. Later runs skip these companies without a lookup. */
+  no_email?: Array<{ company: string; company_domain?: string; job_title: string; url: string }>;
 }
 
 /** True when the poster "name" is just the company (e.g. "Medoja" for "Medoja Bio Private Limited"). */
@@ -204,6 +206,13 @@ export interface SeenJobs {
   runs: number;
   /** "Company: Title" for the most recent finds, named in the prompt so Gemini looks past them. */
   recent: string[];
+  /** Companies where Seamless found no one in an earlier run (domain, or the squashed name). Skipped without a lookup. */
+  noEmailCompanies: Set<string>;
+  /**
+   * Recruiter or HR contacts Seamless already found, by company (newest first). Read from every saved search,
+   * also failed and stopped ones, so the next search does not pay again for the same company.
+   */
+  knownContacts?: Map<string, { email: string; name?: string; title?: string }>;
 }
 
 const squash = (v: string) => v.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
@@ -212,8 +221,13 @@ export function jobKey(company: string, title: string): string {
   return `${squash(company)}|${squash(title)}`;
 }
 
+/** One key per company: its web domain when known, otherwise its name without spaces or punctuation. */
+export function companyKeyOf(company: string, domain?: string | null): string {
+  return domain?.trim().toLowerCase() || squash(company).replace(/ /g, "");
+}
+
 export function emptySeenJobs(): SeenJobs {
-  return { urls: new Set(), keys: new Set(), runs: 0, recent: [] };
+  return { urls: new Set(), keys: new Set(), runs: 0, recent: [], noEmailCompanies: new Set(), knownContacts: new Map() };
 }
 
 /**
@@ -243,13 +257,33 @@ export async function loadSeenJobs(dir = resolve(process.cwd(), "out", "job-sear
   let files: string[];
   try { files = (await readdir(dir)).filter((f) => f.startsWith("jobs-") && f.endsWith(".json")); } catch { return seen; }
   const found: Array<{ at: string; jobs: JobView[] }> = [];
+  const contacts: Array<{ at: string; jobs: JobView[] }> = [];
   for (const f of files) {
     try {
       const r = JSON.parse(await readFile(resolve(dir, f), "utf8")) as Partial<JobSearchRecord> & Partial<JobSearchOutput>;
       found.push({ at: r.started_at ?? r.searched_at ?? "", jobs: jobsToRemember(r) });
+      contacts.push({ at: r.started_at ?? r.searched_at ?? "", jobs: r.result?.jobs ?? r.jobs_so_far ?? r.jobs ?? [] });
+      const out = r.result ?? (r.jobs ? (r as JobSearchOutput) : undefined);
+      for (const n of out?.no_email ?? []) {
+        seen.urls.add(n.url);
+        seen.keys.add(jobKey(n.company, n.job_title));
+        seen.noEmailCompanies.add(companyKeyOf(n.company, n.company_domain));
+      }
+      // Older runs kept no-email jobs in the list.
+      for (const j of out?.jobs ?? []) if (j.email_source === "not_found") seen.noEmailCompanies.add(companyKeyOf(j.company, j.company_domain));
     } catch { /* skip unreadable */ }
   }
   seen.runs = found.length;
+  contacts.sort((a, b) => b.at.localeCompare(a.at));
+  const known = seen.knownContacts ?? new Map();
+  for (const { jobs } of contacts) {
+    for (const j of jobs) {
+      if (!j.email || j.email_source !== "seamless_recruiter") continue;
+      const k = companyKeyOf(j.company, j.company_domain);
+      if (!known.has(k)) known.set(k, { email: j.email, ...(j.contact_name ? { name: j.contact_name } : {}), ...(j.contact_title ? { title: j.contact_title } : {}) });
+    }
+  }
+  seen.knownContacts = known;
   found.sort((a, b) => b.at.localeCompare(a.at));
   for (const { jobs } of found) {
     for (const j of jobs) {
@@ -282,7 +316,8 @@ export const GEMINI_OUT_OF_CREDIT = /quota exhausted|spending cap|exceeded your 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
 
 export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> {
-  const settings = { ...JOB_SEARCH_DEFAULTS, ...deps.settings };
+  const fromEnv = Number(process.env.JOB_SEARCH_MAX_LOOKUPS);
+  const settings = { ...JOB_SEARCH_DEFAULTS, ...(fromEnv > 0 ? { maxSeamlessLookups: fromEnv } : {}), ...deps.settings };
   const now = deps.now ?? new Date();
   const window = jobWindow(now, settings.daysBack);
   const before = deps.seen ?? emptySeenJobs();
@@ -299,6 +334,10 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   let firmsSkipped = 0;
 
   const jobs: JobView[] = [];
+  const noEmail: NonNullable<JobSearchOutput["no_email"]> = [];
+  // With Seamless on, only jobs with an email are kept: one with no email cannot be drafted.
+  const emailOnly = Boolean(deps.seamless);
+  const lookupsLeft = () => !emailOnly || lookups < settings.maxSeamlessLookups;
   const skipped: JobSearchOutput["skipped"] = [];
   const seen = new Set<string>();
   let lookups = 0;
@@ -351,6 +390,10 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       apply(found, "seamless_poster", realPoster, h.poster_title?.trim());
     }
 
+    // A recruiter an earlier search already paid for: reuse it at no cost.
+    const earlier = before.knownContacts?.get(companyKeyOf(view.company, view.company_domain));
+    if (!view.email && !recruiterCache.has(ck) && earlier) recruiterCache.set(ck, earlier);
+
     if (!view.email && recruiterCache.has(ck)) {
       apply(recruiterCache.get(ck), "seamless_recruiter");
     } else if (!view.email && lookups < settings.maxSeamlessLookups) {
@@ -374,6 +417,10 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     (before.keys.size ? `, skipping ${plural(before.keys.size, "job")} found by earlier searches` : ""));
 
   for (let n = 0; n < searchesMax && jobs.length < settings.maxJobs; n++) {
+    if (!lookupsLeft()) {
+      report("searching", `Stopping: all ${settings.maxSeamlessLookups} Seamless lookups for this run are used (JOB_SEARCH_MAX_LOOKUPS in .env)`);
+      break;
+    }
     const angle = angles[n] ?? { label: `angle ${n + 1}`, kind: "pages" as const, hint: "" };
     const tag = spy ? `Search ${n + 1} of ${searchesMax} (${terms[n]!.label} on ${spy.opts.sites.join(", ")})` : `Search ${n + 1} of ${searchesMax} (${angle.label})`;
     report("searching", `${tag}...`);
@@ -434,10 +481,25 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
         email: null,
         email_source: "seamless_off",
       };
+      if (emailOnly && before.noEmailCompanies.has(companyKeyOf(view.company, view.company_domain))) {
+        skipped.push({ url, reason: "NO_EMAIL_IN_EARLIER_RUN" });
+        report("emails", `Skipped ${view.company}: Seamless found no one there in an earlier run`);
+        continue;
+      }
       await findEmail(view, h, url);
       if (skip.contact(view.contact_title)) {
         skipped.push({ url, reason: "STAFFING_OR_CONSULTING_FIRM" }); firms += 1; firmsSkipped += 1;
         report("emails", `Skipped ${view.company}: its contact is a ${view.contact_title}, which only staffing firms have`);
+        continue;
+      }
+      if (emailOnly && !view.email) {
+        if (view.email_source === "not_found") {
+          noEmail.push({ company: view.company, ...(view.company_domain ? { company_domain: view.company_domain } : {}), job_title: view.job_title, url });
+          skipped.push({ url, reason: "NO_EMAIL" });
+          report("emails", `No email for ${view.company}: skipped, looking for other jobs`);
+        } else {
+          skipped.push({ url, reason: "LOOKUP_LIMIT" });
+        }
         continue;
       }
       jobs.push(view);
@@ -462,6 +524,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     seamless_lookups_used: lookups,
     jobs,
     skipped,
+    ...(noEmail.length ? { no_email: noEmail } : {}),
   };
 }
 

@@ -9,6 +9,14 @@ Node.js        22 or newer          check: node -v
 npm            10 or newer          check: npm -v   (comes with Node)
 Git            any                  check: git --version
 Browser        Chrome / Edge / Firefox, current version
+Python         3.10 or newer        check: python --version   (only for JOB_SEARCH_SOURCE=jobspy)
+               Windows: install from python.org and tick "Add python.exe to PATH". The "python" shortcut that
+               opens the Microsoft Store is not Python.
+
+PYTHON PACKAGES  (only for JOB_SEARCH_SOURCE=jobspy)
+----------------------------------------------------
+python-jobspy                       install: pip install -U python-jobspy
+                                    check:   python -c "import jobspy"
 
 REPOSITORIES
 ------------
@@ -36,6 +44,7 @@ GOOGLE SIDE (one-time)
 NETWORK
 -------
 Outbound HTTPS: generativelanguage.googleapis.com, sheets.googleapis.com, api.seamless.ai
+                (JobSpy also: www.indeed.com, apis.indeed.com, www.linkedin.com)
 Local ports:    API 127.0.0.1:8787, dev console localhost:5173
 
 RUNTIME FOLDERS (created automatically, not committed)
