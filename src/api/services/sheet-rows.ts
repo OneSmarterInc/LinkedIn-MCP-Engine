@@ -25,6 +25,12 @@ export interface PipelineRow {
   thread_id: string;
   /** Parsed from the Research cell when the row came from a hiring signal or job post. */
   signal?: { role: string; posted?: string; url?: string };
+  /** The Status cell exactly as written in the Sheet. `status` above is what to show: "Send Error" when AutoBooker's SendState says SEND_FAILED. */
+  sheet_status: string;
+  /** AutoBooker's own columns (K-O). Empty until its first run on that row. */
+  send_state: string;
+  notes: string;
+  sent_at: string;
 }
 
 export interface QuarantineRow {
@@ -44,7 +50,15 @@ export interface QuarantineRow {
   why: string;
 }
 
-const LAST_P = colLetter(PIPELINE_HEADERS.length);
+/**
+ * AutoBooker (apps_script/AutoBooker.gs) adds these five columns after the engine's ten. They are read here so the
+ * console can show a failed send, and cleared when a person retries one. Positions match COL in AutoBooker.gs.
+ */
+export const AUTOBOOKER_HEADERS = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"] as const;
+export const SEND_FAILED = "SEND_FAILED";
+const abCol = (h: (typeof AUTOBOOKER_HEADERS)[number]) => colLetter(PIPELINE_HEADERS.length + AUTOBOOKER_HEADERS.indexOf(h) + 1);
+
+const LAST_P = colLetter(PIPELINE_HEADERS.length + AUTOBOOKER_HEADERS.length);
 const LAST_Q = colLetter(QUARANTINED_HEADERS.length);
 const col = (h: (typeof PIPELINE_HEADERS)[number]) => colLetter(PIPELINE_HEADERS.indexOf(h) + 1);
 
@@ -80,24 +94,35 @@ async function tabExists(gw: SheetsGateway, title: string): Promise<boolean> {
   return (await gw.listTabs()).some((t) => t.title === title);
 }
 
+/** What the console shows. AutoBooker leaves Status = Approved after a failed send and records the failure in SendState. */
+export function effectiveStatus(sheetStatus: string, sendState: string): string {
+  return sendState === SEND_FAILED ? STATUS.sendError : sheetStatus;
+}
+
 export async function readPipeline(gw: SheetsGateway, tabs: PipelineTab[] = PIPELINE_TABS): Promise<PipelineRow[]> {
   const out: PipelineRow[] = [];
   for (const tab of tabs) {
     if (!(await tabExists(gw, tab))) continue;
     const rows = await gw.getValues(`${tab}!A1:${LAST_P}`);
     const headers = (rows[0] ?? []).map((h) => h.trim());
-    if (headers.join("|") !== PIPELINE_HEADERS.join("|")) {
+    if (headers.slice(0, PIPELINE_HEADERS.length).join("|") !== PIPELINE_HEADERS.join("|")) {
       throw new Error(`The "${tab}" tab does not have the expected columns (${PIPELINE_HEADERS.join(", ")}).`);
     }
+    // AutoBooker's columns are found by header name, so a tab it has not touched yet (no K-O) still loads.
+    const abIndex = (h: (typeof AUTOBOOKER_HEADERS)[number]) => headers.indexOf(h, PIPELINE_HEADERS.length);
     rows.slice(1).forEach((r, i) => {
       const g = (h: (typeof PIPELINE_HEADERS)[number]) => (r[PIPELINE_HEADERS.indexOf(h)] ?? "").trim();
+      const ab = (h: (typeof AUTOBOOKER_HEADERS)[number]) => { const idx = abIndex(h); return idx === -1 ? "" : String(r[idx] ?? "").trim(); };
       if (!g("Email") && !g("Name")) return;
       const research = g("Research");
+      const sheetStatus = g("Status");
+      const sendState = ab("SendState");
       out.push({
         tab, row_number: i + 2,
         company: g("Company"), domain: g("Domain"), name: g("Name"), title: g("Title"), email: g("Email").toLowerCase(),
-        research, status: g("Status"), subject: g("Subject"), body: g("DraftBody"), thread_id: g("ThreadID"),
+        research, status: effectiveStatus(sheetStatus, sendState), subject: g("Subject"), body: g("DraftBody"), thread_id: g("ThreadID"),
         ...(parseSignal(research) ? { signal: parseSignal(research) } : {}),
+        sheet_status: sheetStatus, send_state: sendState, notes: ab("Notes"), sent_at: ab("SentAt"),
       });
     });
   }
@@ -135,8 +160,8 @@ export async function findByEmail(gw: SheetsGateway, email: string, tabs: Pipeli
 /** Status moves a human may make from the UI. Anything else belongs to AutoBooker or the engine. */
 const ALLOWED: Record<string, string[]> = {
   [STATUS.approved]: [STATUS.ready, STATUS.needsRewrite],
-  [STATUS.rejected]: [STATUS.ready, STATUS.needsRewrite, STATUS.approved],
-  [STATUS.ready]: [STATUS.approved, STATUS.rejected, STATUS.needsRewrite],
+  [STATUS.rejected]: [STATUS.ready, STATUS.needsRewrite, STATUS.approved, STATUS.sendError],
+  [STATUS.ready]: [STATUS.approved, STATUS.rejected, STATUS.needsRewrite, STATUS.sendError],
 };
 
 export async function setStatus(gw: SheetsGateway, email: string, next: string): Promise<PipelineRow> {
@@ -148,7 +173,13 @@ export async function setStatus(gw: SheetsGateway, email: string, next: string):
     throw Object.assign(new Error(`Cannot move "${row.status}" to "${next}". Allowed from: ${from.join(", ")}.`), { statusCode: 409 });
   }
   await gw.writeValues(`${row.tab}!${col("Status")}${row.row_number}`, [[next]], "raw");
-  return { ...row, status: next };
+  if (row.send_state === SEND_FAILED) {
+    // Leaving a failed send ("Retry send" or Reject): clear AutoBooker's SendState and Notes, otherwise it keeps
+    // skipping the row (it never resends a row that has a SendState) even after a fresh approval.
+    await gw.writeValues(`${row.tab}!${abCol("SendState")}${row.row_number}:${abCol("Notes")}${row.row_number}`, [["", ""]], "raw");
+    return { ...row, status: next, sheet_status: next, send_state: "", notes: "" };
+  }
+  return { ...row, status: next, sheet_status: next };
 }
 
 export async function updateDraft(gw: SheetsGateway, email: string, patch: { subject?: string; body?: string }): Promise<PipelineRow> {

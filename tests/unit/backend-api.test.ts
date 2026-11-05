@@ -146,3 +146,63 @@ describe("helpers", () => {
     expect(whyText("SOMETHING_NEW")).toBe("something new");
   });
 });
+
+describe("API: a failed send is visible and can be retried (AutoBooker columns K-O)", () => {
+  const AB = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"];
+  const H15 = [...H, ...AB];
+  const r15 = (o: Partial<Record<string, string>>) => H15.map((h) => o[h] ?? "");
+  let app: FastifyInstance; let tabs: Map<string, { rows: string[][] }>;
+  beforeAll(async () => {
+    const f = fakeSheets({
+      Jobs_Pipeline: [H15,
+        r15({ Company: "Acme", Name: "Fail Case", Email: "fail@acme.com", Status: "Approved", Subject: "s", DraftBody: "b", SendState: "SEND_FAILED", Notes: "2026-11-05 09:15 send failed: Gmail quota" }),
+        r15({ Company: "Acme", Name: "Queued", Email: "queued@acme.com", Status: "Approved", Subject: "s", DraftBody: "b" }),
+        r15({ Company: "Acme", Name: "Done", Email: "done@acme.com", Status: "Sent", Subject: "s", DraftBody: "b", ThreadID: "t9", SendState: "SENT", SentAt: "2026-11-05T09:00:00Z" }),
+      ],
+      // A tab AutoBooker has never touched: only the engine's ten columns.
+      Pipeline: [H, row({ Company: "Old", Name: "Ten Cols", Email: "ten@old.com", Status: "Ready for Review", Subject: "s", DraftBody: "b" })],
+    });
+    tabs = f.tabs;
+    app = await buildApp({ gw: () => f.gw, ledger: openLedger(":memory:"), env: {} });
+  });
+  afterAll(async () => { await app.close(); });
+
+  const get = async () => (await app.inject({ method: "GET", url: "/api/pipeline?fresh=1" })).json().rows as Array<Record<string, string>>;
+
+  it("shows Send Error for a SEND_FAILED row, keeps the Sheet status, and leaves other rows alone", async () => {
+    const rows = await get();
+    const failed = rows.find((r) => r.email === "fail@acme.com")!;
+    expect(failed).toMatchObject({ status: "Send Error", sheet_status: "Approved", send_state: "SEND_FAILED" });
+    expect(failed.notes).toContain("send failed: Gmail quota");
+    expect(rows.find((r) => r.email === "queued@acme.com")).toMatchObject({ status: "Approved", sheet_status: "Approved", send_state: "" });
+    expect(rows.find((r) => r.email === "done@acme.com")).toMatchObject({ status: "Sent", send_state: "SENT", sent_at: "2026-11-05T09:00:00Z" });
+    expect(rows.find((r) => r.email === "ten@old.com")).toMatchObject({ status: "Ready for Review", send_state: "", notes: "" }); // ten-column tab still loads
+    const summary = (await app.inject({ method: "GET", url: "/api/pipeline/summary" })).json();
+    expect(summary.by_status["Send Error"]).toBe(1);
+  });
+
+  it("a Send Error row cannot be edited or approved directly", async () => {
+    expect((await app.inject({ method: "PATCH", url: "/api/pipeline/fail@acme.com/draft", payload: { subject: "x" } })).statusCode).toBe(409);
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/approve" })).statusCode).toBe(409);
+  });
+
+  it("Retry send (reopen) returns the row to Ready for Review and clears AutoBooker's SendState and Notes", async () => {
+    const r = await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/reopen" });
+    expect(r.statusCode).toBe(200);
+    expect(r.json()).toMatchObject({ status: "Ready for Review", sheet_status: "Ready for Review", send_state: "", notes: "" });
+    const sheetRow = tabs.get("Jobs_Pipeline")!.rows[1]!;
+    expect(sheetRow[H.indexOf("Status")]).toBe("Ready for Review");
+    expect(sheetRow[H15.indexOf("SendState")]).toBe("");
+    expect(sheetRow[H15.indexOf("Notes")]).toBe("");
+    // approving again now works, and AutoBooker will treat it as a fresh row
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/approve" })).statusCode).toBe(200);
+  });
+
+  it("Reject from Send Error also clears the failure marker", async () => {
+    const sheetRow = tabs.get("Jobs_Pipeline")!.rows[1]!;
+    sheetRow[H.indexOf("Status")] = "Approved"; sheetRow[H15.indexOf("SendState")] = "SEND_FAILED"; sheetRow[H15.indexOf("Notes")] = "send failed: again";
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/reject" })).statusCode).toBe(200);
+    expect(sheetRow[H.indexOf("Status")]).toBe("Rejected");
+    expect(sheetRow[H15.indexOf("SendState")]).toBe("");
+  });
+});
