@@ -23,6 +23,16 @@ vi.mock("../../src/mcp/run-store.js", async (orig) => ({
 vi.mock("../../src/core/sourcing.js", () => ({
   sourceLeads: () => new Promise((resolve) => { finishSource = () => resolve({ provider: "csv", leads: [], skipped: [] }); }),
 }));
+// Opt-out sync: the test decides what the Sheet says, and records what reached the ledger.
+let sheetOptOuts: string[] | Error = [];
+const suppressed: string[] = [];
+vi.mock("../../src/core/optout-sync.js", () => ({
+  syncOptOuts: async (_gw: unknown, ledger: { suppress: (e: string, r: string) => void }) => {
+    if (sheetOptOuts instanceof Error) throw sheetOptOuts;
+    for (const e of sheetOptOuts) { ledger.suppress(e, "OPTED_OUT"); suppressed.push(e); }
+    return { rowsScanned: sheetOptOuts.length, added: sheetOptOuts.length, alreadyKnown: 0, addedEmails: sheetOptOuts };
+  },
+}));
 vi.mock("../../src/lib/llm/index.js", () => ({ getLLM: () => ({ name: "fake" }), geminiOptions: () => ({}) }));
 vi.mock("../../src/core/gates/index.js", () => ({ buildAsyncGates: () => ({}) }));
 vi.mock("../../src/core/verifier.js", () => ({ verifyBatch: async () => ({ passed: [], quarantined: [] }) }));
@@ -40,7 +50,7 @@ const { startSearch, startRun } = await import("../../src/api/services/engine.js
 const { acquireLock, LockHeldError } = await import("../../src/core/locks.js");
 const LOCK_DIR = await mkdtemp(join(tmpdir(), "locks-"));
 const env = { GEMINI_API_KEY: "k", GOOGLE_SHEET_ID: "s", LOCK_DIR } as NodeJS.ProcessEnv;
-const deps = { gw: () => ({}) as never, ledger: {} as never, env };
+const deps = { gw: () => ({}) as never, ledger: { suppress: () => {}, isSuppressed: () => false } as never, env };
 
 /** Ends the running search once it has reached the search step (it first reads earlier searches from disk). */
 async function endRun() {
@@ -134,5 +144,35 @@ describe("startRun: one campaign run at a time", () => {
     const ok = await startRun(deps, "Jobs", 5, false);
     expect(ok.run_id).toMatch(/^mcp-/);
     await endSource();
+  });
+});
+
+describe("startRun: opt-outs from the Sheet reach the ledger before the gates", () => {
+  async function settle() {
+    for (let i = 0; i < 200 && !finishSource; i++) await new Promise((r) => setTimeout(r, 5));
+    const f = finishSource; finishSource = undefined; f?.();
+    for (let i = 0; i < 100; i++) { await new Promise((r) => setTimeout(r, 10)); const states = [...runStore.values()] as { status: string }[]; if (states.length && states.every((st) => st.status !== "SOURCING" && st.status !== "SOURCED")) break; }
+  }
+
+  it("copies Opted Out / Bounced addresses into the ledger during a console run", async () => {
+    sheetOptOuts = ["stop@acme.com", "bounced@acme.com"]; suppressed.length = 0;
+    const { run_id } = await startRun(deps, "Jobs", 5, false);
+    await settle();
+    expect(suppressed).toEqual(["stop@acme.com", "bounced@acme.com"]);
+    expect((runStore.get(run_id) as { status: string }).status).toBe("DRAFTED");
+  });
+
+  it("stops the run with a clear message when the Sheet cannot be read", async () => {
+    sheetOptOuts = new Error("Sheet unreachable");
+    const { run_id } = await startRun(deps, "Jobs", 5, false);
+    await settle();
+    const st = runStore.get(run_id) as { status: string; error: string };
+    expect(st.status).toBe("FAILED");
+    expect(st.error).toMatch(/Could not read opt-outs from the Google Sheet, so the run was stopped: Sheet unreachable/);
+    sheetOptOuts = [];
+    // and the run lock is free again
+    const next = await startRun(deps, "Jobs", 5, false);
+    expect(next.run_id).not.toBe(run_id);
+    await settle();
   });
 });

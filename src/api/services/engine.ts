@@ -22,6 +22,7 @@ import { DEFAULT_JOBS_CAMPAIGN, attachOutreach, type JobOutreachDeps } from "../
 import { createRunId, listRuns, loadRunState, saveRunState, type McpRunState } from "../../mcp/run-store.js";
 import { viewRun } from "../../mcp/run-view.js";
 import { acquireLock, lockDir } from "../../core/locks.js";
+import { syncOptOuts } from "../../core/optout-sync.js";
 
 /**
  * The engine, as the API sees it. Every function here calls the same src/core code the MCP server and the CLI use.
@@ -153,6 +154,14 @@ async function startRunNow(deps: EngineDeps, campaign: string, limit: number, do
       const llm = getLLM(env);
       const source = await sourceLeads(cfg, { limit }, { ...(cfg.sourcing_provider === "gemini_xray" ? { search: getSearch(env, llm) } : {}) });
       await set("SOURCED", { source });
+      // Anyone marked Opted Out, Unsubscribed, Do Not Contact or Bounced in the Sheet (by AutoBooker or by hand) must be
+      // in the ledger before Gate 2 runs, the same as the CLI and the job search do. If the Sheet cannot be read, the run
+      // stops: not emailing anyone is safer than emailing someone who asked us to stop.
+      try {
+        await syncOptOuts(deps.gw(), deps.ledger);
+      } catch (err) {
+        throw new Error(`Could not read opt-outs from the Google Sheet, so the run was stopped: ${(err as Error).message}`);
+      }
       const gates = buildAsyncGates(cfg, env, llm);
       const verification = await verifyBatch(source.leads, cfg, deps.ledger, gates);
       await set("VERIFIED", { verification });
