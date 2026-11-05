@@ -85,11 +85,18 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   });
 
   const gw = () => deps.gw();
+  // Short cache in front of the Sheet. A read already in flight is shared, so the three requests the console
+  // fires on load (rows, held-back rows, counts) cause one Sheet read each, not one per request.
   const cache = new Map<string, { at: number; v: unknown }>();
+  const inflight = new Map<string, Promise<unknown>>();
   const cached = async <T,>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> => {
     const hit = cache.get(key);
     if (hit && Date.now() - hit.at < ttlMs) return hit.v as T;
-    const v = await fn(); cache.set(key, { at: Date.now(), v }); return v;
+    const pending = inflight.get(key);
+    if (pending) return pending as Promise<T>;
+    const p = fn().then((v) => { cache.set(key, { at: Date.now(), v }); return v; }).finally(() => inflight.delete(key));
+    inflight.set(key, p);
+    return p;
   };
   const bust = () => cache.clear();
 
@@ -103,8 +110,11 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const rows = await cached(`pipeline:${tabs.join()}`, 20_000, () => readPipeline(gw(), tabs));
     return { rows: q.status ? rows.filter((r) => r.status === q.status) : rows };
   });
-  app.get("/api/pipeline/left-out", async () => ({ rows: await cached("quarantine", 30_000, () => readQuarantine(gw())) }));
-  app.get("/api/pipeline/summary", async () => cached("summary", 20_000, () => summary(gw())));
+  const allRows = () => cached(`pipeline:${PIPELINE_TABS.join()}`, 20_000, () => readPipeline(gw(), PIPELINE_TABS));
+  const quarantine = () => cached("quarantine", 20_000, () => readQuarantine(gw()));
+  app.get("/api/pipeline/left-out", async () => ({ rows: await quarantine() }));
+  // Counts come from the same cached reads as the rows, so this endpoint adds no Sheet calls.
+  app.get("/api/pipeline/summary", async () => { const [rows, q] = await Promise.all([allRows(), quarantine()]); return summary(gw(), { rows, quarantine: q }); });
   app.get("/api/pipeline/:email", async (req) => findByEmail(gw(), (req.params as { email: string }).email));
 
   app.post("/api/pipeline/:email/approve", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.approved); bust(); return r; });

@@ -90,20 +90,23 @@ const WHY: Record<string, string> = {
 };
 export const whyText = (reason: string) => WHY[reason] ?? reason.replace(/_/g, " ").toLowerCase();
 
-async function tabExists(gw: SheetsGateway, title: string): Promise<boolean> {
-  return (await gw.listTabs()).some((t) => t.title === title);
-}
-
 /** What the console shows. AutoBooker leaves Status = Approved after a failed send and records the failure in SendState. */
 export function effectiveStatus(sheetStatus: string, sendState: string): string {
   return sendState === SEND_FAILED ? STATUS.sendError : sheetStatus;
 }
 
+/** The tabs that exist, asked once, then every tab read at the same time: two Google round trips, not two per tab. */
+async function readTabs(gw: SheetsGateway, tabs: readonly string[], lastCol: string): Promise<Array<{ tab: string; rows: string[][] }>> {
+  const existing = new Set((await gw.listTabs()).map((t) => t.title));
+  const present = tabs.filter((t) => existing.has(t));
+  const values = await Promise.all(present.map((t) => gw.getValues(`${t}!A1:${lastCol}`)));
+  return present.map((tab, i) => ({ tab, rows: values[i]! }));
+}
+
 export async function readPipeline(gw: SheetsGateway, tabs: PipelineTab[] = PIPELINE_TABS): Promise<PipelineRow[]> {
   const out: PipelineRow[] = [];
-  for (const tab of tabs) {
-    if (!(await tabExists(gw, tab))) continue;
-    const rows = await gw.getValues(`${tab}!A1:${LAST_P}`);
+  for (const { tab: tabName, rows } of await readTabs(gw, tabs, LAST_P)) {
+    const tab = tabName as PipelineTab;
     const headers = (rows[0] ?? []).map((h) => h.trim());
     if (headers.slice(0, PIPELINE_HEADERS.length).join("|") !== PIPELINE_HEADERS.join("|")) {
       throw Object.assign(new Error(`The "${tab}" tab does not have the expected columns (${PIPELINE_HEADERS.join(", ")}).`), { statusCode: 409 });
@@ -131,9 +134,7 @@ export async function readPipeline(gw: SheetsGateway, tabs: PipelineTab[] = PIPE
 
 export async function readQuarantine(gw: SheetsGateway, tabs: readonly string[] = QUARANTINE_TABS): Promise<QuarantineRow[]> {
   const out: QuarantineRow[] = [];
-  for (const tab of tabs) {
-    if (!(await tabExists(gw, tab))) continue;
-    const rows = await gw.getValues(`${tab}!A1:${LAST_Q}`);
+  for (const { tab, rows } of await readTabs(gw, tabs, LAST_Q)) {
     const headers = (rows[0] ?? []).map((h) => h.trim());
     if (headers.join("|") !== QUARANTINED_HEADERS.join("|")) continue;
     rows.slice(1).forEach((r, i) => {
@@ -194,9 +195,9 @@ export async function updateDraft(gw: SheetsGateway, email: string, patch: { sub
 }
 
 /** Counts by status across the given tabs, plus the quarantine total. */
-export async function summary(gw: SheetsGateway): Promise<{ by_status: Record<string, number>; quarantined: number; by_reason: Record<string, number> }> {
-  const rows = await readPipeline(gw);
-  const q = await readQuarantine(gw);
+export async function summary(gw: SheetsGateway, pre?: { rows: PipelineRow[]; quarantine: QuarantineRow[] }): Promise<{ by_status: Record<string, number>; quarantined: number; by_reason: Record<string, number> }> {
+  // The API passes rows it already holds in its cache, so the summary costs no extra Sheet reads.
+  const [rows, q] = pre ? [pre.rows, pre.quarantine] : await Promise.all([readPipeline(gw), readQuarantine(gw)]);
   const by_status: Record<string, number> = {};
   for (const r of rows) by_status[r.status] = (by_status[r.status] ?? 0) + 1;
   const by_reason: Record<string, number> = {};
