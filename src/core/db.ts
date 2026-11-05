@@ -14,6 +14,8 @@ export interface Ledger {
     status: string;
   }): void;
   suppress(email: string, reason: string): void;
+  /** When the address was first written to a pipeline tab (its draft time), and by which campaign. */
+  contactedAt?(email: string): { at: string; campaign: string } | undefined;
   close(): void;
 }
 
@@ -47,6 +49,10 @@ export function openLedger(
 
   const contacted = db.prepare(
     "SELECT 1 FROM global_contacts_ledger WHERE email = ?"
+  );
+
+  const firstSeen = db.prepare(
+    "SELECT first_seen_at AS at, campaign FROM global_contacts_ledger WHERE email = ?"
   );
 
   const suppressed = db.prepare(
@@ -86,6 +92,11 @@ export function openLedger(
         reason,
         new Date().toISOString()
       );
+    },
+
+    contactedAt: (email) => {
+      const r = firstSeen.get(email.toLowerCase()) as { at: string; campaign: string } | undefined;
+      return r ? { at: r.at, campaign: r.campaign } : undefined;
     },
 
     close: () => db.close(),
