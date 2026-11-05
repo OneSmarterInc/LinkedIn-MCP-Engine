@@ -31,6 +31,10 @@ export interface PipelineRow {
   send_state: string;
   notes: string;
   sent_at: string;
+  /** When the draft was written to the Sheet (from the ledger), ISO time. Missing for rows written before the ledger kept it. */
+  drafted_at?: string;
+  /** The campaign that wrote the row (from the ledger). */
+  campaign?: string;
 }
 
 export interface QuarantineRow {

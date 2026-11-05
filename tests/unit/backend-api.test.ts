@@ -36,7 +36,7 @@ const H = [...PIPELINE_HEADERS];
 const row = (o: Partial<Record<(typeof PIPELINE_HEADERS)[number], string>>) => H.map((h) => o[h] ?? "");
 
 describe("API", () => {
-  let app: FastifyInstance; let tabs: Map<string, { rows: string[][] }>; let stats: { reads: number };
+  let app: FastifyInstance; let ledger: ReturnType<typeof openLedger>; let tabs: Map<string, { rows: string[][] }>; let stats: { reads: number };
   beforeAll(async () => {
     const f = fakeSheets({
       Jobs_Pipeline: [H,
@@ -47,7 +47,8 @@ describe("API", () => {
       Jobs_Quarantine: [[...QUARANTINED_HEADERS], ["Miami Valley Care", "mvcare.org", "Dana Kim", "Director of Nursing", "", "Dayton, OH", "1", "MISSING_EMAIL", "Jobs", "jobs-1", "job-1"]],
     });
     tabs = f.tabs; stats = f.stats;
-    app = await buildApp({ gw: () => f.gw, ledger: openLedger(":memory:"), env: { API_TOKEN: "secret" } });
+    ledger = openLedger(":memory:");
+    app = await buildApp({ gw: () => f.gw, ledger, env: { API_TOKEN: "secret" } });
   });
   afterAll(async () => { await app.close(); });
 
@@ -57,6 +58,16 @@ describe("API", () => {
     expect((await app.inject({ method: "GET", url: "/api/health" })).statusCode).toBe(200);
     expect((await app.inject({ method: "GET", url: "/api/pipeline" })).statusCode).toBe(401);
     expect((await app.inject({ method: "GET", url: "/api/pipeline", headers: auth })).statusCode).toBe(200);
+  });
+
+  it("adds the draft time and campaign from the ledger to each row", async () => {
+    ledger.recordContact({ email: "m.lopez@buckeyelogistics.com", lead_id: "l1", full_name: "Maria Lopez", campaign: "Jobs", status: "EXPORTED" });
+    const r = (await app.inject({ method: "GET", url: "/api/pipeline?fresh=true", headers: auth })).json();
+    const maria = r.rows.find((x: { email: string }) => x.email === "m.lopez@buckeyelogistics.com");
+    expect(maria.campaign).toBe("Jobs");
+    expect(Number.isNaN(Date.parse(maria.drafted_at))).toBe(false);
+    const other = r.rows.find((x: { email: string }) => x.email === "sam@aweinteractive.com");
+    expect(other.drafted_at).toBeUndefined();
   });
 
   it("lists rows from both tabs with the hiring signal parsed", async () => {

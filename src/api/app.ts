@@ -7,7 +7,7 @@ import type { Ledger } from "../core/db.js";
 import { STATUS } from "../core/exporter.js";
 import { CampaignConfig, Mode, SourcingProvider } from "../config/schema.js";
 import { sheetCampaignStore } from "../config/store.js";
-import { readPipeline, readQuarantine, setStatus, updateDraft, summary, findByEmail, PIPELINE_TABS, type PipelineTab } from "./services/sheet-rows.js";
+import { readPipeline, readQuarantine, setStatus, updateDraft, summary, findByEmail, PIPELINE_TABS, type PipelineTab, type PipelineRow } from "./services/sheet-rows.js";
 import { readConfig, writeConfig, CONFIG_DEFAULTS } from "./services/config-tab.js";
 import * as engine from "./services/engine.js";
 
@@ -107,8 +107,13 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     const q = z.object({ tab: z.enum(["Jobs_Pipeline", "Pipeline", "all"]).default("all"), status: z.string().optional(), fresh: z.coerce.boolean().optional() }).parse(req.query);
     if (q.fresh) bust();
     const tabs = q.tab === "all" ? PIPELINE_TABS : [q.tab as PipelineTab];
-    const rows = await cached(`pipeline:${tabs.join()}`, 20_000, () => readPipeline(gw(), tabs));
+    const rows = withDraftTimes(await cached(`pipeline:${tabs.join()}`, 20_000, () => readPipeline(gw(), tabs)));
     return { rows: q.status ? rows.filter((r) => r.status === q.status) : rows };
+  });
+  // The Sheet has no draft time; the ledger records when each address was written to a pipeline tab.
+  const withDraftTimes = (rows: PipelineRow[]): PipelineRow[] => rows.map((r) => {
+    const seen = deps.ledger.contactedAt?.(r.email);
+    return seen ? { ...r, drafted_at: seen.at, campaign: seen.campaign } : r;
   });
   const allRows = () => cached(`pipeline:${PIPELINE_TABS.join()}`, 20_000, () => readPipeline(gw(), PIPELINE_TABS));
   const quarantine = () => cached("quarantine", 20_000, () => readQuarantine(gw()));
