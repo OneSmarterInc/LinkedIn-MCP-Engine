@@ -151,7 +151,8 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // ---- campaigns (the Campaigns tab) ----
   const store = () => sheetCampaignStore(gw());
   // Cached for 30 s: the Campaigns page asks for every campaign at once, and Google allows 60 Sheet reads a minute.
-  app.get("/api/campaigns", async () => ({ campaigns: await cached("campaigns", 30_000, () => store().list()) }));
+  // Each campaign comes with its settings, so the Campaigns page needs this one request (one Sheet read), not one per campaign.
+  app.get("/api/campaigns", async () => ({ campaigns: await cached("campaigns", 30_000, () => store().listDetailed()) }));
   app.get("/api/campaigns/:name", async (req) => {
     const name = decodeURIComponent((req.params as { name: string }).name);
     return cached(`campaign:${name}`, 30_000, () => store().get(name));

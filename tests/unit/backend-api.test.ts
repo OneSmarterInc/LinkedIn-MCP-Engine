@@ -117,6 +117,10 @@ describe("API", () => {
     expect(c.statusCode).toBe(200);
     const l = (await app.inject({ method: "GET", url: "/api/campaigns", headers: auth })).json();
     expect(l.campaigns.map((x: { name: string }) => x.name)).toContain("KY CFOs");
+    // The Campaigns page draws the offer, provider and cap from this one response, so each row must carry its settings.
+    const ky = l.campaigns.find((x: { name: string }) => x.name === "KY CFOs");
+    expect(ky.config).toMatchObject({ offer: "a 15-minute call about claims review", sourcing_provider: "gemini_xray", daily_send_cap: 20, decision_maker_titles: ["CFO"] });
+    expect(ky.status).toBe("OK");
     const on = await app.inject({ method: "POST", url: "/api/campaigns/KY%20CFOs/active", headers: auth, payload: { active: true } });
     expect(on.json()).toEqual({ name: "KY CFOs", active: true });
   });

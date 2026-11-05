@@ -33,9 +33,14 @@ export interface CampaignSummary {
   rowNumber: number;
 }
 
+/** A campaign row with its parsed settings, or the plain-words reason it cannot be used. */
+export interface CampaignDetail extends CampaignSummary { config?: CampaignConfig; error?: string }
+
 export interface CampaignStore {
   readonly kind: "file" | "sheet";
   list(): Promise<CampaignSummary[]>;
+  /** Every row with its settings in one read of the tab (what the console's Campaigns page shows). */
+  listDetailed(): Promise<CampaignDetail[]>;
   get(name: string): Promise<CampaignConfig>;
   /** Adds a campaign (or replaces the row with the same name). Writes Status = OK. */
   save(cfg: CampaignConfig, opts?: { active?: boolean }): Promise<CampaignSummary>;
@@ -154,6 +159,7 @@ export function fileCampaignStore(): CampaignStore {
   return {
     kind: "file",
     async list() { return []; },
+    async listDetailed() { return []; },
     async get(path) {
       const raw = JSON.parse(await readFile(path, "utf8"));
       const result = CampaignConfig.safeParse(raw);
@@ -209,10 +215,31 @@ export function sheetCampaignStore(gw: SheetsGateway): CampaignStore {
     }
   }
 
+  /**
+   * One Google call in the normal case: read the whole tab and check its header row. Only when the tab is missing
+   * (the read fails) or empty does it fall back to ensureTab(), which creates and formats the tab, then read again.
+   */
   async function readAll(): Promise<{ headers: string[]; rows: string[][] }> {
-    await ensureTab();
-    const all = await gw.getValues(`${CAMPAIGNS_TAB}!A1:${LAST}`);
+    let all: string[][];
+    try {
+      all = await gw.getValues(`${CAMPAIGNS_TAB}!A1:${LAST}`);
+    } catch (err) {
+      const exists = (await gw.listTabs()).some((t) => t.title === CAMPAIGNS_TAB);
+      if (exists) throw err; // a real failure (network, permission), not a missing tab
+      all = [];
+    }
     const headers = (all[0] ?? []).map((c) => c.trim());
+    if (headers.every((c) => c === "")) {
+      await ensureTab();
+      all = await gw.getValues(`${CAMPAIGNS_TAB}!A1:${LAST}`);
+      return { headers: (all[0] ?? []).map((c) => c.trim()), rows: all.slice(1) };
+    }
+    if (CAMPAIGN_HEADERS.some((h, i) => headers[i] !== h)) {
+      throw Object.assign(new Error(
+        `The "${CAMPAIGNS_TAB}" tab has unexpected headers. Expected: ${CAMPAIGN_HEADERS.join(", ")}. ` +
+        `Found: ${headers.join(", ")}. Fix the header row; nothing was changed.`,
+      ), { statusCode: 409 });
+    }
     return { headers, rows: all.slice(1) };
   }
 
@@ -242,15 +269,23 @@ export function sheetCampaignStore(gw: SheetsGateway): CampaignStore {
       return rows.map((r, i) => summary(rowToCampaign(headers, r), i + 2)).filter((s) => s.name);
     },
 
+    async listDetailed() {
+      const { headers, rows } = await readAll();
+      return rows.map((r, i): CampaignDetail => {
+        const p = rowToCampaign(headers, r);
+        return { ...summary(p, i + 2), ...(p.config ? { config: p.config } : {}), ...(p.error ? { error: p.error } : {}) };
+      }).filter((s) => s.name);
+    },
+
     async get(name) {
       const hit = await findRow(name);
       if (!hit) {
         const names = (await this.list()).map((s) => s.name);
-        throw new Error(`No campaign named "${name}" in the ${CAMPAIGNS_TAB} tab. Known: ${names.join(", ") || "(none)"}.`);
+        throw Object.assign(new Error(`No campaign named "${name}" in the ${CAMPAIGNS_TAB} tab. Known: ${names.join(", ") || "(none)"}.`), { statusCode: 404 });
       }
       if (hit.parse.error) {
         await writeStatus(hit.rowNumber, `ERROR: ${hit.parse.error}`);
-        throw new Error(`Campaign "${name}" is not valid: ${hit.parse.error}`);
+        throw Object.assign(new Error(`Campaign "${name}" is not valid: ${hit.parse.error}`), { statusCode: 422 });
       }
       return hit.parse.config!;
     },
