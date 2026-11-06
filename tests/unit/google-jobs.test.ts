@@ -148,3 +148,13 @@ describe("run log: posts per board", () => {
     expect(boardSummary([])).toBe("0 posts");
   });
 });
+
+describe("interleaveByBoard", () => {
+  it("takes one job from each board in turn, keeping each board's order", async () => {
+    const { interleaveByBoard } = await import("../../src/core/jobs/job-search.js");
+    const h = (board: string, t: string) => ({ job_title: t, company_name: "C", location: "", posted_date: null, description: "", url: `https://x/${t}`, poster_name: null, poster_title: null, board });
+    const hits = [h("indeed", "i1"), h("indeed", "i2"), h("indeed", "i3"), h("linkedin", "l1"), h("monster", "m1"), h("google_jobs:Dice", "g1"), h("monster", "m2")];
+    expect(interleaveByBoard(hits).map((x) => x.job_title)).toEqual(["i1", "l1", "m1", "g1", "i2", "m2", "i3"]);
+    expect(interleaveByBoard([])).toEqual([]);
+  });
+});

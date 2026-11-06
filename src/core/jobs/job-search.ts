@@ -51,6 +51,24 @@ export function boardSummary(hits: JobHit[]): string {
   const onMonster = hits.filter((h) => h.board?.startsWith("monster") || (h.boards ?? []).some((b) => /monster/i.test(b))).length;
   return `${hits.length} post${hits.length === 1 ? "" : "s"}: ${[...by.entries()].map(([k, v]) => `${k} ${v}`).join(", ")}${onMonster ? ` (on Monster ${onMonster})` : ""}`;
 }
+
+/**
+ * Mixes the boards: indeed 1, linkedin 1, monster 1, indeed 2, linkedin 2, ... Each board keeps its own order. The
+ * run takes jobs from the top until the job or lookup limit is reached, so without this the first board (Indeed)
+ * used every lookup and the other boards' jobs were never reached.
+ */
+export function interleaveByBoard(hits: JobHit[]): JobHit[] {
+  const groups = new Map<string, JobHit[]>();
+  for (const h of hits) {
+    const b = (h.board ?? "unknown").split(":")[0]!;
+    const g = groups.get(b);
+    if (g) g.push(h); else groups.set(b, [h]);
+  }
+  const lists = [...groups.values()];
+  const out: JobHit[] = [];
+  for (let i = 0; out.length < hits.length; i++) for (const l of lists) if (i < l.length) out.push(l[i]!);
+  return out;
+}
 const JobSearchResult = z.object({ jobs: z.array(JobHit) });
 
 /**
@@ -453,7 +471,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       if (spy) {
         // Ask for extra rows: jobs found by earlier runs are skipped below.
         const r = await runJobSpy(terms[n]!.term, settings.maxJobs * 3, spy.opts, spy.run);
-        hits = r.hits;
+        hits = interleaveByBoard(r.hits);
         report("searching", `${tag}: ${boardSummary(hits)}`);
         const blocked = Object.keys(r.boardErrors);
         if (blocked.length) report("searching", `${tag}: ${blocked.join(", ")} did not answer (often a rate limit); kept the other boards' jobs`);
