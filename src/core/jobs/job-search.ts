@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import type { LLMProvider } from "../../lib/llm/provider.js";
 import { logger } from "../../lib/logger.js";
-import { researchAndPoll, pickEmail, seamlessFindRecruiter, type SeamlessOptions } from "../sources/seamless-finder.js";
+import { researchAndPoll, pickEmail, seamlessFindRecruiter, findSavedContact, type LookupOutcome, type SeamlessOptions } from "../sources/seamless-finder.js";
 import type { JobOutreachResult } from "./job-outreach.js";
 import { staffingCheck, type StaffingCheck } from "./staffing.js";
 import { cleanPersonName } from "../names.js";
@@ -49,6 +49,7 @@ export type JobEmailSource =
   | "seamless_recruiter"  // Seamless found a recruiter or HR person at the company
   | "not_found"           // Seamless was asked and had nothing
   | "lookup_limit"        // the run's Seamless limit was reached
+  | "lookup_error"        // Seamless failed (HTTP error, timeout, unreadable duplicate): tried again in a later run
   | "seamless_off";       // SEAMLESS_API_KEY is empty
 
 export interface JobView {
@@ -358,6 +359,8 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   const companyKey = (v: JobView) => (v.company_domain ?? v.company.toLowerCase().replace(/[^a-z0-9]/g, ""));
   const recruiterCache = new Map<string, Found>();
   const posterCache = new Map<string, Found>();
+  // Companies where this run's lookup failed (not "no one there"): not remembered as dead ends.
+  const lookupFailed = new Set<string>();
 
   const findEmail = async (view: JobView, h: JobHit, url: string): Promise<void> => {
     if (!deps.seamless) { view.email_source = "seamless_off"; return; }
@@ -384,8 +387,12 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       lookups += 1;
       report("emails", `Finding an email for ${view.job_title} at ${view.company}: asking Seamless for ${realPoster} (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
       const body = { contacts: [{ contactName: realPoster!, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
-      const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url }));
+      let o = "error" as LookupOutcome;
+      const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url },
+        () => findSavedContact(s.apiKey, s.fetchFn ?? fetch, { domain: view.company_domain, companyName: view.company, personName: realPoster }, s.poll),
+        (x) => { o = x; }));
       const found: Found = email ? { email } : undefined;
+      if (o === "error") lookupFailed.add(ck);
       posterCache.set(pk, found);
       apply(found, "seamless_poster", realPoster, h.poster_title?.trim());
     }
@@ -399,15 +406,17 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     } else if (!view.email && lookups < settings.maxSeamlessLookups) {
       lookups += 1;
       report("emails", `Finding an email for ${view.job_title} at ${view.company}: looking for a recruiter or HR person (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
-      const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll);
+      let o = "error" as LookupOutcome;
+      const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll, (x) => { o = x; });
       const found: Found = r ? { email: r.email, ...(r.name ? { name: r.name } : {}), ...(r.title ? { title: r.title } : {}) } : undefined;
+      if (o === "error") lookupFailed.add(ck);
       recruiterCache.set(ck, found);
       apply(found, "seamless_recruiter");
     }
 
     if (!view.email) {
       const askedEverything = (pk ? posterCache.has(pk) : true) && recruiterCache.has(ck);
-      view.email_source = askedEverything ? "not_found" : "lookup_limit";
+      view.email_source = !askedEverything ? "lookup_limit" : lookupFailed.has(ck) ? "lookup_error" : "not_found";
     }
   };
 
@@ -497,6 +506,9 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
           noEmail.push({ company: view.company, ...(view.company_domain ? { company_domain: view.company_domain } : {}), job_title: view.job_title, url });
           skipped.push({ url, reason: "NO_EMAIL" });
           report("emails", `No email for ${view.company}: skipped, looking for other jobs`);
+        } else if (view.email_source === "lookup_error") {
+          skipped.push({ url, reason: "LOOKUP_ERROR" });
+          report("emails", `Seamless lookup failed for ${view.company}: skipped this run, tried again next run`);
         } else {
           skipped.push({ url, reason: "LOOKUP_LIMIT" });
         }

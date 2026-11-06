@@ -1,0 +1,510 @@
+From 4f7a81b5be898ca894c4ebb8b24360952f36ba1c Mon Sep 17 00:00:00 2001
+From: x <x>
+Date: Fri, 6 Nov 2026 07:56:16 +0000
+Subject: [PATCH] Seamless duplicate: read saved contacts; lookup errors
+ retryable
+
+---
+ .env.example                          |   2 +
+ scripts/clear-no-email.ts             |  28 ++++++
+ scripts/seamless-saved-check.ts       |  28 ++++++
+ src/core/jobs/job-search.ts           |  20 +++-
+ src/core/sources/seamless-finder.ts   | 136 ++++++++++++++++++++++++--
+ tests/unit/seamless-duplicate.test.ts | 102 +++++++++++++++++++
+ 6 files changed, 302 insertions(+), 14 deletions(-)
+ create mode 100644 scripts/clear-no-email.ts
+ create mode 100644 scripts/seamless-saved-check.ts
+ create mode 100644 tests/unit/seamless-duplicate.test.ts
+
+diff --git a/.env.example b/.env.example
+index dd0d824..b82e8d5 100644
+--- a/.env.example
++++ b/.env.example
+@@ -45,6 +45,8 @@ DRAFT_CONCURRENCY=3
+ # Email finder: none | apollo | apollo_pattern | seamless | seamless_pattern
+ # Seamless.AI key: Settings -> Public API -> API Key. 1 credit per lead looked up.
+ SEAMLESS_API_KEY=
++# Path of the saved-contacts list, read when research says "duplicate" (already saved). Leave empty for /contacts.
++SEAMLESS_SAVED_CONTACTS_PATH=
+ APOLLO_API_KEY=
+ 
+ # search_jobs -> Jobs_Pipeline: the campaign (Campaigns tab Name, or a JSON path) whose offer, sender company and
+diff --git a/scripts/clear-no-email.ts b/scripts/clear-no-email.ts
+new file mode 100644
+index 0000000..fcdce75
+--- /dev/null
++++ b/scripts/clear-no-email.ts
+@@ -0,0 +1,28 @@
++/**
++ * Forgets the "no email" companies that searches on one day recorded, so the next search looks them up again.
++ * Use after a bad day (for example Seamless "duplicate" answers that were read as "no email").
++ *   npx tsx scripts/clear-no-email.ts 2026-11-06
++ */
++import { readdir, readFile, writeFile } from "node:fs/promises";
++import { resolve } from "node:path";
++
++const day = process.argv[2];
++if (!/^\d{4}-\d{2}-\d{2}$/.test(day ?? "")) { console.error("Give a date: npx tsx scripts/clear-no-email.ts YYYY-MM-DD"); process.exit(1); }
++const dir = resolve(process.cwd(), "out", "job-searches");
++let changed = 0;
++for (const f of (await readdir(dir)).filter((x) => x.startsWith("jobs-") && x.endsWith(".json"))) {
++  const path = resolve(dir, f);
++  const r = JSON.parse(await readFile(path, "utf8"));
++  if (!String(r.started_at ?? r.searched_at ?? "").startsWith(day)) continue;
++  const out = r.result ?? (r.jobs ? r : undefined);
++  const n = out?.no_email?.length ?? 0;
++  const old = (out?.jobs ?? []).filter((j: { email_source?: string }) => j.email_source === "not_found").length
++    + (r.jobs_so_far ?? []).filter((j: { email_source?: string }) => j.email_source === "not_found").length;
++  if (!n && !old) continue;
++  if (out) out.no_email = [];
++  for (const j of [...(out?.jobs ?? []), ...(r.jobs_so_far ?? [])]) if (j.email_source === "not_found") j.email_source = "lookup_error";
++  await writeFile(path, JSON.stringify(r, null, 2));
++  console.log(`${f}: cleared ${n + old} no-email entries`);
++  changed += 1;
++}
++console.log(changed ? `Done: ${changed} search file(s) changed.` : `No search on ${day} had no-email entries.`);
+diff --git a/scripts/seamless-saved-check.ts b/scripts/seamless-saved-check.ts
+new file mode 100644
+index 0000000..b36e108
+--- /dev/null
++++ b/scripts/seamless-saved-check.ts
+@@ -0,0 +1,28 @@
++/**
++ * Checks that the backend can read your saved Seamless contacts (used when research says "duplicate").
++ * Prints counts and company names only, no emails.   npx tsx scripts/seamless-saved-check.ts [company]
++ */
++import "dotenv/config";
++
++import { clearSavedContactsCache, findSavedContact, loadSavedContacts, savedContactsPath } from "../src/core/sources/seamless-finder.js";
++
++const key = process.env.SEAMLESS_API_KEY?.trim();
++if (!key) { console.error("SEAMLESS_API_KEY is not set in .env"); process.exit(1); }
++
++clearSavedContactsCache();
++try {
++  const rows = await loadSavedContacts(key, fetch, 90);
++  const withEmail = rows.filter((r) => r.email || r.email1);
++  console.log(`OK  path ${savedContactsPath()}: ${rows.length} saved contacts in the last 90 days, ${withEmail.length} with an email`);
++  const companies = [...new Set(rows.map((r) => r.companyName ?? r.company).filter(Boolean))].slice(0, 10);
++  console.log(`    companies (first 10): ${companies.join(", ")}`);
++  const ask = process.argv[2];
++  if (ask) {
++    const c = await findSavedContact(key, fetch, { companyName: ask, titles: ["recruit", "talent", "hr", "human resources"] });
++    console.log(c ? `    ${ask}: found (${c.title ?? "no title"})` : `    ${ask}: not found in saved contacts`);
++  }
++} catch (err) {
++  console.error(`FAIL ${(err as Error).message}`);
++  console.error("If this is HTTP 404, set SEAMLESS_SAVED_CONTACTS_PATH in .env to the saved-contacts path from the Seamless API docs.");
++  process.exit(1);
++}
+diff --git a/src/core/jobs/job-search.ts b/src/core/jobs/job-search.ts
+index 427b6b1..a02051d 100644
+--- a/src/core/jobs/job-search.ts
++++ b/src/core/jobs/job-search.ts
+@@ -5,7 +5,7 @@ import { z } from "zod";
+ 
+ import type { LLMProvider } from "../../lib/llm/provider.js";
+ import { logger } from "../../lib/logger.js";
+-import { researchAndPoll, pickEmail, seamlessFindRecruiter, type SeamlessOptions } from "../sources/seamless-finder.js";
++import { researchAndPoll, pickEmail, seamlessFindRecruiter, findSavedContact, type LookupOutcome, type SeamlessOptions } from "../sources/seamless-finder.js";
+ import type { JobOutreachResult } from "./job-outreach.js";
+ import { staffingCheck, type StaffingCheck } from "./staffing.js";
+ import { cleanPersonName } from "../names.js";
+@@ -49,6 +49,7 @@ export type JobEmailSource =
+   | "seamless_recruiter"  // Seamless found a recruiter or HR person at the company
+   | "not_found"           // Seamless was asked and had nothing
+   | "lookup_limit"        // the run's Seamless limit was reached
++  | "lookup_error"        // Seamless failed (HTTP error, timeout, unreadable duplicate): tried again in a later run
+   | "seamless_off";       // SEAMLESS_API_KEY is empty
+ 
+ export interface JobView {
+@@ -358,6 +359,8 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput>
+   const companyKey = (v: JobView) => (v.company_domain ?? v.company.toLowerCase().replace(/[^a-z0-9]/g, ""));
+   const recruiterCache = new Map<string, Found>();
+   const posterCache = new Map<string, Found>();
++  // Companies where this run's lookup failed (not "no one there"): not remembered as dead ends.
++  const lookupFailed = new Set<string>();
+ 
+   const findEmail = async (view: JobView, h: JobHit, url: string): Promise<void> => {
+     if (!deps.seamless) { view.email_source = "seamless_off"; return; }
+@@ -384,8 +387,12 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput>
+       lookups += 1;
+       report("emails", `Finding an email for ${view.job_title} at ${view.company}: asking Seamless for ${realPoster} (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
+       const body = { contacts: [{ contactName: realPoster!, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
+-      const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url }));
++      let o = "error" as LookupOutcome;
++      const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url },
++        () => findSavedContact(s.apiKey, s.fetchFn ?? fetch, { domain: view.company_domain, companyName: view.company, personName: realPoster }, s.poll),
++        (x) => { o = x; }));
+       const found: Found = email ? { email } : undefined;
++      if (o === "error") lookupFailed.add(ck);
+       posterCache.set(pk, found);
+       apply(found, "seamless_poster", realPoster, h.poster_title?.trim());
+     }
+@@ -399,15 +406,17 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput>
+     } else if (!view.email && lookups < settings.maxSeamlessLookups) {
+       lookups += 1;
+       report("emails", `Finding an email for ${view.job_title} at ${view.company}: looking for a recruiter or HR person (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
+-      const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll);
++      let o = "error" as LookupOutcome;
++      const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll, (x) => { o = x; });
+       const found: Found = r ? { email: r.email, ...(r.name ? { name: r.name } : {}), ...(r.title ? { title: r.title } : {}) } : undefined;
++      if (o === "error") lookupFailed.add(ck);
+       recruiterCache.set(ck, found);
+       apply(found, "seamless_recruiter");
+     }
+ 
+     if (!view.email) {
+       const askedEverything = (pk ? posterCache.has(pk) : true) && recruiterCache.has(ck);
+-      view.email_source = askedEverything ? "not_found" : "lookup_limit";
++      view.email_source = !askedEverything ? "lookup_limit" : lookupFailed.has(ck) ? "lookup_error" : "not_found";
+     }
+   };
+ 
+@@ -497,6 +506,9 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput>
+           noEmail.push({ company: view.company, ...(view.company_domain ? { company_domain: view.company_domain } : {}), job_title: view.job_title, url });
+           skipped.push({ url, reason: "NO_EMAIL" });
+           report("emails", `No email for ${view.company}: skipped, looking for other jobs`);
++        } else if (view.email_source === "lookup_error") {
++          skipped.push({ url, reason: "LOOKUP_ERROR" });
++          report("emails", `Seamless lookup failed for ${view.company}: skipped this run, tried again next run`);
+         } else {
+           skipped.push({ url, reason: "LOOKUP_LIMIT" });
+         }
+diff --git a/src/core/sources/seamless-finder.ts b/src/core/sources/seamless-finder.ts
+index 46db61b..4749aca 100644
+--- a/src/core/sources/seamless-finder.ts
++++ b/src/core/sources/seamless-finder.ts
+@@ -18,8 +18,16 @@ export interface SeamlessOptions {
+   pollMs?: number;
+   /** Give up after this long. */
+   maxWaitMs?: number;
++  /** How far back to read already-saved contacts when research answers "duplicate". Default 365 days. */
++  savedDays?: number;
+ }
+ 
++/**
++ * What a lookup ended with: an email, a real "Seamless has no one", or a failure (HTTP error, timeout, a
++ * duplicate that could not be read back). Only "none" may be remembered as a dead end; "error" is retried later.
++ */
++export type LookupOutcome = "found" | "none" | "error";
++
+ type ResearchRow = {
+   requestId?: string;
+   status?: string;
+@@ -38,6 +46,9 @@ type ResearchRow = {
+   } | null;
+ };
+ 
++/** Research statuses that mean "this person is already saved in your Seamless account". */
++const DUPLICATE = new Set(["duplicate", "contact-already-researched", "contact already researched", "already researched"]);
++
+ const PENDING = new Set(["queued", "researching", "pending", "processing", "in progress", "in_progress"]);
+ 
+ /**
+@@ -117,7 +128,11 @@ export async function researchAndPoll(
+   fetchFn: typeof fetch = fetch,
+   opts: SeamlessOptions = {},
+   ctx: Record<string, unknown> = {},
++  /** Set when Seamless answers "duplicate": the person is already saved in this account. Returns them from there. */
++  onDuplicate?: () => Promise<ResearchContact | undefined>,
++  outcome?: (o: LookupOutcome) => void,
+ ): Promise<ResearchContact | undefined> {
++  const done = (o: LookupOutcome, c?: ResearchContact) => { outcome?.(o); return c; };
+   const pollMs = opts.pollMs ?? 3_000;
+   const maxWaitMs = opts.maxWaitMs ?? 60_000;
+   const headers = { "Content-Type": "application/json", Token: apiKey };
+@@ -131,12 +146,12 @@ export async function researchAndPoll(
+     });
+     if (!submit.ok) {
+       logger.warn({ ...ctx, status: submit.status }, "seamless submit failed");
+-      return undefined;
++      return done("error");
+     }
+     const requestId = firstRequestId(await submit.json());
+     if (!requestId) {
+       logger.warn(ctx, "seamless submit returned no requestId");
+-      return undefined;
++      return done("error");
+     }
+ 
+     const deadline = Date.now() + maxWaitMs;
+@@ -149,28 +164,37 @@ export async function researchAndPoll(
+       });
+       if (!res.ok) {
+         logger.warn({ ...ctx, status: res.status }, "seamless poll failed");
+-        return undefined;
++        return done("error");
+       }
+       const rows = pollRows(await res.json());
+       const row = rows.find((r) => r?.requestId === requestId) ?? rows[0];
+       const status = (row?.status ?? "").toLowerCase().trim();
+ 
+       if (PENDING.has(status) || status === "") continue;
++      if (DUPLICATE.has(status)) {
++        // Already researched in this Seamless account (by an earlier run, or by hand): the email is in the saved
++        // contacts. Read it from there; no new credit.
++        const saved = onDuplicate ? await onDuplicate() : undefined;
++        if (saved) { logger.info({ ...ctx }, "seamless: duplicate, read from saved contacts"); return done("found", saved); }
++        logger.warn({ ...ctx, status }, "seamless: duplicate, but the saved contact was not found");
++        return done("error");
++      }
+       if (status !== "done") {
+         logger.info({ ...ctx, status }, "seamless: no email");
+-        return undefined; // not found | missing | duplicate | error
++        return done(status === "error" ? "error" : "none"); // not found | missing -> none
+       }
+       if (row?.contact?.isDneAll) {
+         logger.info(ctx, "seamless: contact is marked Do Not Email");
+-        return undefined;
++        return done("none");
+       }
+-      return (row?.contact ?? undefined) as ResearchContact | undefined;
++      const c = (row?.contact ?? undefined) as ResearchContact | undefined;
++      return done(c ? "found" : "none", c);
+     }
+     logger.warn({ ...ctx, requestId }, "seamless research timed out");
+-    return undefined;
++    return done("error");
+   } catch (err) {
+     logger.warn({ ...ctx, err: (err as Error).message }, "seamless match error");
+-    return undefined;
++    return done("error");
+   }
+ }
+ 
+@@ -224,8 +248,11 @@ export async function seamlessFindRecruiter(
+   apiKey: string,
+   fetchFn: typeof fetch = fetch,
+   opts: SeamlessOptions = {},
++  outcome?: (o: LookupOutcome) => void,
+ ): Promise<RecruiterHit | undefined> {
+   const ctx = { company: company.name };
++  let result = "error" as LookupOutcome;
++  const report = (o: LookupOutcome) => { result = o; };
+   const filter: Record<string, unknown> = company.domain
+     ? { companyDomain: [company.domain] }
+     : { companyName: [company.name] };
+@@ -238,20 +265,109 @@ export async function seamlessFindRecruiter(
+     });
+     if (!res.ok) {
+       logger.warn({ ...ctx, status: res.status }, "seamless contact search failed");
++      outcome?.("error");
+       return undefined;
+     }
+     const id = firstSearchResultId(await res.json());
+     if (!id) {
+       logger.info(ctx, "seamless: no recruiter or HR contact found");
++      outcome?.("none");
+       return undefined;
+     }
+-    const contact = await researchAndPoll({ searchResultIds: [id] }, apiKey, fetchFn, opts, ctx);
++    const contact = await researchAndPoll({ searchResultIds: [id] }, apiKey, fetchFn, opts, ctx,
++      () => findSavedContact(apiKey, fetchFn, { domain: company.domain, companyName: company.name, titles: RECRUITER_TITLES }, opts), report);
+     const email = pickEmail(contact);
+-    if (!contact || !email) return undefined;
++    if (!contact || !email) { outcome?.(result === "found" ? "none" : result); return undefined; }
++    outcome?.("found");
+     const name = (contact.name ?? `${contact.firstName ?? ""} ${contact.lastName ?? ""}`).trim();
+     return { email, ...(name ? { name } : {}), ...(contact.title ? { title: contact.title } : {}) };
+   } catch (err) {
+     logger.warn({ ...ctx, err: (err as Error).message }, "seamless recruiter search error");
++    outcome?.("error");
++    return undefined;
++  }
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// Saved contacts. Research answers "duplicate" when the person is already in this Seamless account; the email is
++// then read from the account's saved contacts (GET /contacts, 30 days per request, newest first). Loaded once per
++// process and kept 10 minutes, so a run with several duplicates reads the list once.
++// ---------------------------------------------------------------------------------------------------------------
++
++/** Path of the saved-contacts list. SEAMLESS_SAVED_CONTACTS_PATH overrides it if Seamless moves it. */
++export const savedContactsPath = () => process.env.SEAMLESS_SAVED_CONTACTS_PATH?.trim() || "/contacts";
++
++type SavedRow = ResearchContact & {
++  companyName?: string | null; company?: string | null; companyDomain?: string | null; domain?: string | null;
++  createdAt?: string | null;
++};
++
++let savedCache: { key: string; at: number; rows: SavedRow[] } | undefined;
++const SAVED_TTL_MS = 10 * 60_000;
++const DAY_MS = 86_400_000;
++
++/** Test hook. */
++export function clearSavedContactsCache(): void { savedCache = undefined; }
++
++function rowsOf(body: unknown): SavedRow[] {
++  if (Array.isArray(body)) return body as SavedRow[];
++  const o = body as { results?: unknown; data?: unknown; contacts?: unknown } | null;
++  const inner = o?.results ?? o?.data ?? o?.contacts;
++  return Array.isArray(inner) ? (inner as SavedRow[]) : [];
++}
++
++/** Every saved contact from the last `days` days, 30-day windows, 500 a page. */
++export async function loadSavedContacts(apiKey: string, fetchFn: typeof fetch = fetch, days = 365, now = Date.now()): Promise<SavedRow[]> {
++  const key = `${apiKey.slice(-6)}|${days}`;
++  if (savedCache && savedCache.key === key && now - savedCache.at < SAVED_TTL_MS) return savedCache.rows;
++  const rows: SavedRow[] = [];
++  for (let end = now; end > now - days * DAY_MS; end -= 30 * DAY_MS) {
++    const start = Math.max(end - 30 * DAY_MS + 1000, now - days * DAY_MS);
++    for (let page = 1; page <= 20; page++) {
++      const q = new URLSearchParams({ startDate: new Date(start).toISOString(), endDate: new Date(end).toISOString(), page: String(page), limit: "500" });
++      const res = await fetchFn(`${SEAMLESS_BASE}${savedContactsPath()}?${q}`, { headers: { Token: apiKey }, signal: AbortSignal.timeout(30_000) });
++      if (!res.ok) throw new Error(`saved contacts: HTTP ${res.status}`);
++      const got = rowsOf(await res.json());
++      rows.push(...got);
++      if (got.length < 500) break;
++    }
++  }
++  savedCache = { key, at: now, rows };
++  return rows;
++}
++
++const squashName = (v?: string | null) => (v ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
++const bareDomain = (v?: string | null) => (v ?? "").toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
++
++/**
++ * The saved contact for a company (and, for a named person, that person). Prefers a recruiter or HR title when
++ * `titles` is given, then the newest. Returns undefined when nothing matches or the list cannot be read.
++ */
++export async function findSavedContact(
++  apiKey: string,
++  fetchFn: typeof fetch,
++  want: { domain?: string; companyName?: string; personName?: string; titles?: string[] },
++  opts: SeamlessOptions = {},
++): Promise<ResearchContact | undefined> {
++  let rows: SavedRow[];
++  try { rows = await loadSavedContacts(apiKey, fetchFn, opts.savedDays ?? 365); } catch (err) {
++    logger.warn({ err: (err as Error).message, path: savedContactsPath() }, "seamless: could not read saved contacts");
+     return undefined;
+   }
++  const d = bareDomain(want.domain);
++  const n = squashName(want.companyName);
++  const person = squashName(want.personName);
++  const sameCompany = (r: SavedRow) =>
++    (d && (bareDomain(r.companyDomain) === d || bareDomain(r.domain) === d || (pickEmail(r) ?? "").endsWith(`@${d}`))) ||
++    (n && (squashName(r.companyName) === n || squashName(r.company) === n));
++  const fullName = (r: SavedRow) => squashName(r.name ?? `${r.firstName ?? ""}${r.lastName ?? ""}`);
++  let hits = rows.filter((r) => sameCompany(r) && pickEmail(r) && !r.isDneAll);
++  if (person) hits = hits.filter((r) => fullName(r) === person);
++  if (!hits.length) return undefined;
++  const titled = want.titles?.length
++    ? hits.filter((r) => want.titles!.some((t) => (r.title ?? "").toLowerCase().includes(t.toLowerCase().split(" ")[0]!)))
++    : [];
++  const pool = titled.length ? titled : hits;
++  pool.sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
++  return pool[0];
+ }
+diff --git a/tests/unit/seamless-duplicate.test.ts b/tests/unit/seamless-duplicate.test.ts
+new file mode 100644
+index 0000000..482b2cd
+--- /dev/null
++++ b/tests/unit/seamless-duplicate.test.ts
+@@ -0,0 +1,102 @@
++import { beforeEach, describe, expect, it } from "vitest";
++
++import {
++  clearSavedContactsCache,
++  findSavedContact,
++  seamlessFindRecruiter,
++  type LookupOutcome,
++} from "../../src/core/sources/seamless-finder.js";
++
++/** A fake Seamless: answers by path. `saved` is the account's saved-contacts list; `pollStatus` the research status. */
++function fakeSeamless(opts: { pollStatus: string; saved?: unknown; savedStatus?: number; searchIds?: string[] }) {
++  const calls: string[] = [];
++  const fetchFn = (async (url: string | URL) => {
++    const u = String(url);
++    calls.push(u);
++    const json = (b: unknown, status = 200) => new Response(JSON.stringify(b), { status });
++    if (u.includes("/search/contacts")) return json({ data: (opts.searchIds ?? ["s-1"]).map((searchResultId) => ({ searchResultId })) });
++    if (u.endsWith("/contacts/research")) return json({ success: true, requestIds: ["req-1"] });
++    if (u.includes("/contacts/research/poll")) return json({ success: true, data: [{ requestId: "req-1", status: opts.pollStatus }] });
++    if (u.includes("/contacts?")) return json(opts.saved ?? { data: [] }, opts.savedStatus ?? 200);
++    return json({}, 404);
++  }) as typeof fetch;
++  return { fetchFn, calls };
++}
++
++const savedRows = {
++  data: [
++    { name: "Pat Buyer", title: "Purchasing Manager", companyName: "US Foods", companyDomain: "usfoods.com", email: "pat@usfoods.com", createdAt: "2026-10-01" },
++    { name: "Rae Hire", title: "Talent Acquisition Partner", companyName: "US Foods", companyDomain: "usfoods.com", email: "rae@usfoods.com", createdAt: "2026-09-01" },
++    { name: "Other", title: "Recruiter", companyName: "Grainger", email: "o@grainger.com", createdAt: "2026-10-02" },
++  ],
++};
++
++const poll = { pollMs: 0, maxWaitMs: 50, savedDays: 30 };
++
++describe("Seamless 'duplicate' research status", () => {
++  beforeEach(() => clearSavedContactsCache());
++
++  it("reads the email from saved contacts and prefers a recruiter title", async () => {
++    const { fetchFn, calls } = fakeSeamless({ pollStatus: "duplicate", saved: savedRows });
++    let o: LookupOutcome | undefined;
++    const hit = await seamlessFindRecruiter({ name: "US Foods", domain: "usfoods.com" }, "key", fetchFn, poll, (x) => { o = x; });
++    expect(hit?.email).toBe("rae@usfoods.com");
++    expect(o).toBe("found");
++    expect(calls.some((c) => c.includes("/contacts?"))).toBe(true);
++  });
++
++  it("also accepts 'contact-already-researched' and matches by company name when there is no domain", async () => {
++    const { fetchFn } = fakeSeamless({ pollStatus: "contact-already-researched", saved: savedRows });
++    const hit = await seamlessFindRecruiter({ name: "Grainger" }, "key", fetchFn, poll);
++    expect(hit?.email).toBe("o@grainger.com");
++  });
++
++  it("is an error (retry later), not 'no one there', when the saved contact cannot be found", async () => {
++    const { fetchFn } = fakeSeamless({ pollStatus: "duplicate", saved: { data: [] } });
++    let o: LookupOutcome | undefined;
++    expect(await seamlessFindRecruiter({ name: "Keen Footwear" }, "key", fetchFn, poll, (x) => { o = x; })).toBeUndefined();
++    expect(o).toBe("error");
++  });
++
++  it("is an error when the saved-contacts list cannot be read", async () => {
++    const { fetchFn } = fakeSeamless({ pollStatus: "duplicate", savedStatus: 404 });
++    let o: LookupOutcome | undefined;
++    expect(await seamlessFindRecruiter({ name: "US Foods" }, "key", fetchFn, poll, (x) => { o = x; })).toBeUndefined();
++    expect(o).toBe("error");
++  });
++
++  it("'not found' is a real 'no one there'", async () => {
++    const { fetchFn } = fakeSeamless({ pollStatus: "not found" });
++    let o: LookupOutcome | undefined;
++    await seamlessFindRecruiter({ name: "Red Bull" }, "key", fetchFn, poll, (x) => { o = x; });
++    expect(o).toBe("none");
++  });
++
++  it("no search result is 'none'", async () => {
++    const { fetchFn } = fakeSeamless({ pollStatus: "done", searchIds: [] });
++    let o: LookupOutcome | undefined;
++    await seamlessFindRecruiter({ name: "SEMS" }, "key", fetchFn, poll, (x) => { o = x; });
++    expect(o).toBe("none");
++  });
++
++  it("reads the saved list once for several duplicates (cache)", async () => {
++    const { fetchFn, calls } = fakeSeamless({ pollStatus: "duplicate", saved: savedRows });
++    await seamlessFindRecruiter({ name: "US Foods" }, "key", fetchFn, poll);
++    await seamlessFindRecruiter({ name: "Grainger" }, "key", fetchFn, poll);
++    expect(calls.filter((c) => c.includes("/contacts?")).length).toBe(1);
++  });
++
++  it("finds a named poster by person name", async () => {
++    const { fetchFn } = fakeSeamless({ pollStatus: "duplicate", saved: savedRows });
++    const c = await findSavedContact("key", fetchFn, { companyName: "US Foods", personName: "Pat Buyer" }, poll);
++    expect(c?.email).toBe("pat@usfoods.com");
++  });
++
++  it("accepts a bare array and a { results } body", async () => {
++    for (const saved of [savedRows.data, { results: savedRows.data }]) {
++      clearSavedContactsCache();
++      const { fetchFn } = fakeSeamless({ pollStatus: "duplicate", saved });
++      expect((await findSavedContact("key", fetchFn, { domain: "usfoods.com" }, poll))?.email).toBe("pat@usfoods.com");
++    }
++  });
++});
+-- 
+2.43.0
+

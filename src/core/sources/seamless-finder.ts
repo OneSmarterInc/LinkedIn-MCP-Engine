@@ -18,7 +18,15 @@ export interface SeamlessOptions {
   pollMs?: number;
   /** Give up after this long. */
   maxWaitMs?: number;
+  /** How far back to read already-saved contacts when research answers "duplicate". Default 365 days. */
+  savedDays?: number;
 }
+
+/**
+ * What a lookup ended with: an email, a real "Seamless has no one", or a failure (HTTP error, timeout, a
+ * duplicate that could not be read back). Only "none" may be remembered as a dead end; "error" is retried later.
+ */
+export type LookupOutcome = "found" | "none" | "error";
 
 type ResearchRow = {
   requestId?: string;
@@ -37,6 +45,9 @@ type ResearchRow = {
     isDneSome?: boolean | null;
   } | null;
 };
+
+/** Research statuses that mean "this person is already saved in your Seamless account". */
+const DUPLICATE = new Set(["duplicate", "contact-already-researched", "contact already researched", "already researched"]);
 
 const PENDING = new Set(["queued", "researching", "pending", "processing", "in progress", "in_progress"]);
 
@@ -117,7 +128,11 @@ export async function researchAndPoll(
   fetchFn: typeof fetch = fetch,
   opts: SeamlessOptions = {},
   ctx: Record<string, unknown> = {},
+  /** Set when Seamless answers "duplicate": the person is already saved in this account. Returns them from there. */
+  onDuplicate?: () => Promise<ResearchContact | undefined>,
+  outcome?: (o: LookupOutcome) => void,
 ): Promise<ResearchContact | undefined> {
+  const done = (o: LookupOutcome, c?: ResearchContact) => { outcome?.(o); return c; };
   const pollMs = opts.pollMs ?? 3_000;
   const maxWaitMs = opts.maxWaitMs ?? 60_000;
   const headers = { "Content-Type": "application/json", Token: apiKey };
@@ -131,12 +146,12 @@ export async function researchAndPoll(
     });
     if (!submit.ok) {
       logger.warn({ ...ctx, status: submit.status }, "seamless submit failed");
-      return undefined;
+      return done("error");
     }
     const requestId = firstRequestId(await submit.json());
     if (!requestId) {
       logger.warn(ctx, "seamless submit returned no requestId");
-      return undefined;
+      return done("error");
     }
 
     const deadline = Date.now() + maxWaitMs;
@@ -149,28 +164,37 @@ export async function researchAndPoll(
       });
       if (!res.ok) {
         logger.warn({ ...ctx, status: res.status }, "seamless poll failed");
-        return undefined;
+        return done("error");
       }
       const rows = pollRows(await res.json());
       const row = rows.find((r) => r?.requestId === requestId) ?? rows[0];
       const status = (row?.status ?? "").toLowerCase().trim();
 
       if (PENDING.has(status) || status === "") continue;
+      if (DUPLICATE.has(status)) {
+        // Already researched in this Seamless account (by an earlier run, or by hand): the email is in the saved
+        // contacts. Read it from there; no new credit.
+        const saved = onDuplicate ? await onDuplicate() : undefined;
+        if (saved) { logger.info({ ...ctx }, "seamless: duplicate, read from saved contacts"); return done("found", saved); }
+        logger.warn({ ...ctx, status }, "seamless: duplicate, but the saved contact was not found");
+        return done("error");
+      }
       if (status !== "done") {
         logger.info({ ...ctx, status }, "seamless: no email");
-        return undefined; // not found | missing | duplicate | error
+        return done(status === "error" ? "error" : "none"); // not found | missing -> none
       }
       if (row?.contact?.isDneAll) {
         logger.info(ctx, "seamless: contact is marked Do Not Email");
-        return undefined;
+        return done("none");
       }
-      return (row?.contact ?? undefined) as ResearchContact | undefined;
+      const c = (row?.contact ?? undefined) as ResearchContact | undefined;
+      return done(c ? "found" : "none", c);
     }
     logger.warn({ ...ctx, requestId }, "seamless research timed out");
-    return undefined;
+    return done("error");
   } catch (err) {
     logger.warn({ ...ctx, err: (err as Error).message }, "seamless match error");
-    return undefined;
+    return done("error");
   }
 }
 
@@ -224,8 +248,11 @@ export async function seamlessFindRecruiter(
   apiKey: string,
   fetchFn: typeof fetch = fetch,
   opts: SeamlessOptions = {},
+  outcome?: (o: LookupOutcome) => void,
 ): Promise<RecruiterHit | undefined> {
   const ctx = { company: company.name };
+  let result = "error" as LookupOutcome;
+  const report = (o: LookupOutcome) => { result = o; };
   const filter: Record<string, unknown> = company.domain
     ? { companyDomain: [company.domain] }
     : { companyName: [company.name] };
@@ -238,20 +265,109 @@ export async function seamlessFindRecruiter(
     });
     if (!res.ok) {
       logger.warn({ ...ctx, status: res.status }, "seamless contact search failed");
+      outcome?.("error");
       return undefined;
     }
     const id = firstSearchResultId(await res.json());
     if (!id) {
       logger.info(ctx, "seamless: no recruiter or HR contact found");
+      outcome?.("none");
       return undefined;
     }
-    const contact = await researchAndPoll({ searchResultIds: [id] }, apiKey, fetchFn, opts, ctx);
+    const contact = await researchAndPoll({ searchResultIds: [id] }, apiKey, fetchFn, opts, ctx,
+      () => findSavedContact(apiKey, fetchFn, { domain: company.domain, companyName: company.name, titles: RECRUITER_TITLES }, opts), report);
     const email = pickEmail(contact);
-    if (!contact || !email) return undefined;
+    if (!contact || !email) { outcome?.(result === "found" ? "none" : result); return undefined; }
+    outcome?.("found");
     const name = (contact.name ?? `${contact.firstName ?? ""} ${contact.lastName ?? ""}`).trim();
     return { email, ...(name ? { name } : {}), ...(contact.title ? { title: contact.title } : {}) };
   } catch (err) {
     logger.warn({ ...ctx, err: (err as Error).message }, "seamless recruiter search error");
+    outcome?.("error");
     return undefined;
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Saved contacts. Research answers "duplicate" when the person is already in this Seamless account; the email is
+// then read from the account's saved contacts (GET /contacts, 30 days per request, newest first). Loaded once per
+// process and kept 10 minutes, so a run with several duplicates reads the list once.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Path of the saved-contacts list. SEAMLESS_SAVED_CONTACTS_PATH overrides it if Seamless moves it. */
+export const savedContactsPath = () => process.env.SEAMLESS_SAVED_CONTACTS_PATH?.trim() || "/contacts";
+
+type SavedRow = ResearchContact & {
+  companyName?: string | null; company?: string | null; companyDomain?: string | null; domain?: string | null;
+  createdAt?: string | null;
+};
+
+let savedCache: { key: string; at: number; rows: SavedRow[] } | undefined;
+const SAVED_TTL_MS = 10 * 60_000;
+const DAY_MS = 86_400_000;
+
+/** Test hook. */
+export function clearSavedContactsCache(): void { savedCache = undefined; }
+
+function rowsOf(body: unknown): SavedRow[] {
+  if (Array.isArray(body)) return body as SavedRow[];
+  const o = body as { results?: unknown; data?: unknown; contacts?: unknown } | null;
+  const inner = o?.results ?? o?.data ?? o?.contacts;
+  return Array.isArray(inner) ? (inner as SavedRow[]) : [];
+}
+
+/** Every saved contact from the last `days` days, 30-day windows, 500 a page. */
+export async function loadSavedContacts(apiKey: string, fetchFn: typeof fetch = fetch, days = 365, now = Date.now()): Promise<SavedRow[]> {
+  const key = `${apiKey.slice(-6)}|${days}`;
+  if (savedCache && savedCache.key === key && now - savedCache.at < SAVED_TTL_MS) return savedCache.rows;
+  const rows: SavedRow[] = [];
+  for (let end = now; end > now - days * DAY_MS; end -= 30 * DAY_MS) {
+    const start = Math.max(end - 30 * DAY_MS + 1000, now - days * DAY_MS);
+    for (let page = 1; page <= 20; page++) {
+      const q = new URLSearchParams({ startDate: new Date(start).toISOString(), endDate: new Date(end).toISOString(), page: String(page), limit: "500" });
+      const res = await fetchFn(`${SEAMLESS_BASE}${savedContactsPath()}?${q}`, { headers: { Token: apiKey }, signal: AbortSignal.timeout(30_000) });
+      if (!res.ok) throw new Error(`saved contacts: HTTP ${res.status}`);
+      const got = rowsOf(await res.json());
+      rows.push(...got);
+      if (got.length < 500) break;
+    }
+  }
+  savedCache = { key, at: now, rows };
+  return rows;
+}
+
+const squashName = (v?: string | null) => (v ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const bareDomain = (v?: string | null) => (v ?? "").toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").replace(/\/.*$/, "");
+
+/**
+ * The saved contact for a company (and, for a named person, that person). Prefers a recruiter or HR title when
+ * `titles` is given, then the newest. Returns undefined when nothing matches or the list cannot be read.
+ */
+export async function findSavedContact(
+  apiKey: string,
+  fetchFn: typeof fetch,
+  want: { domain?: string; companyName?: string; personName?: string; titles?: string[] },
+  opts: SeamlessOptions = {},
+): Promise<ResearchContact | undefined> {
+  let rows: SavedRow[];
+  try { rows = await loadSavedContacts(apiKey, fetchFn, opts.savedDays ?? 365); } catch (err) {
+    logger.warn({ err: (err as Error).message, path: savedContactsPath() }, "seamless: could not read saved contacts");
+    return undefined;
+  }
+  const d = bareDomain(want.domain);
+  const n = squashName(want.companyName);
+  const person = squashName(want.personName);
+  const sameCompany = (r: SavedRow) =>
+    (d && (bareDomain(r.companyDomain) === d || bareDomain(r.domain) === d || (pickEmail(r) ?? "").endsWith(`@${d}`))) ||
+    (n && (squashName(r.companyName) === n || squashName(r.company) === n));
+  const fullName = (r: SavedRow) => squashName(r.name ?? `${r.firstName ?? ""}${r.lastName ?? ""}`);
+  let hits = rows.filter((r) => sameCompany(r) && pickEmail(r) && !r.isDneAll);
+  if (person) hits = hits.filter((r) => fullName(r) === person);
+  if (!hits.length) return undefined;
+  const titled = want.titles?.length
+    ? hits.filter((r) => want.titles!.some((t) => (r.title ?? "").toLowerCase().includes(t.toLowerCase().split(" ")[0]!)))
+    : [];
+  const pool = titled.length ? titled : hits;
+  pool.sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
+  return pool[0];
 }
