@@ -9,7 +9,7 @@ import { researchAndPoll, pickEmail, seamlessFindRecruiter, findSavedContact, co
 import type { JobOutreachResult } from "./job-outreach.js";
 import { staffingCheck, type StaffingCheck } from "./staffing.js";
 import { cleanPersonName } from "../names.js";
-import { JOBSPY_TERMS, JobSpySetupError, runJobSpy, type JobSpyOptions, type RunCommand } from "./jobspy.js";
+import { type ExtraReaders, JOBSPY_TERMS, JobSpySetupError, runJobSpy, type JobSpyOptions, type RunCommand } from "./jobspy.js";
 
 /** Fixed settings. The search_jobs tool takes no input; change these numbers here. */
 export const JOB_SEARCH_DEFAULTS = {
@@ -97,6 +97,10 @@ export interface JobView {
   /** Who the email belongs to, when Seamless found it. */
   contact_name?: string;
   contact_title?: string;
+  /** Board the post was read from: indeed, linkedin, monster, monster_apify, google_jobs. */
+  board?: string;
+  /** Every site the post is listed on, when known (Google Jobs reports them). */
+  boards?: string[];
 }
 
 export interface JobSearchOutput {
@@ -113,6 +117,12 @@ export interface JobSearchOutput {
   seamless_lookups_used: number;
   jobs: JobView[];
   skipped: Array<{ url: string; reason: string }>;
+  /** Posts each board returned across all searches of this run, before any skipping. */
+  posts_by_board?: Record<string, number>;
+  /** Of those posts, how many are on Monster (read from Monster, or listed there by Google Jobs). */
+  posts_on_monster?: number;
+  /** Skipped posts counted by reason. */
+  skipped_by_reason?: Record<string, number>;
   /** Jobs dropped because Seamless had no one at the company. Later runs skip these companies without a lookup. */
   /** Companies later runs skip: Seamless found no one, or (reason "staffing") Seamless's data shows a staffing or consulting firm. */
   no_email?: Array<{ company: string; company_domain?: string; job_title: string; url: string; reason?: "staffing" }>;
@@ -346,7 +356,7 @@ export interface JobSearchDeps {
   /** Jobs from earlier searches. They are skipped before any Seamless lookup, so they cost no credits. */
   seen?: SeenJobs;
   /** Set to find jobs with JobSpy (real listings from Indeed, LinkedIn, ...) instead of Gemini's Google Search. */
-  jobspy?: { opts: JobSpyOptions; run?: RunCommand };
+  jobspy?: { opts: JobSpyOptions; run?: RunCommand; readers?: ExtraReaders };
   /** Spots staffing and consulting firms (competitors). Defaults to the built-in list plus SKIP_COMPANIES. */
   skip?: StaffingCheck;
 }
@@ -380,6 +390,15 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
   const emailOnly = Boolean(deps.seamless);
   const lookupsLeft = () => !emailOnly || lookups < settings.maxSeamlessLookups;
   const skipped: JobSearchOutput["skipped"] = [];
+  const postsByBoard: Record<string, number> = {};
+  let postsOnMonster = 0;
+  const countBoards = (hs: JobHit[]) => {
+    for (const h of hs) {
+      const b = (h.board ?? "unknown").split(":")[0]!;
+      postsByBoard[b] = (postsByBoard[b] ?? 0) + 1;
+      if (h.board?.startsWith("monster") || (h.boards ?? []).some((x) => /monster/i.test(x))) postsOnMonster += 1;
+    }
+  };
   const seen = new Set<string>();
   let lookups = 0;
   let searches = 0;
@@ -492,8 +511,9 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     try {
       if (spy) {
         // Ask for extra rows: jobs found by earlier runs are skipped below.
-        const r = await runJobSpy(terms[n]!.term, settings.maxJobs * 3, spy.opts, spy.run);
+        const r = await runJobSpy(terms[n]!.term, settings.maxJobs * 3, spy.opts, spy.run, spy.readers ?? {});
         hits = interleaveByBoard(r.hits);
+        countBoards(hits);
         report("searching", `${tag}: ${boardSummary(hits)}`);
         const blocked = Object.keys(r.boardErrors);
         if (blocked.length) report("searching", `${tag}: ${blocked.join(", ")} did not answer (often a rate limit); kept the other boards' jobs`);
@@ -543,6 +563,8 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
         url,
         email: null,
         email_source: "seamless_off",
+        ...(h.board ? { board: h.board.split(":")[0]! } : {}),
+        ...(h.boards?.length ? { boards: h.boards } : {}),
       };
       if (emailOnly && (before.noEmailCompanies.has(companyKeyOf(view.company, view.company_domain)) || before.noEmailCompanies.has(nameKeyOf(view.company)))) {
         skipped.push({ url, reason: "NO_EMAIL_IN_EARLIER_RUN" });
@@ -604,6 +626,8 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
     seamless_lookups_used: lookups,
     jobs,
     skipped,
+    ...(Object.keys(postsByBoard).length ? { posts_by_board: postsByBoard, posts_on_monster: postsOnMonster } : {}),
+    ...(skipped.length ? { skipped_by_reason: skipped.reduce<Record<string, number>>((acc, x) => { acc[x.reason] = (acc[x.reason] ?? 0) + 1; return acc; }, {}) } : {}),
     ...(noEmail.length ? { no_email: noEmail } : {}),
   };
 }

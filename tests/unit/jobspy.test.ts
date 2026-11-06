@@ -77,6 +77,18 @@ describe("JobSpy", () => {
     expect(out.jobs[0]!.email_source).toBe("seamless_off");
   });
 
+  it("records which board each job came from and the posts per board", async () => {
+    const run: RunCommand = async (_c, args) => {
+      const first = JSON.parse(args[1]!).search_term === "software engineer";
+      return { code: 0, stdout: JSON.stringify({ jobs: first ? [row(), row({ site: "linkedin", job_url: "https://www.linkedin.com/jobs/view/77", title: "QA Lead", company: "Other Co" })] : [], errors: {} }), stderr: "" };
+    };
+    const monster = async () => ({ rows: [{ site: "monster", title: "RPG Dev", company: "Buckeye", job_url: "https://www.monster.com/job-openings/m1", date_posted: "2026-11-03" }] });
+    const out = await searchJobs({ llm: noGemini, now: new Date("2026-11-03T10:00:00Z"), settings: { maxSearches: 1 }, jobspy: { opts: { ...opts, sites: ["indeed", "linkedin", "monster"] }, run, readers: { searchMonster: monster } } });
+    expect(out.jobs.map((j) => [j.job_title, j.board])).toEqual([["Java Developer", "indeed"], ["QA Lead", "linkedin"], ["RPG Dev", "monster"]]);
+    expect(out.posts_by_board).toEqual({ indeed: 1, linkedin: 1, monster: 1 });
+    expect(out.posts_on_monster).toBe(1);
+  });
+
   it("treats the Windows Store python shortcut (exit 9009) as Python missing", async () => {
     const store: RunCommand = async () => ({ code: 9009, stdout: "", stderr: "Python was not found; run without arguments to install from the Microsoft Store" });
     await expect(runJobSpy("java", 20, opts, store)).rejects.toBeInstanceOf(JobSpySetupError);
