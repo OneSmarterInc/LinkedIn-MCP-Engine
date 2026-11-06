@@ -5,6 +5,7 @@ import { logger } from "../../lib/logger.js";
 import type { JobHit } from "./job-search.js";
 import { searchMonster as defaultSearchMonster, MonsterSetupError } from "./monster.js";
 import { searchGoogleJobs as defaultSearchGoogleJobs, GoogleJobsSetupError } from "./google-jobs.js";
+import { searchApifyMonster as defaultSearchApifyMonster, ApifyMonsterSetupError, DEFAULT_MONSTER_ACTOR } from "./apify-monster.js";
 
 /**
  * JobSpy (https://github.com/speedyapply/JobSpy) as the job finder: it reads real listings from Indeed, LinkedIn and
@@ -140,9 +141,14 @@ export class JobSpySetupError extends Error {}
 const siteName = (s: string) => s.trim().toLowerCase();
 const isMonster = (s: string) => siteName(s) === "monster";
 const isGoogleJobs = (s: string) => ["google_jobs", "googlejobs", "serpapi"].includes(siteName(s));
+const isApifyMonster = (s: string) => ["monster_apify", "apify_monster", "apify"].includes(siteName(s));
 
 /** The readers that are not JobSpy boards, injectable for tests. */
-export interface ExtraReaders { searchMonster?: typeof defaultSearchMonster; searchGoogleJobs?: typeof defaultSearchGoogleJobs }
+export interface ExtraReaders {
+  searchMonster?: typeof defaultSearchMonster;
+  searchGoogleJobs?: typeof defaultSearchGoogleJobs;
+  searchApifyMonster?: typeof defaultSearchApifyMonster;
+}
 
 /**
  * Runs one search for `term` on every board in `opts.sites`. JobSpy reads its boards through the Python script.
@@ -157,8 +163,9 @@ export async function runJobSpy(
   const readers: ExtraReaders = typeof extra === "function" ? { searchMonster: extra } : extra;
   const searchMonster = readers.searchMonster ?? defaultSearchMonster;
   const searchGoogleJobs = readers.searchGoogleJobs ?? defaultSearchGoogleJobs;
+  const searchApifyMonster = readers.searchApifyMonster ?? defaultSearchApifyMonster;
   const env = process.env;
-  const spySites = opts.sites.filter((s) => !isMonster(s) && !isGoogleJobs(s));
+  const spySites = opts.sites.filter((s) => !isMonster(s) && !isGoogleJobs(s) && !isApifyMonster(s));
   const monster = opts.sites.some(isMonster)
     ? searchMonster(term, resultsWanted, {
         location: opts.location, hoursOld: opts.hoursOld, timeoutMs: opts.timeoutMs,
@@ -174,9 +181,18 @@ export async function runJobSpy(
         ...(env.GOOGLE_JOBS_PREFER_LINK?.trim() ? { preferLink: env.GOOGLE_JOBS_PREFER_LINK.trim() } : {}),
       })
     : undefined;
+  const apify = opts.sites.some(isApifyMonster)
+    ? searchApifyMonster(term, resultsWanted, {
+        token: env.APIFY_TOKEN?.trim() ?? "", actor: env.APIFY_MONSTER_ACTOR?.trim() || DEFAULT_MONSTER_ACTOR,
+        location: opts.location, hoursOld: opts.hoursOld, timeoutMs: Math.min(opts.timeoutMs, Number(env.APIFY_MONSTER_TIMEOUT_MS) || 180_000),
+        ...(Number(env.APIFY_MONSTER_MAX) > 0 ? { maxResults: Number(env.APIFY_MONSTER_MAX) } : {}),
+      })
+    : undefined;
   const spy = spySites.length ? runJobSpyScript(term, resultsWanted, { ...opts, sites: spySites }, run) : Promise.resolve({ hits: [] as JobHit[], boardErrors: {} as Record<string, string> });
   // Let all finish before raising a setup error, so no browser or Python process is left behind.
-  const [spyResult, monsterResult, gjobsResult] = await Promise.allSettled([spy, monster ?? Promise.resolve(undefined), gjobs ?? Promise.resolve(undefined)]);
+  const [spyResult, monsterResult, gjobsResult, apifyResult] = await Promise.allSettled([
+    spy, monster ?? Promise.resolve(undefined), gjobs ?? Promise.resolve(undefined), apify ?? Promise.resolve(undefined),
+  ]);
   if (spyResult.status === "rejected") throw spyResult.reason;
   const { hits, boardErrors } = spyResult.value;
   const merge = (name: string, r: PromiseSettledResult<{ rows: JobSpyRow[]; error?: string } | undefined>, setup: new (...a: never[]) => Error) => {
@@ -191,6 +207,7 @@ export async function runJobSpy(
   };
   merge("monster", monsterResult, MonsterSetupError);
   merge("google_jobs", gjobsResult, GoogleJobsSetupError);
+  merge("monster_apify", apifyResult, ApifyMonsterSetupError);
   return { hits, boardErrors };
 }
 

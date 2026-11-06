@@ -20,6 +20,7 @@
     "gs:bundle": "tsx scripts/bundle-apps-script.ts",
     "monster:check": "tsx scripts/monster-check.ts",
     "gjobs:check": "tsx scripts/gjobs-check.ts",
+    "apify:check": "tsx scripts/apify-monster-check.ts",
     "gs:push": "npm run gs:bundle && clasp push"
   },
   "keywords": [],
