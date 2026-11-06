@@ -40,8 +40,9 @@ function job(o: Partial<JobHit> = {}): JobHit {
  * Fake Seamless. Poster lookups (contactName) find `posterEmail`; recruiter searches find `recruiterEmail`.
  * Records which endpoints were called.
  */
-function fakeSeamless(opts: { posterEmail?: string; recruiterEmail?: string; searchHasRow?: boolean } = {}) {
+function fakeSeamless(opts: { posterEmail?: string; recruiterEmail?: string; searchHasRow?: boolean; uniqueEmails?: boolean; industry?: string } = {}) {
   const calls: string[] = [];
+  let n = 0;
   let lastKind: "poster" | "recruiter" = "poster";
   const fn = vi.fn(async (url: string | URL, init?: RequestInit) => {
     const u = String(url);
@@ -57,8 +58,9 @@ function fakeSeamless(opts: { posterEmail?: string; recruiterEmail?: string; sea
       return reply({ success: true, requestIds: ["req-1"] }, 202);
     }
     if (u.includes("/contacts/research/poll")) {
-      const email = lastKind === "poster" ? opts.posterEmail : opts.recruiterEmail;
-      const contact = lastKind === "recruiter" ? { email, firstName: "Rita", lastName: "Recruit", title: "Talent Acquisition" } : { email };
+      const base = lastKind === "poster" ? opts.posterEmail : opts.recruiterEmail;
+      const email = base && opts.uniqueEmails ? base.replace("@", `${++n}@`) : base;
+      const contact = lastKind === "recruiter" ? { email, firstName: "Rita", lastName: "Recruit", title: "Talent Acquisition", ...(opts.industry ? { companyIndustry: opts.industry } : {}) } : { email };
       return reply({ success: true, data: [{ requestId: "req-1", status: email ? "done" : "not found", contact: email ? contact : null }] });
     }
     return reply({}, 404);
@@ -223,13 +225,14 @@ describe("searchJobs", () => {
     expect(out.skipped).toContainEqual({ url: "https://www.linkedin.com/jobs/view/111", reason: "NO_EMAIL_IN_EARLIER_RUN" });
   });
 
-  it("looks a company up once and reuses the answer for its other openings (no extra credits)", async () => {
+  it("looks a company up once; its other openings reuse the answer and are skipped as the same contact", async () => {
     const jobs = [1, 2, 3].map((i) => job({ url: `https://www.linkedin.com/jobs/view/${i}`, company_name: "Boston Scientific", company_domain: "bostonscientific.com" }));
     const { llm } = fakeLLM({ jobs }, true);
     const s = fakeSeamless({ recruiterEmail: "rita@bostonscientific.com" });
     const out = await searchJobs({ llm, now: NOW, settings: { maxSeamlessLookups: 10 }, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
-    expect(out.jobs.map((j) => j.email)).toEqual(["rita@bostonscientific.com", "rita@bostonscientific.com", "rita@bostonscientific.com"]);
-    expect(out.jobs.every((j) => j.email_source === "seamless_recruiter" && j.contact_name === "Rita Recruit")).toBe(true);
+    expect(out.jobs.map((j) => j.email)).toEqual(["rita@bostonscientific.com"]);
+    expect(out.jobs[0]).toMatchObject({ email_source: "seamless_recruiter", contact_name: "Rita Recruit" });
+    expect(out.skipped.filter((x) => x.reason === "SAME_CONTACT_AS_ANOTHER_JOB")).toHaveLength(2);
     expect(out.seamless_lookups_used).toBe(1);
     expect(s.calls).toEqual(["search", "research:recruiter"]);
   });
@@ -247,7 +250,7 @@ describe("searchJobs", () => {
   it("stops Seamless lookups at the limit", async () => {
     const jobs = [1, 2, 3].map((i) => job({ url: `https://www.linkedin.com/jobs/view/${i}`, company_name: `Company ${i}`, company_domain: `company${i}.com` }));
     const { llm } = fakeLLM({ jobs }, true);
-    const s = fakeSeamless({ recruiterEmail: "rita@acme.com" });
+    const s = fakeSeamless({ recruiterEmail: "rita@acme.com", uniqueEmails: true });
     const out = await searchJobs({
       llm, now: NOW, settings: { maxSeamlessLookups: 2 }, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast },
     });
@@ -331,11 +334,12 @@ describe("live progress", () => {
     const msgs = steps.map((p) => p.message);
     expect(msgs[0]).toMatch(/^Starting: up to 10 jobs/);
     expect(msgs).toContain("Search 1 of 2 (software, data and AI jobs)...");
-    expect(msgs).toContain("Search 1 of 2 (software, data and AI jobs): found 2 new jobs, 2 in total");
-    expect(msgs.filter((m) => m.startsWith("Email found for Acme"))).toHaveLength(2);
-    expect(msgs).toContain("Search 2 of 2 (hiring posts asking for a CV): found 0 new jobs, 2 in total");
-    // Both jobs are at Acme: the company is looked up once and the answer reused, so one Seamless lookup.
-    expect(msgs.at(-1)).toBe("Done: 2 jobs, 2 with email, 2 searches, 1 Seamless lookup");
+    expect(msgs).toContain("Search 1 of 2 (software, data and AI jobs): found 1 new job, 1 in total");
+    expect(msgs.filter((m) => m.startsWith("Email found for Acme"))).toHaveLength(1);
+    expect(msgs).toContain("Skipped a second Acme post: same contact as a job already kept");
+    expect(msgs).toContain("Search 2 of 2 (hiring posts asking for a CV): found 0 new jobs, 1 in total");
+    // Both jobs are at Acme: the company is looked up once, and the second post has the same contact, so one job.
+    expect(msgs.at(-1)).toBe("Done: 1 job, 1 with email, 2 searches, 1 Seamless lookup");
     // emails show up in the job list as soon as they are found
     const afterFirstEmail = steps.find((p) => p.message.startsWith("Email found"))!;
     expect(afterFirstEmail.with_email).toBe(1);
@@ -539,5 +543,52 @@ describe("each run brings new jobs", () => {
     } as unknown as LLMProvider;
     await expect(searchJobs({ llm, now: NOW })).rejects.toThrow(/out of credits or over its monthly spending cap/);
     expect(calls).toBe(1);
+  });
+});
+
+describe("company keys and Seamless company data", () => {
+  it("'WEX Inc.' and 'WEX' share one lookup; the second post is skipped as the same contact", async () => {
+    const jobs = [
+      job({ url: "https://www.linkedin.com/jobs/view/1", company_name: "WEX Inc.", company_domain: "wexinc.com" }),
+      job({ url: "https://www.linkedin.com/jobs/view/2", company_name: "WEX" }),
+    ];
+    const { llm } = fakeLLM({ jobs }, true);
+    const s = fakeSeamless({ recruiterEmail: "lisa@wexinc.com" });
+    const out = await searchJobs({ llm, now: NOW, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    expect(out.seamless_lookups_used).toBe(1);
+    expect(out.jobs).toHaveLength(1);
+  });
+  it("nameKeyOf drops The, Inc., LLC and punctuation", async () => {
+    const { nameKeyOf } = await import("../../src/core/jobs/job-search.js");
+    expect(nameKeyOf("WEX Inc.")).toBe(nameKeyOf("WEX"));
+    expect(nameKeyOf("The Kroger Co.")).toBe("kroger");
+    expect(nameKeyOf("Inc.")).toBe("inc");
+  });
+});
+
+describe("firmReason (Seamless company data)", () => {
+  it("skips staffing agencies by industry, NAICS or SIC", async () => {
+    const { firmReason } = await import("../../src/core/jobs/staffing.js");
+    expect(firmReason({ industry: "Staffing and Recruiting" })).toMatch(/staffing/);
+    expect(firmReason({ naics: "561311" })).toMatch(/NAICS/);
+    expect(firmReason({ sic: "7363" })).toMatch(/SIC/);
+  });
+  it("skips IT services only when the description says it works for clients", async () => {
+    const { firmReason } = await import("../../src/core/jobs/staffing.js");
+    expect(firmReason({ industry: "IT Services and IT Consulting", description: "We provide staff augmentation to our clients." })).toMatch(/clients/);
+    expect(firmReason({ industry: "IT Services and IT Consulting", description: "We build payment software for fleets." })).toBeUndefined();
+    expect(firmReason({ industry: "Accounting", naics: "541211" })).toBeUndefined();
+    expect(firmReason(undefined)).toBeUndefined();
+  });
+});
+
+describe("staffing firm found by Seamless company data", () => {
+  it("is skipped and saved for later runs", async () => {
+    const { llm } = fakeLLM({ jobs: [job({ company_name: "Northwind Labs", company_domain: "nw.com" })] }, true);
+    const s = fakeSeamless({ recruiterEmail: "r@nw.com", industry: "Staffing and Recruiting" });
+    const out = await searchJobs({ llm, now: NOW, seamless: { apiKey: "k", fetchFn: s.fetchFn, poll: fast } });
+    expect(out.jobs).toEqual([]);
+    expect(out.skipped.map((x) => x.reason)).toContain("STAFFING_OR_CONSULTING_FIRM");
+    expect(out.no_email?.[0]).toMatchObject({ company: "Northwind Labs", reason: "staffing" });
   });
 });

@@ -5,7 +5,7 @@ import { z } from "zod";
 
 import type { LLMProvider } from "../../lib/llm/provider.js";
 import { logger } from "../../lib/logger.js";
-import { researchAndPoll, pickEmail, seamlessFindRecruiter, findSavedContact, type LookupOutcome, type SeamlessOptions } from "../sources/seamless-finder.js";
+import { researchAndPoll, pickEmail, seamlessFindRecruiter, findSavedContact, companyInfo, type CompanyInfo, type LookupOutcome, type SeamlessOptions } from "../sources/seamless-finder.js";
 import type { JobOutreachResult } from "./job-outreach.js";
 import { staffingCheck, type StaffingCheck } from "./staffing.js";
 import { cleanPersonName } from "../names.js";
@@ -114,7 +114,8 @@ export interface JobSearchOutput {
   jobs: JobView[];
   skipped: Array<{ url: string; reason: string }>;
   /** Jobs dropped because Seamless had no one at the company. Later runs skip these companies without a lookup. */
-  no_email?: Array<{ company: string; company_domain?: string; job_title: string; url: string }>;
+  /** Companies later runs skip: Seamless found no one, or (reason "staffing") Seamless's data shows a staffing or consulting firm. */
+  no_email?: Array<{ company: string; company_domain?: string; job_title: string; url: string; reason?: "staffing" }>;
 }
 
 /** True when the poster "name" is just the company (e.g. "Medoja" for "Medoja Bio Private Limited"). */
@@ -255,7 +256,14 @@ export function jobKey(company: string, title: string): string {
 
 /** One key per company: its web domain when known, otherwise its name without spaces or punctuation. */
 export function companyKeyOf(company: string, domain?: string | null): string {
-  return domain?.trim().toLowerCase() || squash(company).replace(/ /g, "");
+  return domain?.trim().toLowerCase() || nameKeyOf(company);
+}
+
+const LEGAL = /\b(inc|incorporated|llc|l l c|ltd|limited|corp|corporation|co|company|plc|lp|llp)\b/g;
+/** The company name without "The", Inc., LLC, Co. and punctuation: "WEX Inc." and "WEX" give the same key. */
+export function nameKeyOf(company: string): string {
+  const k = squash(company).replace(/^the /, "").replace(LEGAL, "").replace(/ /g, "");
+  return k || squash(company).replace(/ /g, "");
 }
 
 export function emptySeenJobs(): SeenJobs {
@@ -300,6 +308,7 @@ export async function loadSeenJobs(dir = resolve(process.cwd(), "out", "job-sear
         seen.urls.add(n.url);
         seen.keys.add(jobKey(n.company, n.job_title));
         seen.noEmailCompanies.add(companyKeyOf(n.company, n.company_domain));
+        seen.noEmailCompanies.add(nameKeyOf(n.company));
       }
       // Older runs kept no-email jobs in the list.
       for (const j of out?.jobs ?? []) if (j.email_source === "not_found") seen.noEmailCompanies.add(companyKeyOf(j.company, j.company_domain));
@@ -386,15 +395,22 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
 
   // One Seamless answer per company (and per named poster) for the whole run. The same employer often has several
   // openings in one search; the second and third reuse the first answer and cost no credits.
-  type Found = { email: string; name?: string; title?: string } | undefined;
-  const companyKey = (v: JobView) => (v.company_domain ?? v.company.toLowerCase().replace(/[^a-z0-9]/g, ""));
+  type Found = { email: string; name?: string; title?: string; firm?: CompanyInfo } | undefined;
+  const companyKey = (v: JobView) => (v.company_domain ?? nameKeyOf(v.company));
+  // Keyed by domain and by name, so "WEX Inc." (wexinc.com) and "WEX" (no website) share one lookup.
   const recruiterCache = new Map<string, Found>();
+  const cachedRecruiter = (v: JobView): { hit: boolean; found: Found } => {
+    for (const k of [companyKey(v), nameKeyOf(v.company)]) if (recruiterCache.has(k)) return { hit: true, found: recruiterCache.get(k) };
+    return { hit: false, found: undefined };
+  };
   const posterCache = new Map<string, Found>();
   // Companies where this run's lookup failed (not "no one there"): not remembered as dead ends.
   const lookupFailed = new Set<string>();
 
-  const findEmail = async (view: JobView, h: JobHit, url: string): Promise<void> => {
-    if (!deps.seamless) { view.email_source = "seamless_off"; return; }
+  /** Finds the email and returns what Seamless says the company does (for the staffing check), when it said. */
+  const findEmail = async (view: JobView, h: JobHit, url: string): Promise<CompanyInfo | undefined> => {
+    if (!deps.seamless) { view.email_source = "seamless_off"; return undefined; }
+    let firm: CompanyInfo | undefined;
     const s = deps.seamless;
     const ck = companyKey(view);
     const poster = h.poster_name?.trim();
@@ -404,6 +420,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
 
     const apply = (found: Found, source: JobEmailSource, fallbackName?: string, fallbackTitle?: string) => {
       if (!found) return;
+      firm = found.firm;
       view.email = found.email;
       view.email_source = source;
       const name = found.name ?? fallbackName;
@@ -419,10 +436,12 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
       report("emails", `Finding an email for ${view.job_title} at ${view.company}: asking Seamless for ${realPoster} (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
       const body = { contacts: [{ contactName: realPoster!, ...(view.company_domain ? { domain: view.company_domain } : { companyName: view.company }) }] };
       let o = "error" as LookupOutcome;
-      const email = pickEmail(await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url },
+      const contact = await researchAndPoll(body, s.apiKey, s.fetchFn, s.poll, { job: url },
         () => findSavedContact(s.apiKey, s.fetchFn ?? fetch, { domain: view.company_domain, companyName: view.company, personName: realPoster }, s.poll),
-        (x) => { o = x; }));
-      const found: Found = email ? { email } : undefined;
+        (x) => { o = x; });
+      const email = pickEmail(contact);
+      const info = companyInfo(contact);
+      const found: Found = email ? { email, ...(info ? { firm: info } : {}) } : undefined;
       if (o === "error") lookupFailed.add(ck);
       posterCache.set(pk, found);
       apply(found, "seamless_poster", realPoster, h.poster_title?.trim());
@@ -430,25 +449,28 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
 
     // A recruiter an earlier search already paid for: reuse it at no cost.
     const earlier = before.knownContacts?.get(companyKeyOf(view.company, view.company_domain));
-    if (!view.email && !recruiterCache.has(ck) && earlier) recruiterCache.set(ck, earlier);
+    if (!view.email && !cachedRecruiter(view).hit && earlier) recruiterCache.set(ck, earlier);
 
-    if (!view.email && recruiterCache.has(ck)) {
-      apply(recruiterCache.get(ck), "seamless_recruiter");
+    const cached = cachedRecruiter(view);
+    if (!view.email && cached.hit) {
+      apply(cached.found, "seamless_recruiter");
     } else if (!view.email && lookups < settings.maxSeamlessLookups) {
       lookups += 1;
       report("emails", `Finding an email for ${view.job_title} at ${view.company}: looking for a recruiter or HR person (lookup ${lookups} of ${settings.maxSeamlessLookups})`);
       let o = "error" as LookupOutcome;
       const r = await seamlessFindRecruiter({ name: view.company, domain: view.company_domain }, s.apiKey, s.fetchFn, s.poll, (x) => { o = x; });
-      const found: Found = r ? { email: r.email, ...(r.name ? { name: r.name } : {}), ...(r.title ? { title: r.title } : {}) } : undefined;
+      const found: Found = r ? { email: r.email, ...(r.name ? { name: r.name } : {}), ...(r.title ? { title: r.title } : {}), ...(r.company ? { firm: r.company } : {}) } : undefined;
       if (o === "error") lookupFailed.add(ck);
       recruiterCache.set(ck, found);
+      recruiterCache.set(nameKeyOf(view.company), found);
       apply(found, "seamless_recruiter");
     }
 
     if (!view.email) {
-      const askedEverything = (pk ? posterCache.has(pk) : true) && recruiterCache.has(ck);
+      const askedEverything = (pk ? posterCache.has(pk) : true) && cachedRecruiter(view).hit;
       view.email_source = !askedEverything ? "lookup_limit" : lookupFailed.has(ck) ? "lookup_error" : "not_found";
     }
+    return firm;
   };
 
   report("starting", `Starting: up to ${settings.maxJobs} jobs from ${window.from} to ${window.to}, up to ${searchesMax} searches` +
@@ -522,12 +544,26 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
         email: null,
         email_source: "seamless_off",
       };
-      if (emailOnly && before.noEmailCompanies.has(companyKeyOf(view.company, view.company_domain))) {
+      if (emailOnly && (before.noEmailCompanies.has(companyKeyOf(view.company, view.company_domain)) || before.noEmailCompanies.has(nameKeyOf(view.company)))) {
         skipped.push({ url, reason: "NO_EMAIL_IN_EARLIER_RUN" });
         report("emails", `Skipped ${view.company}: Seamless found no one there in an earlier run`);
         continue;
       }
-      await findEmail(view, h, url);
+      const firmData = await findEmail(view, h, url);
+      const firmWhy = view.email ? skip.firm?.(firmData) : undefined;
+      if (firmWhy) {
+        // Remembered with the no-email companies, so later runs skip it before any lookup.
+        noEmail.push({ company: view.company, ...(view.company_domain ? { company_domain: view.company_domain } : {}), job_title: view.job_title, url, reason: "staffing" });
+        skipped.push({ url, reason: "STAFFING_OR_CONSULTING_FIRM" }); firms += 1; firmsSkipped += 1;
+        report("emails", `Skipped ${view.company}: Seamless lists it as ${firmWhy}`);
+        continue;
+      }
+      if (view.email && jobs.some((j) => j.email?.toLowerCase() === view.email!.toLowerCase())) {
+        // Same person for a second post: one email per person, so the first job is enough.
+        skipped.push({ url, reason: "SAME_CONTACT_AS_ANOTHER_JOB" });
+        report("emails", `Skipped a second ${view.company} post: same contact as a job already kept`);
+        continue;
+      }
       if (skip.contact(view.contact_title)) {
         skipped.push({ url, reason: "STAFFING_OR_CONSULTING_FIRM" }); firms += 1; firmsSkipped += 1;
         report("emails", `Skipped ${view.company}: its contact is a ${view.contact_title}, which only staffing firms have`);

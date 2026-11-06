@@ -31,10 +31,36 @@ const CONTACT = /\b(bench sales|us it recruit\w*|it bench|c2c)\b/i;
 
 const escape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** Industries that are always staffing or recruiting. */
+const STAFFING_INDUSTRY = /\b(staffing|recruit(ing|ment)|employment (services|agenc\w*)|human resources services|outsourcing\/offshoring)\b/i;
+/** Industries where some companies are real employers and some sell people to clients: decided by the description. */
+const SERVICES_INDUSTRY = /\b(it services|information technology (and|&) services|it consulting|management consulting|business consulting)\b/i;
+/** Description words that show a company places people with, or delivers projects for, clients. */
+const CLIENT_WORDS = /\b(staffing|staff augmentation|contract(-to-hire| to hire)|our clients|client sites?|for (our|its) clients|consultants? to|placement|talent solutions|bench|offshore development|nearshore|onsite[- ]offshore|it consulting|consulting services|implementation partner)\b/i;
+
+export interface FirmInfo { industry?: string; description?: string; naics?: string; sic?: string }
+
+/**
+ * Why Seamless's company data marks a staffing or IT consulting firm, or undefined. Checked after the lookup, so the
+ * credit is spent once; the company is then remembered and later runs skip it before any lookup.
+ */
+export function firmReason(info?: FirmInfo): string | undefined {
+  if (!info) return undefined;
+  if (info.naics?.startsWith("5613")) return `a staffing or employment agency (NAICS ${info.naics})`;
+  if (info.sic && ["7361", "7363"].includes(info.sic)) return `a staffing or employment agency (SIC ${info.sic})`;
+  if (info.industry && STAFFING_INDUSTRY.test(info.industry)) return `a staffing or recruiting firm (industry: ${info.industry})`;
+  if (info.industry && SERVICES_INDUSTRY.test(info.industry) && info.description && CLIENT_WORDS.test(info.description)) {
+    return `an IT services or consulting firm that works for clients (industry: ${info.industry})`;
+  }
+  return undefined;
+}
+
 export interface StaffingCheck {
   /** Why the company was skipped, in plain words, or undefined when it looks like a real employer. */
   reason(company: { name: string; domain?: string; text?: string }): string | undefined;
   contact(title?: string): boolean;
+  /** Seamless's company data (industry, NAICS, SIC, description), checked after the lookup. */
+  firm(info?: FirmInfo): string | undefined;
 }
 
 export function staffingCheck(env: NodeJS.ProcessEnv = process.env): StaffingCheck {
@@ -52,5 +78,6 @@ export function staffingCheck(env: NodeJS.ProcessEnv = process.env): StaffingChe
       return undefined;
     },
     contact: (title) => Boolean(title && CONTACT.test(title)),
+    firm: firmReason,
   };
 }

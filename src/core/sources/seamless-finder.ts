@@ -115,7 +115,25 @@ export type ResearchContact = NonNullable<ResearchRow["contact"]> & {
   firstName?: string | null;
   lastName?: string | null;
   title?: string | null;
+  companyIndustry?: string | null;
+  companyDescription?: string | null;
+  naicsCode?: string | number | null;
+  sicCode?: string | number | null;
 };
+
+/** What Seamless says the contact's company does: used to spot staffing and IT consulting firms after the lookup. */
+export interface CompanyInfo { industry?: string; description?: string; naics?: string; sic?: string }
+
+export function companyInfo(c?: ResearchContact | null): CompanyInfo | undefined {
+  if (!c) return undefined;
+  const s = (v: unknown) => (typeof v === "string" ? v.trim() : typeof v === "number" ? String(v) : "");
+  const info: CompanyInfo = {};
+  if (s(c.companyIndustry)) info.industry = s(c.companyIndustry);
+  if (s(c.companyDescription)) info.description = s(c.companyDescription).slice(0, 2000);
+  if (s(c.naicsCode)) info.naics = s(c.naicsCode);
+  if (s(c.sicCode)) info.sic = s(c.sicCode);
+  return Object.keys(info).length ? info : undefined;
+}
 
 /**
  * Sends one research request (1 credit) and polls until it is done.
@@ -241,6 +259,7 @@ export interface RecruiterHit {
   email: string;
   name?: string;
   title?: string;
+  company?: CompanyInfo;
 }
 
 /** First searchResultId in a POST /search/contacts reply: { data: [ { searchResultId, ... } ], supplementalData }. */
@@ -315,7 +334,8 @@ export async function seamlessFindRecruiter(
     if (!contact || !email) { outcome?.(result === "found" ? "none" : result); return undefined; }
     outcome?.("found");
     const name = (contact.name ?? `${contact.firstName ?? ""} ${contact.lastName ?? ""}`).trim();
-    return { email, ...(name ? { name } : {}), ...(contact.title ? { title: contact.title } : {}) };
+    const info = companyInfo(contact);
+    return { email, ...(name ? { name } : {}), ...(contact.title ? { title: contact.title } : {}), ...(info ? { company: info } : {}) };
   } catch (err) {
     logger.warn({ ...ctx, err: (err as Error).message }, "seamless recruiter search error");
     outcome?.("error");
