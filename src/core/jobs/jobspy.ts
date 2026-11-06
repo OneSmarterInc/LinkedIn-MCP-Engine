@@ -129,6 +129,8 @@ export function rowToHit(r: JobSpyRow): JobHit | undefined {
     ...(r.description ? { about: r.description } : {}),
     poster_name: null,
     poster_title: null,
+    ...(r.site ? { board: r.site } : {}),
+    ...(r.boards?.length ? { boards: r.boards } : {}),
   };
 }
 

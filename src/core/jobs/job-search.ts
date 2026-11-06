@@ -36,8 +36,21 @@ export const JobHit = z.object({
   poster_title: z.string().nullish(),
   /** Longer post text, used only to spot staffing firms (JobSpy fills it). */
   about: z.string().nullish(),
+  /** Where the post was read: indeed, linkedin, monster, google_jobs:<source Google names>. */
+  board: z.string().nullish(),
+  /** Every site the post is listed on (Google Jobs lists them). */
+  boards: z.array(z.string()).nullish(),
 });
 export type JobHit = z.infer<typeof JobHit>;
+
+/** "23 posts: indeed 12, linkedin 8, google_jobs 3 (on Monster 1)" for the run log. */
+export function boardSummary(hits: JobHit[]): string {
+  if (!hits.length) return "0 posts";
+  const by = new Map<string, number>();
+  for (const h of hits) { const b = (h.board ?? "unknown").split(":")[0]!; by.set(b, (by.get(b) ?? 0) + 1); }
+  const onMonster = hits.filter((h) => h.board?.startsWith("monster") || (h.boards ?? []).some((b) => /monster/i.test(b))).length;
+  return `${hits.length} post${hits.length === 1 ? "" : "s"}: ${[...by.entries()].map(([k, v]) => `${k} ${v}`).join(", ")}${onMonster ? ` (on Monster ${onMonster})` : ""}`;
+}
 const JobSearchResult = z.object({ jobs: z.array(JobHit) });
 
 /**
@@ -441,6 +454,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
         // Ask for extra rows: jobs found by earlier runs are skipped below.
         const r = await runJobSpy(terms[n]!.term, settings.maxJobs * 3, spy.opts, spy.run);
         hits = r.hits;
+        report("searching", `${tag}: ${boardSummary(hits)}`);
         const blocked = Object.keys(r.boardErrors);
         if (blocked.length) report("searching", `${tag}: ${blocked.join(", ")} did not answer (often a rate limit); kept the other boards' jobs`);
       } else {

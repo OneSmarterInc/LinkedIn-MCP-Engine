@@ -132,3 +132,19 @@ describe("google_jobs inside runJobSpy", () => {
     expect(r.hits.map((h) => h.company_name).sort()).toEqual(["GC", "MC"]);
   });
 });
+
+describe("run log: posts per board", () => {
+  it("counts by board and says how many are on Monster", async () => {
+    const { boardSummary } = await import("../../src/core/jobs/job-search.js");
+    const { rowToHit } = await import("../../src/core/jobs/jobspy.js");
+    const hits = [
+      rowToHit({ site: "indeed", title: "A", company: "C", job_url: "https://www.indeed.com/viewjob?jk=1" })!,
+      rowToHit({ site: "indeed", title: "B", company: "C", job_url: "https://www.indeed.com/viewjob?jk=2" })!,
+      rowToHit({ site: "linkedin", title: "D", company: "C", job_url: "https://www.linkedin.com/jobs/view/3" })!,
+      ...rowsFromSerp(page1, NOW).slice(0, 2).map((r) => rowToHit(r)!),
+      rowToHit({ site: "monster", title: "M", company: "C", job_url: "https://www.monster.com/job-openings/m" })!,
+    ];
+    expect(boardSummary(hits)).toBe("6 posts: indeed 2, linkedin 1, google_jobs 2, monster 1 (on Monster 2)");
+    expect(boardSummary([])).toBe("0 posts");
+  });
+});
