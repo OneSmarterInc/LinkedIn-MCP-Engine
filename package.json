@@ -18,6 +18,8 @@
     "test:contract": "vitest run --config vitest.contract.config.ts",
     "api": "tsx src/api/server.ts",
     "gs:bundle": "tsx scripts/bundle-apps-script.ts",
+    "monster:check": "tsx scripts/monster-check.ts",
+    "gjobs:check": "tsx scripts/gjobs-check.ts",
     "gs:push": "npm run gs:bundle && clasp push"
   },
   "keywords": [],
@@ -25,6 +27,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "playwright": "^1.63.0",
     "@fastify/cors": "^11.0.1",
     "@fastify/static": "^10.1.10",
     "@google/genai": "^2.31.0",
