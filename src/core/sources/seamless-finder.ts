@@ -217,7 +217,25 @@ export async function seamlessMatch(
 }
 
 /** Titles tried when a job post names no person. */
-export const RECRUITER_TITLES = ["Recruiter", "Talent Acquisition", "HR Manager", "Human Resources Manager", "HR Director"];
+export const RECRUITER_TITLES = [
+  "Recruiter", "Talent Acquisition", "Recruiting", "HR Manager", "Human Resources Manager", "HR Business Partner",
+  "HR Generalist", "HR Director", "Human Resources Director",
+];
+
+/**
+ * How good a title is to email about an open job, lower is better: recruiters and talent acquisition first, then HR
+ * managers and partners, then HR directors, then VPs, then the C-level and EVPs (they seldom answer a cold email).
+ */
+export function titleRank(title?: string | null): number {
+  const t = (title ?? "").toLowerCase();
+  if (!t) return 2.5;
+  if (/\b(chief|chro|cpo|evp|svp|executive vice president|senior vice president|(?<!vice )president)\b/.test(t)) return 4;
+  if (/\b(vp|vice president|head of)\b/.test(t)) return 3;
+  if (/\b(recruit\w*|talent acquisition|talent partner|sourcer|sourcing)\b/.test(t)) return 0;
+  if (/\b(director)\b/.test(t)) return 2;
+  if (/\b(hr|human resources|people)\b/.test(t)) return 1;
+  return 2.5;
+}
 
 export interface RecruiterHit {
   email: string;
@@ -226,6 +244,22 @@ export interface RecruiterHit {
 }
 
 /** First searchResultId in a POST /search/contacts reply: { data: [ { searchResultId, ... } ], supplementalData }. */
+/** The searchResultId with the best title (titleRank), first in Seamless's order on a tie. */
+export function bestSearchResultId(body: unknown): string | undefined {
+  const rows = Array.isArray(body) ? body : (body as { data?: unknown } | null)?.data;
+  if (!Array.isArray(rows)) return undefined;
+  let best: { id: string; rank: number } | undefined;
+  for (const r of rows as Array<Record<string, unknown>>) {
+    const raw = r?.searchResultId;
+    const id = typeof raw === "string" && raw.trim() ? raw.trim() : typeof raw === "number" ? String(raw) : undefined;
+    if (!id) continue;
+    const title = [r.title, r.jobTitle, r.currentTitle, r.position].find((v): v is string => typeof v === "string" && v.trim() !== "");
+    const rank = titleRank(title);
+    if (!best || rank < best.rank) best = { id, rank };
+  }
+  return best?.id;
+}
+
 export function firstSearchResultId(body: unknown): string | undefined {
   const rows = Array.isArray(body) ? body : (body as { data?: unknown } | null)?.data;
   if (!Array.isArray(rows)) return undefined;
@@ -239,7 +273,7 @@ export function firstSearchResultId(body: unknown): string | undefined {
 
 /**
  * Finds a recruiter or HR person at a company and their work email.
- * Step 1: POST /search/contacts (1 credit per started block of results; we ask for 1).
+ * Step 1: POST /search/contacts (1 credit per started block of 50 results; we ask for 25 and keep the best title).
  * Step 2: research that searchResultId (1 credit) and poll.
  * Returns undefined when nothing usable is found. Never throws.
  */
@@ -260,7 +294,8 @@ export async function seamlessFindRecruiter(
     const res = await fetchFn(`${SEAMLESS_BASE}/search/contacts`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Token: apiKey },
-      body: JSON.stringify({ ...filter, jobTitle: RECRUITER_TITLES, limit: 1 }),
+      // Up to 25 people for one credit (Seamless bills a started block of 50), then the best title is researched.
+      body: JSON.stringify({ ...filter, jobTitle: RECRUITER_TITLES, limit: 25 }),
       signal: AbortSignal.timeout(20_000),
     });
     if (!res.ok) {
@@ -268,7 +303,7 @@ export async function seamlessFindRecruiter(
       outcome?.("error");
       return undefined;
     }
-    const id = firstSearchResultId(await res.json());
+    const id = bestSearchResultId(await res.json());
     if (!id) {
       logger.info(ctx, "seamless: no recruiter or HR contact found");
       outcome?.("none");
@@ -364,10 +399,8 @@ export async function findSavedContact(
   let hits = rows.filter((r) => sameCompany(r) && pickEmail(r) && !r.isDneAll);
   if (person) hits = hits.filter((r) => fullName(r) === person);
   if (!hits.length) return undefined;
-  const titled = want.titles?.length
-    ? hits.filter((r) => want.titles!.some((t) => (r.title ?? "").toLowerCase().includes(t.toLowerCase().split(" ")[0]!)))
-    : [];
-  const pool = titled.length ? titled : hits;
-  pool.sort((a, b) => String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
-  return pool[0];
+  // Recruiters first (titleRank), then the newest.
+  const rank = (r: SavedRow) => (want.titles?.length ? titleRank(r.title) : 0);
+  hits.sort((a, b) => rank(a) - rank(b) || String(b.createdAt ?? "").localeCompare(String(a.createdAt ?? "")));
+  return hits[0];
 }

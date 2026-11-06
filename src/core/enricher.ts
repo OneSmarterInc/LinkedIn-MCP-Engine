@@ -47,11 +47,24 @@ export function countSentences(text: string): number {
 
 const LEGAL_SUFFIX = /[,\s]+(inc|incorporated|co|company|corp|corporation|llc|l\.l\.c|ltd|limited|plc|lp|llp|pc|pllc)\.?$/i;
 
-/** How a person would say the company name in an email: "The Kroger Co." -> "Kroger". */
+/** A name written all in capitals, in normal case: "KALMAN & COMPANY" -> "Kalman & Company". Short words (PRC, CBRE) stay. */
+function unShout(name: string): string {
+  if (!/[A-Z]{5,}/.test(name) || /[a-z]/.test(name)) return name;
+  return name.replace(/[A-Z]{5,}/g, (w) => w[0] + w.slice(1).toLowerCase());
+}
+
+/**
+ * How a person would say the company name in an email: "The Kroger Co." -> "Kroger".
+ * A suffix is not removed when that would leave a name ending in "&" or "and" ("Kalman & Company, Inc." -> "Kalman & Company").
+ */
 export function shortCompanyName(company: string): string {
-  let name = company.trim().replace(/^the\s+/i, "");
-  for (let i = 0; i < 2; i++) name = name.replace(LEGAL_SUFFIX, "").trim();
-  return name || company.trim();
+  let name = unShout(company.trim()).replace(/^the\s+/i, "");
+  for (let i = 0; i < 2; i++) {
+    const next = name.replace(LEGAL_SUFFIX, "").trim();
+    if (/(&|\band)$/i.test(next)) break;
+    name = next;
+  }
+  return name.replace(/[,\s]+$/, "") || company.trim();
 }
 
 /** First meaningful word of a company name: "The Kroger Co." -> "kroger". */

@@ -298,11 +298,11 @@ describe("Seamless recruiter search", () => {
     expect(firstSearchResultId({ data: [] })).toBeUndefined();
     expect(firstSearchResultId(null)).toBeUndefined();
   });
-  it("searches by company domain with recruiter titles and limit 1", async () => {
+  it("searches by company domain with recruiter titles and limit 25", async () => {
     const s = fakeSeamless({ recruiterEmail: "rita@acme.com" });
     await seamlessFindRecruiter({ name: "Acme", domain: "acme.com" }, "k", s.fetchFn, fast);
     const body = JSON.parse(String((s.fetchFn as unknown as ReturnType<typeof vi.fn>).mock.calls[0]![1].body));
-    expect(body).toMatchObject({ companyDomain: ["acme.com"], limit: 1 });
+    expect(body).toMatchObject({ companyDomain: ["acme.com"], limit: 25 });
     expect(body.jobTitle).toContain("Recruiter");
   });
   it("returns undefined on a failed search, and does not throw", async () => {
