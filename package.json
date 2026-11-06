@@ -28,6 +28,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "nodemailer": "^7.0.6",
     "playwright": "^1.63.0",
     "@fastify/cors": "^11.0.1",
     "@fastify/static": "^10.1.10",
@@ -46,6 +47,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@types/nodemailer": "^7.0.2",
     "@commitlint/cli": "^21.2.4",
     "@commitlint/config-conventional": "^21.2.4",
     "@types/better-sqlite3": "^9.6.0",

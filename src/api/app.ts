@@ -10,6 +10,10 @@ import { sheetCampaignStore } from "../config/store.js";
 import { readPipeline, readQuarantine, setStatus, updateDraft, summary, findByEmail, PIPELINE_TABS, type PipelineTab, type PipelineRow } from "./services/sheet-rows.js";
 import { readConfig, writeConfig, CONFIG_DEFAULTS } from "./services/config-tab.js";
 import * as engine from "./services/engine.js";
+import { resolve } from "node:path";
+import { AuthStore } from "./auth/store.js";
+import { registerAuth } from "./auth/routes.js";
+import { mailSettings, smtpSender, type SendMail } from "./auth/mail.js";
 
 /**
  * The HTTP API the React frontend talks to. Every route is a thin wrapper over src/api/services, which in turn
@@ -22,6 +26,10 @@ export interface AppDeps {
   gw: () => SheetsGateway;
   ledger: Ledger;
   env?: NodeJS.ProcessEnv;
+  /** Where the user accounts live; ":memory:" in tests. Default data/users.sqlite (or USERS_DB). */
+  authDbPath?: string;
+  /** Test hook: replaces the SMTP sender. */
+  sendMail?: SendMail;
 }
 
 type HttpError = Error & { statusCode?: number };
@@ -60,12 +68,30 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   await app.register(cors, { origin: true });
 
   // ---- auth ----
+  // Accounts mode (SUPERUSER_EMAIL set): people sign in with email, password and an authenticator code; see auth/routes.ts.
+  // Otherwise: the shared API_TOKEN guards every /api route, or the API is open when neither is set.
   const token = env.API_TOKEN?.trim();
-  app.addHook("onRequest", async (req, reply) => {
-    if (!token || !req.url.startsWith("/api/") || req.url === "/api/health") return;
-    const got = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
-    if (got !== token) return reply.code(401).send({ error: "Sign in required." });
-  });
+  const superusers = (env.SUPERUSER_EMAIL ?? "").split(",").map((x) => x.trim()).filter(Boolean);
+  const accounts = superusers.length > 0;
+  let audit: (req: import("fastify").FastifyRequest, action: string, target?: string, detail?: string) => void = () => {};
+  if (accounts) {
+    const authSecret = env.AUTH_SECRET?.trim() ?? "";
+    if (authSecret.length < 16) {
+      throw new Error("SUPERUSER_EMAIL is set, so AUTH_SECRET must be set in .env too (a long random string; it protects the two-factor secrets). " +
+        "Make one with:  node -e \"console.log(require('crypto').randomBytes(32).toString('base64'))\"");
+    }
+    const store = new AuthStore(deps.authDbPath ?? env.USERS_DB?.trim() ?? resolve(process.cwd(), "data", "users.sqlite"));
+    const settings = mailSettings(env);
+    const mail = settings ? { settings, send: deps.sendMail ?? smtpSender(settings) } : undefined;
+    ({ audit } = registerAuth(app, { store, superusers, authSecret, cookieSecure: env.COOKIE_SECURE?.trim() === "true", ...(token ? { serviceToken: token } : {}), ...(mail ? { mail } : {}) }));
+    app.addHook("onClose", async () => store.close());
+  } else {
+    app.addHook("onRequest", async (req, reply) => {
+      if (!token || !req.url.startsWith("/api/") || req.url === "/api/health") return;
+      const got = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
+      if (got !== token) return reply.code(401).send({ error: "Sign in required." });
+    });
+  }
 
   // ---- errors in plain words ----
   // 400: the request body was wrong (Zod or Fastify validation) -> name the field in plain words.
@@ -74,7 +100,10 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // Anything else -> 500 with a fixed sentence; the full error goes to the server log only.
   app.setErrorHandler((err: HttpError & { validation?: unknown; code?: unknown; response?: { status?: number } }, req, reply) => {
     if (err instanceof z.ZodError) return reply.code(400).send({ error: zodMessage(err) });
-    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.message });
+    if (err.statusCode && err.statusCode >= 400 && err.statusCode < 500) {
+      // A short machine-readable code rides along when a route set one (e.g. PENDING, DISABLED on sign-in).
+      return reply.code(err.statusCode).send({ error: err.message, ...(typeof err.code === "string" && /^[A-Z_]+$/.test(err.code) ? { code: err.code } : {}) });
+    }
     if (err.validation) return reply.code(400).send({ error: err.message });
     const upstream = Number(err.response?.status ?? err.code);
     const google = GOOGLE_HINTS[upstream];
@@ -100,7 +129,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   };
   const bust = () => cache.clear();
 
-  app.get("/api/health", async () => ({ ok: true, sheet: !!env.GOOGLE_SHEET_ID, auth: !!token }));
+  app.get("/api/health", async () => ({ ok: true, sheet: !!env.GOOGLE_SHEET_ID, auth: !!token && !accounts, accounts, mail: accounts && !!env.SMTP_HOST?.trim() }));
 
   // ---- pipeline rows (Jobs_Pipeline + Pipeline) ----
   app.get("/api/pipeline", async (req) => {
@@ -125,16 +154,16 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const oneRow = (r: PipelineRow) => withDraftTimes([r])[0]!;
   app.get("/api/pipeline/:email", async (req) => oneRow(await findByEmail(gw(), (req.params as { email: string }).email)));
 
-  app.post("/api/pipeline/:email/approve", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.approved); bust(); return oneRow(r); });
-  app.post("/api/pipeline/:email/reject", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.rejected); bust(); return oneRow(r); });
-  app.post("/api/pipeline/:email/reopen", async (req) => { const r = await setStatus(gw(), (req.params as { email: string }).email, STATUS.ready); bust(); return oneRow(r); });
+  app.post("/api/pipeline/:email/approve", async (req) => { const e = (req.params as { email: string }).email; const r = await setStatus(gw(), e, STATUS.approved); bust(); audit(req, "approve_draft", e); return oneRow(r); });
+  app.post("/api/pipeline/:email/reject", async (req) => { const e = (req.params as { email: string }).email; const r = await setStatus(gw(), e, STATUS.rejected); bust(); audit(req, "reject_draft", e); return oneRow(r); });
+  app.post("/api/pipeline/:email/reopen", async (req) => { const e = (req.params as { email: string }).email; const r = await setStatus(gw(), e, STATUS.ready); bust(); audit(req, "reopen_draft", e); return oneRow(r); });
   app.patch("/api/pipeline/:email/draft", async (req) => {
     const body = z.object({ subject: z.string().max(200).optional(), body: z.string().max(5000).optional() }).parse(req.body);
-    const r = await updateDraft(gw(), (req.params as { email: string }).email, body); bust(); return oneRow(r);
+    const r = await updateDraft(gw(), (req.params as { email: string }).email, body); bust(); audit(req, "edit_draft", (req.params as { email: string }).email); return oneRow(r);
   });
 
   // ---- job search ----
-  app.post("/api/search", async () => engine.startSearch({ gw, ledger: deps.ledger, env }));
+  app.post("/api/search", async (req) => { const r = await engine.startSearch({ gw, ledger: deps.ledger, env }); audit(req, "start_search", r.search_id); return r; });
   app.get("/api/search", async (req) => {
     const q = z.object({ limit: z.coerce.number().int().min(1).max(50).default(10) }).parse(req.query);
     return { searches: await engine.listSearches(q.limit), defaults: engine.searchDefaults };
@@ -145,7 +174,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   // ---- campaign runs ----
   app.post("/api/runs", async (req) => {
     const b = z.object({ campaign: z.string().min(1), limit: z.number().int().min(1).max(100).default(10), export: z.boolean().default(true) }).parse(req.body);
-    return engine.startRun({ gw, ledger: deps.ledger, env }, b.campaign, b.limit, b.export);
+    const r = await engine.startRun({ gw, ledger: deps.ledger, env }, b.campaign, b.limit, b.export); audit(req, "start_run", b.campaign, r.run_id); return r;
   });
   app.get("/api/runs", async (req) => {
     const q = z.object({ limit: z.coerce.number().int().min(1).max(50).default(10) }).parse(req.query);
@@ -179,7 +208,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       ...(a.persona ? { outreach_persona: a.persona } : {}), ...(a.signal_query ? { signal_query: a.signal_query } : {}),
       calendar_duration_minutes: a.meeting_minutes, daily_send_cap: a.daily_cap, block_current_employer_domain: a.mode === "CANDIDATE",
     });
-    const r = await store().save(cfg, { active: a.active }); bust(); return r;
+    const r = await store().save(cfg, { active: a.active }); bust(); audit(req, "create_campaign", a.name); return r;
   });
   app.patch("/api/campaigns/:name", async (req) => {
     const name = decodeURIComponent((req.params as { name: string }).name);
@@ -193,12 +222,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
       ...(a.persona !== undefined ? { outreach_persona: a.persona } : {}), ...(a.signal_query !== undefined ? { signal_query: a.signal_query } : {}),
       calendar_duration_minutes: a.meeting_minutes ?? cur.calendar_duration_minutes, daily_send_cap: a.daily_cap ?? cur.daily_send_cap,
     });
-    const r = await store().save(next, { active: a.active }); bust(); return r;
+    const r = await store().save(next, { active: a.active }); bust(); audit(req, "edit_campaign", name); return r;
   });
   app.post("/api/campaigns/:name/active", async (req) => {
     const b = z.object({ active: z.boolean() }).parse(req.body);
     const name = decodeURIComponent((req.params as { name: string }).name);
-    await store().setActive(name, b.active); bust(); return { name, active: b.active };
+    await store().setActive(name, b.active); bust(); audit(req, b.active ? "activate_campaign" : "deactivate_campaign", name); return { name, active: b.active };
   });
   app.post("/api/campaigns/validate", async () => ({ campaigns: await store().validateAll() }));
 
@@ -207,7 +236,7 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.put("/api/settings", async (req) => {
     const patch = z.record(z.string(), z.union([z.string(), z.number(), z.boolean()])).parse(req.body);
     const asText = Object.fromEntries(Object.entries(patch).map(([k, v]) => [k, typeof v === "boolean" ? (v ? "TRUE" : "FALSE") : String(v)]));
-    const values = await writeConfig(gw(), asText); bust(); return { values };
+    const values = await writeConfig(gw(), asText); bust(); audit(req, "change_settings", undefined, Object.keys(asText).join(", ")); return { values };
   });
 
   return app;
