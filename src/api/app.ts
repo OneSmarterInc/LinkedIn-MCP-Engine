@@ -6,12 +6,12 @@ import type { Ledger } from "../core/db.js";
 import { STATUS } from "../core/exporter.js";
 import { CampaignConfig, Mode, SourcingProvider } from "../config/schema.js";
 import { sheetCampaignStore } from "../config/store.js";
-import { readPipeline, readQuarantine, setStatus, updateDraft, summary, findByEmail, PIPELINE_TABS, type PipelineTab, type PipelineRow } from "./services/sheet-rows.js";
+import { readPipeline, readQuarantine, setStatus, setOutcome, updateDraft, summary, findByEmail, PIPELINE_TABS, type PipelineTab, type PipelineRow } from "./services/sheet-rows.js";
 import { readConfig, writeConfig, CONFIG_DEFAULTS } from "./services/config-tab.js";
 import * as engine from "./services/engine.js";
 import { resolve } from "node:path";
 import { AuthStore } from "./auth/store.js";
-import { registerAuth } from "./auth/routes.js";
+import { authOf, registerAuth } from "./auth/routes.js";
 import { mailSettings, smtpSender, type SendMail } from "./auth/mail.js";
 
 /**
@@ -164,6 +164,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   app.post("/api/pipeline/:email/approve", async (req) => { const e = (req.params as { email: string }).email; const r = await setStatus(gw(), e, STATUS.approved); bust(); audit(req, "approve_draft", e); return oneRow(r); });
   app.post("/api/pipeline/:email/reject", async (req) => { const e = (req.params as { email: string }).email; const r = await setStatus(gw(), e, STATUS.rejected); bust(); audit(req, "reject_draft", e); return oneRow(r); });
   app.post("/api/pipeline/:email/reopen", async (req) => { const e = (req.params as { email: string }).email; const r = await setStatus(gw(), e, STATUS.ready); bust(); audit(req, "reopen_draft", e); return oneRow(r); });
+  app.post("/api/pipeline/:email/outcome", async (req) => {
+    const e = (req.params as { email: string }).email;
+    const b = z.object({ outcome: z.enum(["meeting_booked", "not_interested"]) }).parse(req.body);
+    const who = authOf(req).user?.full_name ?? "the console";
+    const r = await setOutcome(gw(), e, b.outcome, who); bust(); audit(req, `outcome_${b.outcome}`, e); return oneRow(r);
+  });
   app.patch("/api/pipeline/:email/draft", async (req) => {
     const body = z.object({ subject: z.string().max(200).optional(), body: z.string().max(5000).optional() }).parse(req.body);
     const r = await updateDraft(gw(), (req.params as { email: string }).email, body); bust(); audit(req, "edit_draft", (req.params as { email: string }).email); return oneRow(r);

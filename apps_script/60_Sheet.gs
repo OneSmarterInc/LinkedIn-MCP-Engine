@@ -36,8 +36,13 @@ function ensureColumnsOn_(s) {
   if (cur.every(function (c) { return c.trim() === ""; })) {
     range.setValues([OUR_HEADERS]).setFontWeight("bold").setBackground("#e6e6e6");
     s.setColumnWidth(COL.notes, 360);
-  } else if (OUR_HEADERS.some(function (h, i) { return cur[i] !== h; })) {
-    throw new Error("Columns K–O already hold other headers (" + cur.join(", ") + "). Expected " + OUR_HEADERS.join(", ") + ".");
+    s.setColumnWidth(COL.lastReply, 360);
+  } else if (OUR_HEADERS.some(function (h, i) { return cur[i].trim() !== "" && cur[i] !== h; })) {
+    throw new Error("Columns K–P already hold other headers (" + cur.join(", ") + "). Expected " + OUR_HEADERS.join(", ") + ".");
+  } else if (cur.some(function (c) { return c.trim() === ""; })) {
+    // A Sheet set up before a column was added (LastReply, 7 Nov 2026): add the missing headers, keep the rest.
+    range.setValues([OUR_HEADERS]).setFontWeight("bold").setBackground("#e6e6e6");
+    s.setColumnWidth(COL.lastReply, 360);
   }
   s.getRange(2, COL.sentAt, Math.max(1, s.getMaxRows() - 1), 2).setNumberFormat("yyyy-mm-dd hh:mm");
 }
@@ -56,7 +61,7 @@ function readRows_(sheet) {
       body: String(r[COL.body - 1] || ""), threadId: String(r[COL.threadId - 1] || "").trim(),
       messageId: String(r[COL.messageId - 1] || "").trim(), sentAt: r[COL.sentAt - 1],
       lastReplyAt: r[COL.lastReplyAt - 1], sendState: String(r[COL.sendState - 1] || "").trim(),
-      notes: String(r[COL.notes - 1] || ""),
+      notes: String(r[COL.notes - 1] || ""), lastReply: String(r[COL.lastReply - 1] || ""),
     };
   });
 }
@@ -105,6 +110,15 @@ function setCells_(sheet, rowNo, patch) {
  * when the cell passes 1,500 characters, hint lines excepted.
  */
 var NOTES_MAX = 1500;
+
+/**
+ * The first lines of a reply for the LastReply column: spaces and line breaks squeezed, at most 500 characters.
+ * A reply that starts with = + - or @ is stored as text, never as a formula.
+ */
+function replySnippet_(text) {
+  var t = String(text || "").replace(/\s+/g, " ").trim().slice(0, 500);
+  return /^[=+\-@]/.test(t) ? "'" + t : t;
+}
 function appendNote_(existing, msg) {
   var lines = String(existing || "").split("\n").filter(function (l) { return l.trim() !== ""; });
   var last = lines.length ? lines[lines.length - 1].replace(/^\S+ \S+ /, "") : "";

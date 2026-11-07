@@ -283,3 +283,43 @@ describe("API: errors come back in plain words (B13)", () => {
     await app.close();
   });
 });
+
+describe("API: Sent & replies (LastReply in column P, outcomes from the portal)", () => {
+  const AB = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes", "LastReply"];
+  const H16 = [...H, ...AB];
+  const r16 = (o: Partial<Record<string, string>>) => H16.map((h) => o[h] ?? "");
+  const XRW = { "x-requested-with": "outreach-console" };
+  let app: FastifyInstance; let tabs: Map<string, { rows: string[][] }>;
+  beforeAll(async () => {
+    const f = fakeSheets({
+      Jobs_Pipeline: [H16,
+        r16({ Company: "Northwind", Name: "Dana W", Email: "dana@northwind.example", Status: "Replied", Subject: "s", DraftBody: "b", ThreadID: "t1", SendState: "NEEDS_HUMAN", SentAt: "2026-11-07 10:05", LastReplyAt: "2026-11-07 11:42", LastReply: "Can you send two profiles?" }),
+        r16({ Company: "Summit", Name: "Tom B", Email: "tom@summit.example", Status: "Sent", Subject: "s", DraftBody: "b", ThreadID: "t2", SendState: "SENT", SentAt: "2026-11-06 15:40" }),
+        r16({ Company: "Acme", Name: "Draft", Email: "draft@acme.example", Status: "Ready for Review", Subject: "s", DraftBody: "b" }),
+      ],
+    });
+    tabs = f.tabs;
+    app = await buildApp({ gw: () => f.gw, ledger: openLedger(":memory:"), env: {} });
+  });
+  afterAll(async () => { await app.close(); });
+
+  it("returns the reply time and text", async () => {
+    const rows = (await app.inject({ method: "GET", url: "/api/pipeline?fresh=1" })).json().rows as Array<Record<string, string>>;
+    expect(rows.find((r) => r.email === "dana@northwind.example")).toMatchObject({ last_reply_at: "2026-11-07 11:42", last_reply: "Can you send two profiles?" });
+    expect(rows.find((r) => r.email === "tom@summit.example")).toMatchObject({ last_reply: "", sent_at: "2026-11-06 15:40" });
+  });
+
+  it("marks a meeting booked or not interested, only on sent rows, with a note", async () => {
+    const m = await app.inject({ method: "POST", url: "/api/pipeline/dana@northwind.example/outcome", headers: XRW, payload: { outcome: "meeting_booked" } });
+    expect(m.statusCode).toBe(200);
+    expect(m.json()).toMatchObject({ status: "Meeting Booked", send_state: "BOOKED" });
+    const n = await app.inject({ method: "POST", url: "/api/pipeline/tom@summit.example/outcome", headers: XRW, payload: { outcome: "not_interested" } });
+    expect(n.json()).toMatchObject({ status: "Replied", send_state: "NEEDS_HUMAN" });
+    expect(n.json().notes).toMatch(/said not interested \(marked in the portal by/);
+    const row = tabs.get("Jobs_Pipeline")!.rows[2]!;
+    expect(row[H16.indexOf("Status")]).toBe("Replied");
+    expect(row[H16.indexOf("SendState")]).toBe("NEEDS_HUMAN");
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/draft@acme.example/outcome", headers: XRW, payload: { outcome: "meeting_booked" } })).statusCode).toBe(409);
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/tom@summit.example/outcome", headers: XRW, payload: { outcome: "maybe" } })).statusCode).toBe(400);
+  });
+});

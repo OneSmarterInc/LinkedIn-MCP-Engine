@@ -23,7 +23,7 @@ function processReplies() {
       // this address again (it syncs Bounced rows into the ledger before every run). Sends nothing, so dry run too.
       var bounce = bounceIn_(thread, r.lastReplyAt);
       if (bounce) {
-        updateRow_(sheet, r, { status: STATUS.bounced, lastReplyAt: bounce.getDate(), sendState: STATE.bounced, notes: appendNote_(r.notes, "bounced: the address does not accept mail") });
+        updateRow_(sheet, r, { status: STATUS.bounced, lastReplyAt: bounce.getDate(), lastReply: "Delivery failed: the address does not accept mail", sendState: STATE.bounced, notes: appendNote_(r.notes, "bounced: the address does not accept mail") });
         log_("bounced", r.email, "delivery failure in the thread");
         SpreadsheetApp.flush();
         continue;
@@ -33,6 +33,7 @@ function processReplies() {
       if (!reply) continue;
 
       var fresh = stripQuotedText_(reply.getPlainBody());
+      var snip = replySnippet_(fresh);
       // Mail systems mark machine-sent mail in its headers. That signal beats any word list, so it is checked first.
       var verdict = isAutomatedMessage_(reply) ? { kind: "NEEDS_HUMAN", note: "automatic reply" } : classifyReply_(fresh, r, cfg);
       var replyAt = reply.getDate();
@@ -43,7 +44,7 @@ function processReplies() {
         // an opt-out, which is applied now: it sends nothing and must never be missed.
         var dryText = "[DRY RUN] reply classified " + verdict.kind + (verdict.when ? " for " + verdict.when.toISOString() : "");
         if (verdict.kind === "OPT_OUT") {
-          updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, sendState: STATE.optedOut, notes: appendNote_(r.notes, "opted out (seen in dry run)") });
+          updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, lastReply: snip, sendState: STATE.optedOut, notes: appendNote_(r.notes, "opted out (seen in dry run)") });
           log_("reply", r.email, "OPT_OUT | " + fresh.slice(0, 120).replace(/\s+/g, " "));
         } else if (String(r.notes || "").indexOf(dryText) === -1) {
           updateRow_(sheet, r, { notes: appendNote_(r.notes, dryText) });
@@ -60,17 +61,17 @@ function processReplies() {
       try {
         switch (verdict.kind) {
           case "OPT_OUT":
-            updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, sendState: STATE.optedOut, notes: appendNote_(r.notes, "opted out") });
+            updateRow_(sheet, r, { status: STATUS.optedOut, lastReplyAt: replyAt, lastReply: snip, sendState: STATE.optedOut, notes: appendNote_(r.notes, "opted out") });
             break;
 
           case "TIMES_REQUESTED":
             offerTimes_(thread, r, cfg, "Happy to. ");
-            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: appendNote_(r.notes, "offered 3 times") });
+            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, lastReply: snip, sendState: STATE.timesOffered, notes: appendNote_(r.notes, "offered 3 times") });
             break;
 
           case "TIME_PROPOSED":
             var outcome = tryBook_(thread, r, cfg, verdict.when, function (label) {
-              updateRow_(sheet, r, { status: STATUS.meetingBooked, lastReplyAt: replyAt, sendState: STATE.booked, notes: appendNote_(r.notes, "booked " + label) });
+              updateRow_(sheet, r, { status: STATUS.meetingBooked, lastReplyAt: replyAt, lastReply: snip, sendState: STATE.booked, notes: appendNote_(r.notes, "booked " + label) });
               r.notes = appendNote_(r.notes, "booked " + label);
               SpreadsheetApp.flush();
             });
@@ -81,15 +82,15 @@ function processReplies() {
               }
             } else {
               offerTimes_(thread, r, cfg, outcome.reason + " ");
-              updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.timesOffered, notes: appendNote_(r.notes, outcome.reason) });
+              updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, lastReply: snip, sendState: STATE.timesOffered, notes: appendNote_(r.notes, outcome.reason) });
             }
             break;
 
           default: // NEEDS_HUMAN
-            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: appendNote_(r.notes, needsHumanPrefix_(verdict.note) + fresh.slice(0, 200)) });
+            updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, lastReply: snip, sendState: STATE.needsHuman, notes: appendNote_(r.notes, needsHumanPrefix_(verdict.note) + fresh.slice(0, 200)) });
         }
       } catch (e) {
-        updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, sendState: STATE.needsHuman, notes: appendNote_(r.notes, "automation failed, needs a person: " + String(e.message || e)) });
+        updateRow_(sheet, r, { status: STATUS.replied, lastReplyAt: replyAt, lastReply: snip, sendState: STATE.needsHuman, notes: appendNote_(r.notes, "automation failed, needs a person: " + String(e.message || e)) });
         log_("reply-error", r.email, String(e.message || e));
       }
       SpreadsheetApp.flush();

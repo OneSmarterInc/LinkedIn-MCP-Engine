@@ -31,6 +31,9 @@ export interface PipelineRow {
   send_state: string;
   notes: string;
   sent_at: string;
+  /** When the person last answered, and the first lines of that answer (AutoBooker columns M and P). */
+  last_reply_at: string;
+  last_reply: string;
   /** When the draft was written to the Sheet (from the ledger), ISO time. Missing for rows written before the ledger kept it. */
   drafted_at?: string;
   /** The campaign that wrote the row (from the ledger). */
@@ -58,7 +61,7 @@ export interface QuarantineRow {
  * AutoBooker (apps_script/*.gs (AutoBooker)) adds these five columns after the engine's ten. They are read here so the
  * console can show a failed send, and cleared when a person retries one. Positions match COL in AutoBooker.gs.
  */
-export const AUTOBOOKER_HEADERS = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"] as const;
+export const AUTOBOOKER_HEADERS = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes", "LastReply"] as const;
 export const SEND_FAILED = "SEND_FAILED";
 const abCol = (h: (typeof AUTOBOOKER_HEADERS)[number]) => colLetter(PIPELINE_HEADERS.length + AUTOBOOKER_HEADERS.indexOf(h) + 1);
 
@@ -130,6 +133,7 @@ export async function readPipeline(gw: SheetsGateway, tabs: PipelineTab[] = PIPE
         research, status: effectiveStatus(sheetStatus, sendState), subject: g("Subject"), body: g("DraftBody"), thread_id: g("ThreadID"),
         ...(parseSignal(research) ? { signal: parseSignal(research) } : {}),
         sheet_status: sheetStatus, send_state: sendState, notes: ab("Notes"), sent_at: ab("SentAt"),
+        last_reply_at: ab("LastReplyAt"), last_reply: ab("LastReply").replace(/^'/, ""),
       });
     });
   }
@@ -185,6 +189,29 @@ export async function setStatus(gw: SheetsGateway, email: string, next: string):
     return { ...row, status: next, sheet_status: next, send_state: "", notes: "" };
   }
   return { ...row, status: next, sheet_status: next };
+}
+
+/** What a person may record from the Sent & replies page about a conversation AutoBooker started. */
+export type Outcome = "meeting_booked" | "not_interested";
+
+/**
+ * Records the outcome of a conversation by hand. Only for rows AutoBooker sent (Sent or Replied).
+ * meeting_booked: Status Meeting Booked, SendState BOOKED. not_interested: Status stays Replied, SendState NEEDS_HUMAN
+ * (AutoBooker then leaves the thread alone, as it does when it reads a "not interested" itself). A note line says who.
+ */
+export async function setOutcome(gw: SheetsGateway, email: string, outcome: Outcome, by: string, now = new Date()): Promise<PipelineRow> {
+  const row = await findByEmail(gw, email);
+  if (![STATUS.sent, STATUS.replied].includes(row.status as never)) {
+    throw Object.assign(new Error(`Only a sent email can get an outcome; this one is "${row.status}".`), { statusCode: 409 });
+  }
+  const status = outcome === "meeting_booked" ? STATUS.meetingBooked : STATUS.replied;
+  const sendState = outcome === "meeting_booked" ? "BOOKED" : "NEEDS_HUMAN";
+  const stamp = now.toISOString().slice(0, 16).replace("T", " ");
+  const line = `${stamp} ${outcome === "meeting_booked" ? "meeting booked" : "said not interested"} (marked in the portal by ${by})`;
+  const notes = [row.notes, line].filter(Boolean).join("\n");
+  await gw.writeValues(`${row.tab}!${col("Status")}${row.row_number}`, [[status]], "raw");
+  await gw.writeValues(`${row.tab}!${abCol("SendState")}${row.row_number}:${abCol("Notes")}${row.row_number}`, [[sendState, notes]], "raw");
+  return { ...row, status, sheet_status: status, send_state: sendState, notes };
 }
 
 export async function updateDraft(gw: SheetsGateway, email: string, patch: { subject?: string; body?: string }): Promise<PipelineRow> {

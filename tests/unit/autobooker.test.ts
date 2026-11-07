@@ -81,7 +81,7 @@ class FakeSheet {
 }
 
 type Row = Partial<Record<"company" | "name" | "email" | "status" | "subject" | "body" | "threadId" | "messageId" | "sentAt" | "lastReplyAt" | "sendState" | "notes", unknown>>;
-const COLS = { company: 1, domain: 2, name: 3, title: 4, email: 5, research: 6, status: 7, subject: 8, body: 9, threadId: 10, messageId: 11, sentAt: 12, lastReplyAt: 13, sendState: 14, notes: 15 } as const;
+const COLS = { company: 1, domain: 2, name: 3, title: 4, email: 5, research: 6, status: 7, subject: 8, body: 9, threadId: 10, messageId: 11, sentAt: 12, lastReplyAt: 13, sendState: 14, notes: 15, lastReply: 16 } as const;
 
 const LIVE_CONFIG: Record<string, string> = {
   DryRun: "FALSE", SenderName: "Vikram Sethi", SenderTitle: "Founder", Street: "1 Main St", CityStateZip: "Dayton, OH 45402",
@@ -429,6 +429,16 @@ describe("processReplies", () => {
     expect(t.thread.replies).toHaveLength(0);
   });
 
+  it("saves the first lines of the reply in LastReply (P) for the portal", () => {
+    const t = run("Thanks, but we are not interested at this time.\n\nRegards,\nJane");
+    expect(t.cell(2, "lastReply")).toBe("Thanks, but we are not interested at this time. Regards, Jane");
+  });
+
+  it("a reply that starts like a formula is stored as text", () => {
+    const t = run("=HYPERLINK(\"http://x\") is this a question?");
+    expect(String(t.cell(2, "lastReply")).startsWith("'=")).toBe(true);
+  });
+
   it("still treats unsubscribe as an opt-out", () => {
     expect(run("Please unsubscribe me.").cell(2, "status")).toBe("Opted Out");
   });
@@ -653,10 +663,17 @@ describe("Jobs_Pipeline (search_jobs outreach)", () => {
     expect(jobCell(2, "sendState")).toBe("SENT");
   });
 
-  it("gives a Jobs_Pipeline made after setup() its K-O headers", () => {
+  it("gives a Jobs_Pipeline made after setup() its K-P headers", () => {
     const { ctx, jobs } = setup({ config: LIVE_CONFIG, jobRows: [] });
     ctx.sendApproved!();
-    expect([11, 12, 13, 14, 15].map((c) => jobs.get(1, c))).toEqual(["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"]);
+    expect([11, 12, 13, 14, 15, 16].map((c) => jobs.get(1, c))).toEqual(["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes", "LastReply"]);
+  });
+
+  it("adds LastReply (P) to a Sheet set up before it existed, and keeps K-O", () => {
+    const { ctx, pipeline } = setup({ config: LIVE_CONFIG });
+    ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"].forEach((h, i) => pipeline.set(1, 11 + i, h));
+    ctx.sendApproved!();
+    expect([11, 12, 13, 14, 15, 16].map((c) => pipeline.get(1, c))).toEqual(["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes", "LastReply"]);
   });
 
   it("one daily cap covers both tabs", () => {

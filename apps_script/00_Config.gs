@@ -23,10 +23,11 @@ var TAB = { pipeline: "Pipeline", jobsPipeline: "Jobs_Pipeline", config: "Config
 var COL = {
   company: 1, domain: 2, name: 3, title: 4, email: 5, research: 6,
   status: 7, subject: 8, body: 9, threadId: 10,
-  messageId: 11, sentAt: 12, lastReplyAt: 13, sendState: 14, notes: 15,
+  messageId: 11, sentAt: 12, lastReplyAt: 13, sendState: 14, notes: 15, lastReply: 16,
 };
-var OUR_HEADERS = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes"];
-var LAST_COL = COL.notes;
+// LastReply (P, added 7 Nov 2026): the first lines of the person's latest reply, for the portal's Sent & replies page.
+var OUR_HEADERS = ["MessageID", "SentAt", "LastReplyAt", "SendState", "Notes", "LastReply"];
+var LAST_COL = COL.lastReply;
 
 var STATUS = {
   ready: "Ready for Review", needsRewrite: "Needs Rewrite", approved: "Approved",
