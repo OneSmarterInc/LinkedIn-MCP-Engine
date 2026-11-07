@@ -5,7 +5,7 @@ import type { LLMProvider } from "../../src/lib/llm/provider.js";
 
 // All companies and links here are made up.
 
-const opts = { ...jobSpyOptionsFromEnv({}), python: "python", script: "scripts/jobspy_search.py" };
+const opts = { ...jobSpyOptionsFromEnv({ JOBSPY_ALLOW_SCRAPING: "true" }), python: "python", script: "scripts/jobspy_search.py" };
 const reply = (body: unknown): RunCommand => async () => ({ code: 0, stdout: `${JSON.stringify(body)}\n`, stderr: "" });
 const row = (o: Record<string, unknown> = {}) => ({
   site: "indeed", title: "Java Developer", company: "Acme", location: "Dayton, OH, US", date_posted: "2026-11-02",
@@ -25,11 +25,19 @@ describe("JobSpy", () => {
   });
 
   it("reads defaults and .env settings", () => {
-    const o = jobSpyOptionsFromEnv({ JOBSPY_SITES: "indeed, glassdoor", JOBSPY_HOURS_OLD: "24", JOBSPY_LOCATION: "Ohio" });
+    const o = jobSpyOptionsFromEnv({ JOBSPY_ALLOW_SCRAPING: "true", JOBSPY_SITES: "indeed, glassdoor", JOBSPY_HOURS_OLD: "24", JOBSPY_LOCATION: "Ohio" });
     expect(o.sites).toEqual(["indeed", "glassdoor"]);
     expect(o.hoursOld).toBe(24);
     expect(o.location).toBe("Ohio");
-    expect(jobSpyOptionsFromEnv({}).sites).toEqual(["indeed", "linkedin"]);
+    expect(jobSpyOptionsFromEnv({ JOBSPY_ALLOW_SCRAPING: "true" }).sites).toEqual(["indeed", "linkedin"]);
+  });
+
+  it("direct scraping is off by default: only licensed boards are searched, and the rest is reported", () => {
+    expect(jobSpyOptionsFromEnv({}).sites).toEqual(["google_jobs"]);
+    const o = jobSpyOptionsFromEnv({ JOBSPY_SITES: "indeed,linkedin,google_jobs,monster_apify" });
+    expect(o.sites).toEqual(["google_jobs", "monster_apify"]);
+    expect(o.scrapingOff).toEqual(["indeed", "linkedin"]);
+    expect(jobSpyOptionsFromEnv({ JOBSPY_SITES: "indeed" }).sites).toEqual(["google_jobs"]);
   });
 
   it("takes the company domain from its own website, never from a job board", () => {
@@ -83,7 +91,7 @@ describe("JobSpy", () => {
       return { code: 0, stdout: JSON.stringify({ jobs: first ? [row(), row({ site: "linkedin", job_url: "https://www.linkedin.com/jobs/view/77", title: "QA Lead", company: "Other Co" })] : [], errors: {} }), stderr: "" };
     };
     const monster = async () => ({ rows: [{ site: "monster", title: "RPG Dev", company: "Buckeye", job_url: "https://www.monster.com/job-openings/m1", date_posted: "2026-11-03" }] });
-    const out = await searchJobs({ llm: noGemini, now: new Date("2026-11-03T10:00:00Z"), settings: { maxSearches: 1 }, jobspy: { opts: { ...opts, sites: ["indeed", "linkedin", "monster"] }, run, readers: { searchMonster: monster } } });
+    const out = await searchJobs({ llm: noGemini, now: new Date("2026-11-03T10:00:00Z"), settings: { maxSearches: 1 }, jobspy: { opts: { ...opts, sites: ["indeed", "linkedin", "monster"] }, run, readers: { searchApifyMonster: monster } } });
     expect(out.jobs.map((j) => [j.job_title, j.board])).toEqual([["Java Developer", "indeed"], ["QA Lead", "linkedin"], ["RPG Dev", "monster"]]);
     expect(out.posts_by_board).toEqual({ indeed: 1, linkedin: 1, monster: 1 });
     expect(out.posts_on_monster).toBe(1);

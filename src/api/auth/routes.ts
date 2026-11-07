@@ -183,7 +183,7 @@ export function registerAuth(app: FastifyInstance, o: AuthOptions): { audit: (re
     const ip = ipOf(req);
     if (rateLimited(ip)) throw httpError(429, "Too many attempts from this address. Wait a minute.");
     const b = z.object({ email: z.string().trim().toLowerCase().max(200), password: z.string().max(200) }).parse(req.body);
-    const wait = store.lockedFor(b.email);
+    const wait = store.lockedFor(b.email, ip);
     if (wait) throw httpError(429, `Too many failed attempts. Try again in ${Math.ceil(wait / 60)} minute${wait > 60 ? "s" : ""}.`);
     const user = store.userByEmail(b.email);
     const ok = user ? await verifyPassword(b.password, user.password_hash) : (await verifyPassword(b.password, DUMMY_HASH), false);
@@ -232,7 +232,7 @@ export function registerAuth(app: FastifyInstance, o: AuthOptions): { audit: (re
     if (reused) throw httpError(400, "That code was already used. Wait for the next code in your app.");
     if (!byApp && !byRecovery) {
       store.recordAttempt(user.email, false, ipOf(req));
-      const wait = store.lockedFor(user.email);
+      const wait = store.lockedFor(user.email, ipOf(req));
       if (wait) { store.endSession(session.id); throw httpError(429, "Too many wrong codes. Sign in again in 15 minutes."); }
       throw httpError(400, "That code did not match.");
     }

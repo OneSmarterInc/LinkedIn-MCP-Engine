@@ -78,6 +78,14 @@ describe("auth store", () => {
     s.recordAttempt("a@b.com", true, "1.1.1.1");
     expect(s.lockedFor("a@b.com")).toBe(0);
   });
+  it("B6: failures from one address do not lock out another; twenty from many addresses lock everyone", () => {
+    const s = new AuthStore(":memory:");
+    for (let i = 0; i < 5; i++) s.recordAttempt("admin@x.com", false, "6.6.6.6");
+    expect(s.lockedFor("admin@x.com", "6.6.6.6")).toBeGreaterThan(800);
+    expect(s.lockedFor("admin@x.com", "10.0.0.1")).toBe(0); // the real admin still signs in
+    for (let i = 0; i < 15; i++) s.recordAttempt("admin@x.com", false, `7.7.7.${i}`);
+    expect(s.lockedFor("admin@x.com", "10.0.0.1")).toBeGreaterThan(800);
+  });
   it("recovery codes are single use", () => {
     const s = new AuthStore(":memory:");
     s.setRecoveryCodes("u1", ["abcde-fghjk", "mnpqr-stuvw"]);

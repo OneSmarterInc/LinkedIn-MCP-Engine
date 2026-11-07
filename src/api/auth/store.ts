@@ -138,15 +138,21 @@ export class AuthStore {
     this.db.prepare("INSERT INTO login_attempts (email, at, ok, ip) VALUES (?,?,?,?)").run(email.trim().toLowerCase(), now(), ok ? 1 : 0, ip.slice(0, 64));
     this.db.prepare("DELETE FROM login_attempts WHERE at < ?").run(new Date(Date.now() - 24 * 3_600_000).toISOString());
   }
-  /** Seconds until the account may try again, or 0. Five failures in the last 15 minutes lock it for 15 minutes. */
-  lockedFor(email: string, maxFailures = 5, windowMs = 15 * 60_000): number {
-    const rows = this.db.prepare("SELECT at, ok FROM login_attempts WHERE email = ? AND at > ? ORDER BY at DESC")
-      .all(email.trim().toLowerCase(), new Date(Date.now() - windowMs).toISOString()) as unknown as Array<{ at: string; ok: number }>;
-    let failures = 0;
-    for (const r of rows) { if (r.ok) break; failures++; }
-    if (failures < maxFailures) return 0;
-    const newest = Date.parse(rows[0]!.at);
-    return Math.max(1, Math.ceil((newest + windowMs - Date.now()) / 1000));
+  /**
+   * Seconds until this address may try this account again, or 0. Failures since the last success in the last 15
+   * minutes count. With `ip`: five from that address lock it out (a stranger elsewhere cannot lock the real person
+   * out), and twenty from all addresses together lock the account for everyone (a spread-out guessing attack).
+   * Without `ip`: five from anywhere, as before.
+   */
+  lockedFor(email: string, ip?: string, perAddress = 5, windowMs = 15 * 60_000, allAddresses = 20): number {
+    const rows = this.db.prepare("SELECT at, ok, ip FROM login_attempts WHERE email = ? AND at > ? ORDER BY at DESC")
+      .all(email.trim().toLowerCase(), new Date(Date.now() - windowMs).toISOString()) as unknown as Array<{ at: string; ok: number; ip: string }>;
+    const failed: Array<{ at: string; ip: string }> = [];
+    for (const r of rows) { if (r.ok) break; failed.push(r); }
+    const mine = ip === undefined ? failed : failed.filter((r) => r.ip === ip.slice(0, 64));
+    const hit = mine.length >= perAddress ? mine : failed.length >= (ip === undefined ? perAddress : allAddresses) ? failed : undefined;
+    if (!hit) return 0;
+    return Math.max(1, Math.ceil((Date.parse(hit[0]!.at) + windowMs - Date.now()) / 1000));
   }
 
   // ---- password reset ----

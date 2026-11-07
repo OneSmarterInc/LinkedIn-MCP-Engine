@@ -58,17 +58,18 @@ INSTALL AND CHECK
 cd backend   ; npm install ; npm run doctor ; npm run api
 cd frontend  ; npm install ; npm run dev
 
-## Monster job posts (optional, JOBSPY_SITES includes "monster")
-Monster draws its results with JavaScript, so the engine reads it with a real browser (Playwright + Chromium).
-Once, in the backend folder:
-    npm install                        (pulls the playwright package)
-    npx playwright install chromium    (downloads Chromium, about 150 MB)
-Check it works, no credits used:
-    npm run monster:check -- "software engineer" "Ohio"
+## Monster job posts (optional, JOBSPY_SITES includes "monster" or "monster_apify")
+Read through an Apify actor on Apify's servers; nothing runs in a browser here.
+    1. .env:  APIFY_TOKEN=...   (Apify console > Settings > API & Integrations)
+    2. Check (one actor run, a few cents):  npm run apify:check -- "software engineer"
+
+## Direct scraping (JobSpy: indeed, linkedin, glassdoor, zip_recruiter ...)
+Against those sites' terms, so off unless the owner sets JOBSPY_ALLOW_SCRAPING=true in .env. When off, those boards are
+left out of JOBSPY_SITES and the run log says so.
 
 ## Google Jobs through SerpApi (optional, JOBSPY_SITES includes "google_jobs")
 Licensed API; carries Monster, Dice, CareerBuilder and company career pages. Free plan: 250 searches a month.
     1. Sign up at serpapi.com, copy the key from serpapi.com/manage-api-key
-    2. .env:  SERPAPI_KEY=...   and   JOBSPY_SITES=indeed,linkedin,google_jobs
+    2. .env:  SERPAPI_KEY=...   and   JOBSPY_SITES=google_jobs,monster_apify
     3. Check (one search):  npm run gjobs:check -- "software engineer" "Ohio, United States"
 Each page of 10 posts is one search; GOOGLE_JOBS_PAGES (default 1) caps pages per term.

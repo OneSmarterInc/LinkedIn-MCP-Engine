@@ -3,7 +3,6 @@ import { resolve } from "node:path";
 
 import { logger } from "../../lib/logger.js";
 import type { JobHit } from "./job-search.js";
-import { searchMonster as defaultSearchMonster, MonsterSetupError } from "./monster.js";
 import { searchGoogleJobs as defaultSearchGoogleJobs, GoogleJobsSetupError } from "./google-jobs.js";
 import { searchApifyMonster as defaultSearchApifyMonster, ApifyMonsterSetupError, DEFAULT_MONSTER_ACTOR } from "./apify-monster.js";
 
@@ -26,7 +25,18 @@ export interface JobSpyOptions {
   countryIndeed: string;
   proxies: string[];
   timeoutMs: number;
+  /** Boards in JOBSPY_SITES that were left out because direct scraping is off (JOBSPY_ALLOW_SCRAPING). */
+  scrapingOff?: string[];
 }
+
+/** Boards read through a licensed API or a hosted service, not by scraping the site from this machine. */
+const LICENSED = new Set(["google_jobs", "googlejobs", "serpapi", "monster", "monster_apify", "apify_monster", "apify"]);
+
+/**
+ * Direct scraping (JobSpy reading LinkedIn, Indeed, Glassdoor ... from this machine) is against those sites' terms, so it
+ * is off unless the owner turns it on with JOBSPY_ALLOW_SCRAPING=true (review 7 Nov 2026, item D).
+ */
+export const scrapingAllowed = (env: NodeJS.ProcessEnv = process.env) => (env.JOBSPY_ALLOW_SCRAPING ?? "").trim().toLowerCase() === "true";
 
 /** One search term per run step. Each run starts at a different term, the same way the Gemini angles rotate. */
 export const JOBSPY_TERMS: Array<{ label: string; term: string }> = [
@@ -44,10 +54,16 @@ export const JOBSPY_TERMS: Array<{ label: string; term: string }> = [
 
 export function jobSpyOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): JobSpyOptions {
   const list = (v: string | undefined, d: string[]) => (v?.trim() ? v.split(",").map((s) => s.trim()).filter(Boolean) : d);
+  const allow = scrapingAllowed(env);
+  const wanted = list(env.JOBSPY_SITES, allow ? ["indeed", "linkedin"] : ["google_jobs"]);
+  const scrapingOff = allow ? [] : wanted.filter((s) => !LICENSED.has(s.toLowerCase()));
+  const sites = wanted.filter((s) => !scrapingOff.includes(s));
+  if (scrapingOff.length) logger.warn({ left_out: scrapingOff }, "direct scraping is off (JOBSPY_ALLOW_SCRAPING); these boards are not searched");
   return {
     python: env.JOBSPY_PYTHON?.trim() || (process.platform === "win32" ? "python" : "python3"),
     script: resolve(process.cwd(), "scripts", "jobspy_search.py"),
-    sites: list(env.JOBSPY_SITES, ["indeed", "linkedin"]),
+    sites: sites.length ? sites : ["google_jobs"],
+    ...(scrapingOff.length ? { scrapingOff } : {}),
     location: env.JOBSPY_LOCATION?.trim() || "United States",
     hoursOld: Number(env.JOBSPY_HOURS_OLD) || 72,
     countryIndeed: env.JOBSPY_COUNTRY_INDEED?.trim() || "USA",
@@ -139,41 +155,30 @@ export function rowToHit(r: JobSpyRow): JobHit | undefined {
 export class JobSpySetupError extends Error {}
 
 const siteName = (s: string) => s.trim().toLowerCase();
-const isMonster = (s: string) => siteName(s) === "monster";
 const isGoogleJobs = (s: string) => ["google_jobs", "googlejobs", "serpapi"].includes(siteName(s));
-const isApifyMonster = (s: string) => ["monster_apify", "apify_monster", "apify"].includes(siteName(s));
+// "monster" means Monster through Apify: the browser reader that hid automation from Monster was removed (review 7 Nov, D).
+const isApifyMonster = (s: string) => ["monster", "monster_apify", "apify_monster", "apify"].includes(siteName(s));
 
 /** The readers that are not JobSpy boards, injectable for tests. */
 export interface ExtraReaders {
-  searchMonster?: typeof defaultSearchMonster;
   searchGoogleJobs?: typeof defaultSearchGoogleJobs;
   searchApifyMonster?: typeof defaultSearchApifyMonster;
 }
 
 /**
  * Runs one search for `term` on every board in `opts.sites`. JobSpy reads its boards through the Python script.
- * Two names are not JobSpy boards and run at the same time through their own readers: "monster" (browser-based,
- * monster.ts) and "google_jobs" (SerpApi, google-jobs.ts; Monster, Dice, CareerBuilder and company sites via
- * Google Jobs). Board errors (LinkedIn 429, a Monster bot check, SerpApi quota) are logged and the other boards'
- * jobs kept; a setup problem (no Python, no Playwright, no SERPAPI_KEY) stops the run with the fix in the message.
+ * Two names are not JobSpy boards and run at the same time through their own readers: "google_jobs" (SerpApi,
+ * google-jobs.ts; Monster, Dice, CareerBuilder and company sites via Google Jobs) and "monster" / "monster_apify"
+ * (an Apify actor, apify-monster.ts). Board errors (LinkedIn 429, SerpApi quota, Apify credit) are logged and the other
+ * boards' jobs kept; a setup problem (no Python, no SERPAPI_KEY, no APIFY_TOKEN) stops the run with the fix in the message.
  */
 export async function runJobSpy(
-  term: string, resultsWanted: number, opts: JobSpyOptions, run: RunCommand = runCommand, extra: ExtraReaders | typeof defaultSearchMonster = {},
+  term: string, resultsWanted: number, opts: JobSpyOptions, run: RunCommand = runCommand, readers: ExtraReaders = {},
 ): Promise<{ hits: JobHit[]; boardErrors: Record<string, string> }> {
-  const readers: ExtraReaders = typeof extra === "function" ? { searchMonster: extra } : extra;
-  const searchMonster = readers.searchMonster ?? defaultSearchMonster;
   const searchGoogleJobs = readers.searchGoogleJobs ?? defaultSearchGoogleJobs;
   const searchApifyMonster = readers.searchApifyMonster ?? defaultSearchApifyMonster;
   const env = process.env;
-  const spySites = opts.sites.filter((s) => !isMonster(s) && !isGoogleJobs(s) && !isApifyMonster(s));
-  const monster = opts.sites.some(isMonster)
-    ? searchMonster(term, resultsWanted, {
-        location: opts.location, hoursOld: opts.hoursOld, timeoutMs: opts.timeoutMs,
-        headless: env.MONSTER_HEADLESS?.trim() !== "false", maxPages: Number(env.MONSTER_PAGES) || 3,
-        ...(env.MONSTER_PROFILE_DIR?.trim() ? { profileDir: env.MONSTER_PROFILE_DIR.trim() } : {}),
-        ...(env.MONSTER_BROWSER?.trim() === "chromium" ? { channel: "chromium" as const } : {}),
-      })
-    : undefined;
+  const spySites = opts.sites.filter((s) => !isGoogleJobs(s) && !isApifyMonster(s));
   const gjobs = opts.sites.some(isGoogleJobs)
     ? searchGoogleJobs(term, resultsWanted, {
         apiKey: env.SERPAPI_KEY?.trim() ?? "", location: opts.location, hoursOld: opts.hoursOld,
@@ -189,9 +194,9 @@ export async function runJobSpy(
       })
     : undefined;
   const spy = spySites.length ? runJobSpyScript(term, resultsWanted, { ...opts, sites: spySites }, run) : Promise.resolve({ hits: [] as JobHit[], boardErrors: {} as Record<string, string> });
-  // Let all finish before raising a setup error, so no browser or Python process is left behind.
-  const [spyResult, monsterResult, gjobsResult, apifyResult] = await Promise.allSettled([
-    spy, monster ?? Promise.resolve(undefined), gjobs ?? Promise.resolve(undefined), apify ?? Promise.resolve(undefined),
+  // Let all finish before raising a setup error, so no Python process is left behind.
+  const [spyResult, gjobsResult, apifyResult] = await Promise.allSettled([
+    spy, gjobs ?? Promise.resolve(undefined), apify ?? Promise.resolve(undefined),
   ]);
   if (spyResult.status === "rejected") throw spyResult.reason;
   const { hits, boardErrors } = spyResult.value;
@@ -205,7 +210,6 @@ export async function runJobSpy(
     if (r.value.error) { boardErrors[name] = r.value.error; logger.warn({ term, board: name, err: r.value.error }, "board error"); }
     hits.push(...r.value.rows.map(rowToHit).filter((h): h is JobHit => Boolean(h)));
   };
-  merge("monster", monsterResult, MonsterSetupError);
   merge("google_jobs", gjobsResult, GoogleJobsSetupError);
   merge("monster_apify", apifyResult, ApifyMonsterSetupError);
   return { hits, boardErrors };

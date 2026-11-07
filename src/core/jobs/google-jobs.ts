@@ -11,7 +11,7 @@
  */
 import { logger } from "../../lib/logger.js";
 import type { JobSpyRow } from "./jobspy.js";
-import { dateFromRecency, withinHours } from "./monster.js";
+import { dateFromRecency, withinHours } from "./dates.js";
 
 export interface GoogleJobsOptions {
   apiKey: string;

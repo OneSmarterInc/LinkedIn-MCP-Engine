@@ -122,10 +122,10 @@ describe("google_jobs inside runJobSpy", () => {
     expect(r.hits).toHaveLength(1); expect(r.boardErrors.google_jobs).toMatch(/quota/);
     await expect(runJobSpy("rpg", 10, base, run, { searchGoogleJobs: vi.fn(async () => { throw new GoogleJobsSetupError("SERPAPI_KEY is not set in .env"); }) })).rejects.toThrow(/SERPAPI_KEY/);
   });
-  it("monster and google_jobs can run together, with no Python call when no JobSpy board is listed", async () => {
+  it("monster (through Apify) and google_jobs can run together, with no Python call when no JobSpy board is listed", async () => {
     const run2: RunCommand = vi.fn(async () => ({ code: 0, stdout: "{}", stderr: "" }));
     const r = await runJobSpy("rpg", 10, { ...base, sites: ["monster", "google_jobs"] }, run2, {
-      searchMonster: vi.fn(async () => ({ rows: [{ site: "monster", title: "M", company: "MC", job_url: "https://www.monster.com/job-openings/m" }] })),
+      searchApifyMonster: vi.fn(async () => ({ rows: [{ site: "monster", title: "M", company: "MC", job_url: "https://www.monster.com/job-openings/m" }] })),
       searchGoogleJobs: vi.fn(async () => ({ rows: [{ site: "google_jobs:Dice", title: "G", company: "GC", job_url: "https://www.dice.com/job/g" }], searches: 1 })),
     });
     expect(run2).not.toHaveBeenCalled();

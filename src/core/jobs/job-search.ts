@@ -494,6 +494,7 @@ export async function searchJobs(deps: JobSearchDeps): Promise<JobSearchOutput> 
 
   report("starting", `Starting: up to ${settings.maxJobs} jobs from ${window.from} to ${window.to}, up to ${searchesMax} searches` +
     (spy ? ` with JobSpy (${spy.opts.sites.join(", ")}, ${spy.opts.location}, last ${spy.opts.hoursOld} hours)` : "") +
+    (spy?.opts.scrapingOff?.length ? ` (left out: ${spy.opts.scrapingOff.join(", ")}, because direct scraping is off; JOBSPY_ALLOW_SCRAPING in .env)` : "") +
     (deps.seamless ? `, up to ${settings.maxSeamlessLookups} Seamless lookups` : ", Seamless off") +
     (before.keys.size ? `, skipping ${plural(before.keys.size, "job")} found by earlier searches` : ""));
 
