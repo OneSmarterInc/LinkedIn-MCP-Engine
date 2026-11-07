@@ -13,7 +13,7 @@ export type SessionStage = "password" | "enroll" | "full";
 
 export interface User {
   id: string; email: string; full_name: string; role: Role; status: UserStatus;
-  password_hash: string; totp_secret_enc: string | null; created_at: string;
+  password_hash: string; totp_secret_enc: string | null; created_at: string; totp_last_step?: number | null;
   approved_by: string | null; approved_at: string | null; rejected_reason: string | null; last_sign_in_at: string | null;
 }
 export interface Session { id: string; user_id: string; stage: SessionStage; created_at: string; last_seen_at: string; ip: string; user_agent: string; pending_secret: string | null }
@@ -50,6 +50,9 @@ export class AuthStore {
         target TEXT, detail TEXT, ip TEXT
       );
     `);
+    // Added 7 Nov 2026: the last accepted two-factor step, so one code works once. Older databases get the column here.
+    const cols = (this.db.prepare("PRAGMA table_info(users)").all() as Array<{ name: string }>).map((c) => c.name);
+    if (!cols.includes("totp_last_step")) this.db.exec("ALTER TABLE users ADD COLUMN totp_last_step INTEGER");
   }
 
   // ---- users ----
@@ -79,7 +82,21 @@ export class AuthStore {
   }
   setRole(id: string, role: Role): void { this.db.prepare("UPDATE users SET role = ? WHERE id = ?").run(role, id); }
   deleteUser(id: string): void { this.endSessionsFor(id); this.db.prepare("DELETE FROM recovery_codes WHERE user_id = ?").run(id); this.db.prepare("DELETE FROM users WHERE id = ?").run(id); }
-  setTotp(id: string, secretEnc: string): void { this.db.prepare("UPDATE users SET totp_secret_enc = ? WHERE id = ?").run(secretEnc, id); }
+  setTotp(id: string, secretEnc: string): void { this.db.prepare("UPDATE users SET totp_secret_enc = ?, totp_last_step = NULL WHERE id = ?").run(secretEnc, id); }
+  /**
+   * Records a two-factor step as used. False when this step, or a later one, was already used: the code is refused,
+   * so a code seen over someone's shoulder cannot be typed in again.
+   */
+  acceptTotpStep(id: string, step: number): boolean {
+    const r = this.db.prepare("UPDATE users SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)").run(step, id, step);
+    return Number(r.changes) > 0;
+  }
+  /** Lost phone: forget the authenticator and the recovery codes; the next sign-in shows a new QR code. */
+  resetTwoFactor(id: string): void {
+    this.db.prepare("UPDATE users SET totp_secret_enc = NULL, totp_last_step = NULL WHERE id = ?").run(id);
+    this.db.prepare("DELETE FROM recovery_codes WHERE user_id = ?").run(id);
+    this.endSessionsFor(id);
+  }
   touchSignIn(id: string): void { this.db.prepare("UPDATE users SET last_sign_in_at = ? WHERE id = ?").run(now(), id); }
 
   // ---- sessions ----
@@ -136,6 +153,11 @@ export class AuthStore {
   createReset(userId: string, tokenHash: string, ttlMs: number): void {
     this.db.prepare("DELETE FROM password_resets WHERE user_id = ? OR expires_at < ?").run(userId, now());
     this.db.prepare("INSERT INTO password_resets (token_hash, user_id, expires_at) VALUES (?,?,?)").run(tokenHash, userId, new Date(Date.now() + ttlMs).toISOString());
+  }
+  /** The user a live, unused reset token belongs to, without using it up. */
+  peekReset(tokenHash: string): User | undefined {
+    const r = this.db.prepare("SELECT user_id FROM password_resets WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?").get(tokenHash, now()) as { user_id: string } | undefined;
+    return r ? this.userById(r.user_id) : undefined;
   }
   /** The user a live, unused reset token belongs to; marks it used. */
   consumeReset(tokenHash: string): User | undefined {

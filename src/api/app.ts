@@ -1,5 +1,4 @@
 import Fastify, { type FastifyInstance } from "fastify";
-import cors from "@fastify/cors";
 import { z } from "zod";
 
 import type { SheetsGateway } from "../core/exporter.js";
@@ -64,8 +63,11 @@ export function zodMessage(err: z.ZodError): string {
 
 export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
   const env = deps.env ?? process.env;
-  const app = Fastify({ logger: false });
-  await app.register(cors, { origin: true });
+  // No CORS: the console is served from the same origin (built) or through the Vite /api proxy (dev), so a page on
+  // another site gets no readable answer. TRUST_PROXY=true (or the proxy's address list) only behind a real proxy.
+  const trust = env.TRUST_PROXY?.trim() ?? "";
+  const trustProxy: boolean | string[] = trust === "true" ? true : trust ? trust.split(",").map((x) => x.trim()).filter(Boolean) : false;
+  const app = Fastify({ logger: false, trustProxy });
 
   // ---- auth ----
   // Accounts mode (SUPERUSER_EMAIL set): people sign in with email, password and an authenticator code; see auth/routes.ts.
@@ -87,7 +89,12 @@ export async function buildApp(deps: AppDeps): Promise<FastifyInstance> {
     app.addHook("onClose", async () => store.close());
   } else {
     app.addHook("onRequest", async (req, reply) => {
-      if (!token || !req.url.startsWith("/api/") || req.url === "/api/health") return;
+      if (!req.url.startsWith("/api/") || req.url === "/api/health") return;
+      // A web page on another site cannot add this header to a form post, so no other site can approve drafts.
+      if (req.method !== "GET" && req.method !== "HEAD" && !req.headers["x-requested-with"] && !req.headers.authorization) {
+        return reply.code(403).send({ error: "Missing request header." });
+      }
+      if (!token) return;
       const got = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "").trim();
       if (got !== token) return reply.code(401).send({ error: "Sign in required." });
     });

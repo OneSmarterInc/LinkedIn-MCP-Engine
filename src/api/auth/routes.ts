@@ -15,11 +15,11 @@
  *   POST 2fa/enroll {code}  (first sign-in)            -> {user, recovery_codes}
  *   POST 2fa/verify {code}  (code or a recovery code)  -> {user, recovery_codes_left}
  *   POST logout, GET me
- * Admin: GET /api/users, POST /api/users/:id/approve {role} | reject {reason} | disable | enable | role {role}, GET /api/audit
+ * Admin: GET /api/users, POST /api/users/:id/approve {role} | reject {reason} | disable | enable | reset-2fa | role {role}, GET /api/audit
  */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
-import { decryptText, encryptText, hashPassword, newId, newRecoveryCodes, newTotpSecret, otpauthUrl, passwordProblem, sha256, totpMatches, verifyPassword } from "./crypto.js";
+import { decryptText, encryptText, hashPassword, newId, newRecoveryCodes, newTotpSecret, otpauthUrl, passwordProblem, sha256, totpMatchStep, verifyPassword } from "./crypto.js";
 import { templates, type MailMessage, type MailSettings, type SendMail } from "./mail.js";
 import { AuthStore, type Role, type Session, type User } from "./store.js";
 
@@ -60,7 +60,9 @@ function readCookie(req: FastifyRequest, name: string): string | undefined {
   return undefined;
 }
 
-const ipOf = (req: FastifyRequest): string => (String(req.headers["x-forwarded-for"] ?? "").split(",")[0]?.trim() || req.ip || "");
+// req.ip only. Behind a real proxy set TRUST_PROXY in .env, so Fastify reads X-Forwarded-For from that proxy alone;
+// a header any client can type must never decide the rate limit.
+const ipOf = (req: FastifyRequest): string => req.ip || "";
 
 /** The signed-in person (or the service token, or nobody) behind a request; set by the auth hook. */
 export function authOf(req: FastifyRequest): RequestAuth {
@@ -205,8 +207,10 @@ export function registerAuth(app: FastifyInstance, o: AuthOptions): { audit: (re
     const { user, session } = requireStage(req, "enroll");
     const b = z.object({ code: z.string().trim() }).parse(req.body);
     const secret = session.pending_secret ? decryptText(session.pending_secret, o.authSecret) : "";
-    if (!secret || !totpMatches(secret, b.code, now())) throw httpError(400, "That code did not match. Check the time on your phone and try the next code.");
+    const step = secret ? totpMatchStep(secret, b.code, now()) : undefined;
+    if (step === undefined) throw httpError(400, "That code did not match. Check the time on your phone and try the next code.");
     store.setTotp(user.id, encryptText(secret, o.authSecret));
+    store.acceptTotpStep(user.id, step);
     const codes = newRecoveryCodes();
     store.setRecoveryCodes(user.id, codes);
     store.setStage(session.id, "full");
@@ -221,8 +225,11 @@ export function registerAuth(app: FastifyInstance, o: AuthOptions): { audit: (re
     const { user, session } = requireStage(req, "password");
     const b = z.object({ code: z.string().trim() }).parse(req.body);
     const secret = user.totp_secret_enc ? decryptText(user.totp_secret_enc, o.authSecret) : "";
-    const byApp = secret ? totpMatches(secret, b.code, now()) : false;
-    const byRecovery = !byApp && /^[a-z0-9]{5}-?[a-z0-9]{5}$/i.test(b.code) && store.useRecoveryCode(user.id, b.code);
+    const step = secret ? totpMatchStep(secret, b.code, now()) : undefined;
+    const reused = step !== undefined && !store.acceptTotpStep(user.id, step);
+    const byApp = step !== undefined && !reused;
+    const byRecovery = !byApp && !reused && /^[a-z0-9]{5}-?[a-z0-9]{5}$/i.test(b.code) && store.useRecoveryCode(user.id, b.code);
+    if (reused) throw httpError(400, "That code was already used. Wait for the next code in your app.");
     if (!byApp && !byRecovery) {
       store.recordAttempt(user.email, false, ipOf(req));
       const wait = store.lockedFor(user.email);
@@ -272,10 +279,13 @@ export function registerAuth(app: FastifyInstance, o: AuthOptions): { audit: (re
     if (rateLimited(ipOf(req))) throw httpError(429, "Too many attempts from this address. Wait a minute.");
     const b = z.object({ token: z.string().min(10).max(200), password: z.string(), confirm: z.string() }).parse(req.body);
     if (b.password !== b.confirm) throw httpError(400, "The two passwords do not match.");
+    // Check the password before using up the link: a weak password leaves the link as it was, with its first expiry time.
+    const holder = store.peekReset(sha256(b.token));
+    if (!holder) throw httpError(400, "This reset link is not valid any more. Ask for a new one.");
+    const bad = passwordProblem(b.password, holder.email);
+    if (bad) throw httpError(400, bad);
     const user = store.consumeReset(sha256(b.token));
     if (!user) throw httpError(400, "This reset link is not valid any more. Ask for a new one.");
-    const bad = passwordProblem(b.password, user.email);
-    if (bad) { store.createReset(user.id, sha256(b.token), RESET_MINUTES * 60_000); throw httpError(400, bad); } // keep the link usable for a better password
     store.setPassword(user.id, await hashPassword(b.password)); // also ends every session
     store.audit({ actor_id: user.id, actor: `${user.full_name} <${user.email}>`, action: "password_reset", ip: ipOf(req) });
     return { ok: true };
@@ -284,6 +294,7 @@ export function registerAuth(app: FastifyInstance, o: AuthOptions): { audit: (re
   /** Admin: a test mail to the admin's own address, so SMTP settings can be checked from the portal. */
   app.post("/api/auth/test-mail", async (req) => {
     const a = authOf(req);
+    if (!a.session || a.session.stage !== "full") throw httpError(401, "Sign in first.");
     if (!a.user || a.user.role !== "admin") throw httpError(403, "Only an administrator can do that.");
     if (!o.mail) throw httpError(409, "Email is not set up: add SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS and MAIL_FROM to .env and restart the backend.");
     try {
@@ -339,6 +350,15 @@ export function registerAuth(app: FastifyInstance, o: AuthOptions): { audit: (re
     if (u.status !== "disabled") throw httpError(409, `${u.email} is ${u.status}.`);
     store.setStatus(u.id, "active", authOf(req).actor.label);
     audit(req, "enable_user", u.email);
+    return { user: publicUser(store.userById(u.id)!) };
+  });
+  /** Lost phone and recovery codes: the person's next sign-in sets up a new authenticator. */
+  app.post("/api/users/:id/reset-2fa", async (req) => {
+    const u = target(req);
+    if (u.id === authOf(req).user?.id) throw httpError(409, "Ask another administrator to reset your own two-factor.");
+    if (!u.totp_secret_enc) throw httpError(409, `${u.email} has no two-factor set up yet.`);
+    store.resetTwoFactor(u.id);
+    audit(req, "reset_two_factor", u.email);
     return { user: publicUser(store.userById(u.id)!) };
   });
   app.post("/api/users/:id/role", async (req) => {

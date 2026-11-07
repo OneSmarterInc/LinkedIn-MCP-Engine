@@ -131,7 +131,8 @@ describe("accounts mode: register -> approve -> sign in with two-factor", () => 
     r = await sup.call("POST", "/api/auth/2fa/enroll", { code: totpCode(supSecret) });
     expect(r.status).toBe(200); expect((r.body.recovery_codes as string[]).length).toBe(10);
     expect((r.body.user as { role: string }).role).toBe("admin");
-    const supRecovery = (r.body.recovery_codes as string[])[0]!;
+    const supCodes = r.body.recovery_codes as string[];
+    const supRecovery = supCodes[0]!;
 
     // signed in: data routes work, me shows the pending count
     expect((await sup.call("GET", "/api/pipeline")).status).toBe(200);
@@ -160,7 +161,10 @@ describe("accounts mode: register -> approve -> sign in with two-factor", () => 
     r = await sup.call("POST", "/api/auth/login", { email: "vikram@onesmarter.com", password: PW });
     expect(r.body.next).toBe("totp");
     expect((await sup.call("GET", "/api/pipeline")).status).toBe(401);
+    // The enrol code's step is used up, so this sign-in uses the next step (allowed: one step of drift).
     r = await sup.call("POST", "/api/auth/2fa/verify", { code: totpCode(supSecret) });
+    expect(r.status).toBe(400); expect(r.body.error).toMatch(/already used/);
+    r = await sup.call("POST", "/api/auth/2fa/verify", { code: totpCode(supSecret, Date.now() + 30_000) });
     expect(r.status).toBe(200); expect(r.body.recovery_codes_left).toBe(10);
     sup.forgetCookie();
     await sup.call("POST", "/api/auth/login", { email: "vikram@onesmarter.com", password: PW });
@@ -171,7 +175,7 @@ describe("accounts mode: register -> approve -> sign in with two-factor", () => 
     expect((await sup.call("POST", "/api/auth/2fa/verify", { code: supRecovery })).status).toBe(400); // used
 
     // actions carry the actor; audit lists them; sign out ends the session
-    await sup.call("POST", "/api/auth/2fa/verify", { code: totpCode(supSecret) });
+    await sup.call("POST", "/api/auth/2fa/verify", { code: supCodes[1]! });
     await sup.call("POST", "/api/pipeline/someone%40acme.com/approve").catch(() => {});
     r = await sup.call("GET", "/api/audit");
     const actions = (r.body.rows as Array<{ action: string; actor: string }>).map((x) => x.action);
@@ -326,6 +330,111 @@ describe("account emails and password reset", () => {
     const r = await c.call("POST", "/api/auth/forgot", { email: "x@y.com" });
     expect(r.body.message).toMatch(/not set up/);
     expect((await app.inject({ method: "GET", url: "/api/health" })).json().mail).toBe(false);
+    await app.close();
+  });
+});
+
+describe("review 7 Nov 2026 fixes", () => {
+  const mk = async (env: Record<string, string> = ENV, sendMail?: (m: { to: string; subject: string; text: string }) => Promise<void>) =>
+    buildApp({ gw, ledger: openLedger(":memory:"), env, authDbPath: ":memory:", ...(sendMail ? { sendMail } : {}) });
+  const signUp = async (app: FastifyInstance) => {
+    const sup = client(app);
+    await sup.call("POST", "/api/auth/register", { full_name: "Vikram Sethi", email: "vikram@onesmarter.com", password: PW, confirm: PW });
+    const l = await sup.call("POST", "/api/auth/login", { email: "vikram@onesmarter.com", password: PW });
+    await sup.call("POST", "/api/auth/2fa/enroll", { code: totpCode(l.body.secret as string) });
+    return sup;
+  };
+
+  it("A2: an admin resets a person's two-factor; the next sign-in shows a new QR code; not for your own account", async () => {
+    const app = await mk();
+    const sup = await signUp(app);
+    const mem = client(app);
+    await mem.call("POST", "/api/auth/register", { full_name: "Hansa V", email: "hansa@onesmarter.com", password: PW, confirm: PW });
+    const users = (await sup.call("GET", "/api/users")).body.users as Array<{ id: string; email: string }>;
+    const h = users.find((u) => u.email === "hansa@onesmarter.com")!;
+    const me = users.find((u) => u.email === "vikram@onesmarter.com")!;
+    await sup.call("POST", `/api/users/${h.id}/approve`, { role: "member" });
+    const l = await mem.call("POST", "/api/auth/login", { email: "hansa@onesmarter.com", password: PW });
+    await mem.call("POST", "/api/auth/2fa/enroll", { code: totpCode(l.body.secret as string) });
+    expect((await mem.call("GET", "/api/pipeline")).status).toBe(200);
+
+    expect((await sup.call("POST", `/api/users/${h.id}/reset-2fa`, {})).status).toBe(200);
+    expect((await mem.call("GET", "/api/pipeline")).status).toBe(401); // signed out at once
+    const again = await mem.call("POST", "/api/auth/login", { email: "hansa@onesmarter.com", password: PW });
+    expect(again.body.next).toBe("enroll");
+    expect((await sup.call("POST", `/api/users/${me.id}/reset-2fa`, {})).status).toBe(409);
+    const audit = (await sup.call("GET", "/api/audit")).body.rows as Array<{ action: string }>;
+    expect(audit.map((a) => a.action)).toContain("reset_two_factor");
+    await app.close();
+  });
+
+  it("A3: a made-up X-Forwarded-For does not get around the sign-in limit", async () => {
+    const app = await mk();
+    const codes: number[] = [];
+    for (let i = 0; i < 14; i++) {
+      const res = await app.inject({ method: "POST", url: "/api/auth/login", headers: { "x-forwarded-for": `10.0.0.${i}`, "x-requested-with": "x", "content-type": "application/json" }, payload: { email: "a@b.com", password: "wrong wrong wrong" } });
+      codes.push(res.statusCode);
+    }
+    expect(codes).toContain(429);
+    await app.close();
+  });
+
+  it("A4: open mode refuses changes without the console header and sends no CORS header", async () => {
+    const app = await buildApp({ gw, ledger: openLedger(":memory:"), env: {} });
+    const evil = await app.inject({ method: "POST", url: "/api/pipeline/x%40y.com/approve", headers: { origin: "https://evil.example" } });
+    expect(evil.statusCode).toBe(403);
+    expect(evil.headers["access-control-allow-origin"]).toBeUndefined();
+    const read = await app.inject({ method: "GET", url: "/api/health", headers: { origin: "https://evil.example" } });
+    expect(read.headers["access-control-allow-origin"]).toBeUndefined();
+    await app.close();
+  });
+
+  it("B3: test-mail needs the two-factor step, not only the password", async () => {
+    const sent: unknown[] = [];
+    const env = { ...ENV, SMTP_HOST: "smtp.x.com", SMTP_PORT: "587", SMTP_USER: "u", SMTP_PASS: "p", MAIL_FROM: "x@onesmarter.com" };
+    const app = await mk(env, async (m) => { sent.push(m); });
+    const sup = await signUp(app);
+    sup.forgetCookie();
+    await sup.call("POST", "/api/auth/login", { email: "vikram@onesmarter.com", password: PW }); // password only
+    expect((await sup.call("POST", "/api/auth/test-mail", {})).status).toBe(401);
+    expect(sent).toHaveLength(0);
+    await app.close();
+  });
+
+  it("B4: the same authenticator code works once", async () => {
+    const app = await mk();
+    const sup = client(app);
+    await sup.call("POST", "/api/auth/register", { full_name: "Vikram Sethi", email: "vikram@onesmarter.com", password: PW, confirm: PW });
+    const l = await sup.call("POST", "/api/auth/login", { email: "vikram@onesmarter.com", password: PW });
+    const secret = l.body.secret as string;
+    await sup.call("POST", "/api/auth/2fa/enroll", { code: totpCode(secret) });
+    sup.forgetCookie();
+    await sup.call("POST", "/api/auth/login", { email: "vikram@onesmarter.com", password: PW });
+    const next = totpCode(secret, Date.now() + 30_000);
+    expect((await sup.call("POST", "/api/auth/2fa/verify", { code: next })).status).toBe(200);
+    sup.forgetCookie();
+    await sup.call("POST", "/api/auth/login", { email: "vikram@onesmarter.com", password: PW });
+    const again = await sup.call("POST", "/api/auth/2fa/verify", { code: next });
+    expect(again.status).toBe(400); expect(again.body.error).toMatch(/already used/);
+    await app.close();
+  });
+
+  it("B2: checking a reset link does not use it up; only a good password does", () => {
+    const s = new AuthStore(":memory:");
+    const u = s.createUser({ email: "a@onesmarter.com", full_name: "A B", password_hash: "x", role: "member", status: "active" });
+    s.createReset(u.id, "hash-1", 60_000);
+    expect(s.peekReset("hash-1")?.id).toBe(u.id);
+    expect(s.peekReset("hash-1")?.id).toBe(u.id); // still there: a weak password changes nothing
+    expect(s.consumeReset("hash-1")?.id).toBe(u.id);
+    expect(s.peekReset("hash-1")).toBeUndefined();
+  });
+
+  it("B5: a bad or unknown search or run id is 400 or 404, not 500", async () => {
+    const app = await buildApp({ gw, ledger: openLedger(":memory:"), env: {} });
+    expect((await app.inject({ method: "GET", url: "/api/search/not-an-id" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/search/jobs-00000000-0000-0000-0000-000000000000" })).statusCode).toBe(404);
+    expect((await app.inject({ method: "GET", url: "/api/runs/not-an-id" })).statusCode).toBe(400);
+    expect((await app.inject({ method: "GET", url: "/api/runs/mcp-00000000-0000-0000-0000-000000000000" })).statusCode).toBe(404);
     await app.close();
   });
 });

@@ -74,14 +74,24 @@ export function totpCode(secretB32: string, at = Date.now(), step = 30): string 
   return String(bin % 1_000_000).padStart(6, "0");
 }
 
+/**
+ * The 30-second step number that `code` matches (the current step or the one before or after it), or undefined.
+ * The caller stores the step, so the same code cannot be used twice.
+ */
+export function totpMatchStep(secretB32: string, code: string, at = Date.now()): number | undefined {
+  const c = code.replace(/\s+/g, "");
+  if (!/^\d{6}$/.test(c)) return undefined;
+  for (const d of [-1, 0, 1]) {
+    const t = at + d * 30_000;
+    const want = totpCode(secretB32, t);
+    if (want.length === c.length && timingSafeEqual(Buffer.from(want), Buffer.from(c))) return Math.floor(t / 1000 / 30);
+  }
+  return undefined;
+}
+
 /** True when `code` matches the current 30-second step or the one before or after it. */
 export function totpMatches(secretB32: string, code: string, at = Date.now()): boolean {
-  const c = code.replace(/\s+/g, "");
-  if (!/^\d{6}$/.test(c)) return false;
-  return [-1, 0, 1].some((d) => {
-    const want = totpCode(secretB32, at + d * 30_000);
-    return want.length === c.length && timingSafeEqual(Buffer.from(want), Buffer.from(c));
-  });
+  return totpMatchStep(secretB32, code, at) !== undefined;
 }
 
 export function otpauthUrl(secretB32: string, email: string, issuer = "Outreach Console"): string {

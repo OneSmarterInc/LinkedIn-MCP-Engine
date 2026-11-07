@@ -185,6 +185,8 @@ describe("API: a failed send is visible and can be retried (AutoBooker columns K
   });
   afterAll(async () => { await app.close(); });
 
+  // The console sends this on every change; open mode refuses changes without it (another site cannot add it).
+  const XRW = { "x-requested-with": "outreach-console" };
   const get = async () => (await app.inject({ method: "GET", url: "/api/pipeline?fresh=1" })).json().rows as Array<Record<string, string>>;
 
   it("shows Send Error for a SEND_FAILED row, keeps the Sheet status, and leaves other rows alone", async () => {
@@ -200,12 +202,12 @@ describe("API: a failed send is visible and can be retried (AutoBooker columns K
   });
 
   it("a Send Error row cannot be edited or approved directly", async () => {
-    expect((await app.inject({ method: "PATCH", url: "/api/pipeline/fail@acme.com/draft", payload: { subject: "x" } })).statusCode).toBe(409);
-    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/approve" })).statusCode).toBe(409);
+    expect((await app.inject({ method: "PATCH", url: "/api/pipeline/fail@acme.com/draft", headers: XRW, payload: { subject: "x" } })).statusCode).toBe(409);
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/approve", headers: XRW })).statusCode).toBe(409);
   });
 
   it("Retry send (reopen) returns the row to Ready for Review and clears AutoBooker's SendState and Notes", async () => {
-    const r = await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/reopen" });
+    const r = await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/reopen", headers: XRW });
     expect(r.statusCode).toBe(200);
     expect(r.json()).toMatchObject({ status: "Ready for Review", sheet_status: "Ready for Review", send_state: "", notes: "" });
     const sheetRow = tabs.get("Jobs_Pipeline")!.rows[1]!;
@@ -213,13 +215,13 @@ describe("API: a failed send is visible and can be retried (AutoBooker columns K
     expect(sheetRow[H15.indexOf("SendState")]).toBe("");
     expect(sheetRow[H15.indexOf("Notes")]).toBe("");
     // approving again now works, and AutoBooker will treat it as a fresh row
-    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/approve" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/approve", headers: XRW })).statusCode).toBe(200);
   });
 
   it("Reject from Send Error also clears the failure marker", async () => {
     const sheetRow = tabs.get("Jobs_Pipeline")!.rows[1]!;
     sheetRow[H.indexOf("Status")] = "Approved"; sheetRow[H15.indexOf("SendState")] = "SEND_FAILED"; sheetRow[H15.indexOf("Notes")] = "send failed: again";
-    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/reject" })).statusCode).toBe(200);
+    expect((await app.inject({ method: "POST", url: "/api/pipeline/fail@acme.com/reject", headers: XRW })).statusCode).toBe(200);
     expect(sheetRow[H.indexOf("Status")]).toBe("Rejected");
     expect(sheetRow[H15.indexOf("SendState")]).toBe("");
   });

@@ -59,10 +59,18 @@ outreach from.
 
 ## Lost phone
 
-Sign in with a recovery code, then ask an admin to disable and re-enable the account; the next sign-in enrols a new
-authenticator. (A self-service "reset two-factor" button is a later addition.)
+An admin presses **Reset two-factor** on the Users page (`POST /api/users/:id/reset-2fa`). That removes the old
+authenticator and the recovery codes and signs the person out; their next sign-in shows a new QR code. An admin cannot
+reset their own two-factor: another admin does it. Each authenticator code works once.
 
 ## Hosting
 
 Sessions are cookies, so the portal must be served from one origin: in development Vite proxies `/api` to the
 backend; in production the backend serves the built frontend. Behind HTTPS set `COOKIE_SECURE=true`.
+
+## Hosting behind a proxy
+
+Set `TRUST_PROXY` in `.env` only when a real reverse proxy (Caddy, nginx) is in front: `true`, or the proxy's
+address. Then the sign-in limit uses the client address the proxy reports. Without it the backend uses the direct
+connection address and ignores `X-Forwarded-For`, so a client cannot dodge the limit with a made-up header.
+The API sends no CORS headers: the console is served from the same address (built) or through the Vite `/api` proxy.

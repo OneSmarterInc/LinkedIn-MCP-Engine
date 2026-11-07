@@ -33,7 +33,7 @@ export function createRunId(): string {
 
 function getRunPath(runId: string): string {
   if (!/^mcp-[0-9a-f-]{36}$/i.test(runId)) {
-    throw new Error("Invalid MCP run ID.");
+    throw Object.assign(new Error("Invalid MCP run ID."), { statusCode: 400 });
   }
 
   return resolve(RUNS_DIR, `${runId}.json`);
@@ -66,7 +66,8 @@ export async function loadRunState(
     raw = await readFile(path, "utf8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      throw new Error(`Run ${runId} not found. Call source_leads first.`);
+      // statusCode: the API answers 404 with this sentence, not a 500.
+      throw Object.assign(new Error(`Run ${runId} not found. Call source_leads first.`), { statusCode: 404 });
     }
 
     throw error;

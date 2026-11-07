@@ -670,7 +670,7 @@ export function createJobSearchId(): string {
 }
 
 function recordPath(id: string, dir: string): string {
-  if (!ID.test(id)) throw new Error("Invalid job search ID.");
+  if (!ID.test(id)) throw Object.assign(new Error("Invalid job search ID."), { statusCode: 400 });
   return resolve(dir, `${id}.json`);
 }
 
@@ -699,7 +699,7 @@ export async function loadJobSearchRecord(id: string, dir = JOBS_DIR): Promise<J
     const rec = JSON.parse(await readFile(recordPath(id, dir), "utf8")) as JobSearchRecord;
     return { ...rec, log: rec.log ?? [] };
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Job search ${id} not found. Call search_jobs first.`);
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") throw Object.assign(new Error(`Job search ${id} not found. Call search_jobs first.`), { statusCode: 404 });
     throw err;
   }
 }
